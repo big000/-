@@ -50,7 +50,7 @@ def load_intraday():
     d = _clean(yf.download("^TWII", period="5d", interval="1m", progress=False))
     if d.empty: return d
     d.index = d.index.tz_convert(TZ)
-    return d[np.array([x.date() for x in d.index]) == d.index[-1].date()]
+    return d[d.index.date == d.index[-1].date()]
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_5m_all(sym):
@@ -63,7 +63,7 @@ def load_5m_all(sym):
 def load_5m_today(sym):
     d = load_5m_all(sym)
     if d.empty: return d
-    return d[np.array([x.date() for x in d.index]) == d.index[-1].date()]
+    return d[d.index.date == d.index[-1].date()]
 
 @st.cache_data(ttl=900, show_spinner=False)
 def twse_day(ymd):
@@ -93,36 +93,42 @@ def last_10_flows():
 
 # ───────────────────────── 交易日曆（證交所休市日） ─────────────────────────
 @st.cache_data(ttl=86400, show_spinner=False)
-def tw_holidays(year):
-    """證交所休市日 {date: 名稱}。抓取失敗直接丟例外（不快取失敗結果）。"""
-    r = requests.get("https://www.twse.com.tw/rwd/zh/holidaySchedule/holidaySchedule", timeout=8,
-                     params={"date": year, "response": "json"}, headers={"User-Agent": "Mozilla/5.0"}).json()
-    if r.get("stat") != "OK" or not r.get("data"): raise ValueError("no holiday data")
-    out = {}
-    for row in r["data"]:
-        txt = " ".join(str(x) for x in row)
-        if "開始交易" in txt or "最後交易" in txt: continue      # 這兩類是開市日，不是假日
-        s = str(row[0])
-        m = (re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", s) or re.search(r"(\d{2,3})年(\d{1,2})月(\d{1,2})日", s)
-             or re.search(r"(\d{2,3})/(\d{1,2})/(\d{1,2})", s))
-        if not m: continue
-        y, mo, dd = map(int, m.groups())
-        if y < 1911: y += 1911
-        out[date(y, mo, dd)] = str(row[1]) if len(row) > 1 else "休市"
-    return out
+def tw_holidays():
+    """從證交所 OpenAPI 官方端點抓取休市日 {date: 名稱}"""
+    try:
+        r = requests.get("https://openapi.twse.com.tw/v1/holidaySchedule/holidaySchedule", timeout=8)
+        if r.status_code != 200: raise ValueError("API Error")
+        out = {}
+        for row in r.json():
+            name = str(row.get("Name", ""))
+            desc = str(row.get("Description", ""))
+            # 排除「開始交易」或「最後交易」等開市日提醒
+            if "開始交易" in name or "最後交易" in name or "開始交易" in desc or "最後交易" in desc: 
+                continue
+                
+            d_str = str(row.get("Date", "")).strip().replace("-", "").replace("/", "")
+            if len(d_str) == 8 and d_str.isdigit():
+                y, m, d = int(d_str[:4]), int(d_str[4:6]), int(d_str[6:8])
+                out[date(y, m, d)] = name or desc or "休市"
+        return out
+    except Exception:
+        raise ValueError("Fetch failed")
 
 def future_trading_days(after, k):
     """after 之後的第 1~k 個交易日 → (日期清單, 期間遇到的平日假日 {date: 名稱}, 假日資料是否完整)"""
-    hol, ok, got = {}, True, set()
+    hol, ok = {}, True
+    try:
+        hol = tw_holidays()
+    except Exception:
+        ok = False
+        
     days, skipped, d = [], {}, after
     while len(days) < k:
         d += timedelta(days=1)
-        if d.year not in got:
-            got.add(d.year)
-            try: hol.update(tw_holidays(d.year))
-            except Exception: ok = False
         if d.weekday() >= 5: continue
-        if d in hol: skipped[d] = hol[d]; continue
+        if d in hol: 
+            skipped[d] = hol[d]
+            continue
         days.append(d)
     return days, skipped, ok
 
@@ -339,11 +345,11 @@ def strategy_data():
     df5 = load_5m_all(SYM)
     intra = {}
     if not df5.empty:
-        for dt, g in df5.groupby(np.array([x.date() for x in df5.index])):
+        for dt, g in df5.groupby(df5.index.date):
             intra[dt] = [(float(o), float(h), float(l), float(c)) for o, h, l, c in zip(g.Open, g.High, g.Low, g.Close)]
         if not df.empty:
             last_idx = df.index[-1]
-            g = df5[np.array([x.date() for x in df5.index]) == last_idx.date()]
+            g = df5[df5.index.date == last_idx.date()]
             if not g.empty:
                 df.loc[last_idx, "High"] = max(df.loc[last_idx, "Open"], df.loc[last_idx, "Close"], g["High"].max())
                 df.loc[last_idx, "Low"] = min(df.loc[last_idx, "Open"], df.loc[last_idx, "Close"], g["Low"].min())
@@ -447,10 +453,10 @@ def strategy_page():
             ent, stop, tp, how = entry_plan(df, s, em, xm, sl, tp1, sl1)
             if s["cd"]:
                 days, skipped, ok = future_trading_days(df.index[-1].date(), s["cd"] + 1)
-                msg = (f"⏳ 冷卻中，還需 {s['cd']} 個交易日｜冷卻結束：{fmt_d(days[s['cd'] - 1])}　"
+                msg = (f"⏳ 冷卻中，還需 {s['cd']} 個交易日｜冷卻結束：{fmt_d(days[s['cd'] - 1])} "
                        f"最早可再進場：{fmt_d(days[s['cd']])}（冷卻結束後參考下列價位）")
                 if skipped: msg += "\n\n已排除休市日：" + "、".join(f"{fmt_d(k)} {v}" for k, v in skipped.items())
-                if not ok: msg += "\n\n⚠️ 抓不到證交所休市日資料，目前只排除週末，遇到國定假日請自行順延。"
+                if not ok: msg += "\n\n⚠️ 無法連接證交所 OpenAPI 獲取休假資料，目前只排除週末，遇到國定假日請自行順延。"
                 st.info(msg)
             else: st.info(f"⚪ 空手：{how}")
             if ent:
