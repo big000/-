@@ -1,5 +1,5 @@
-import json, time
-from datetime import datetime
+import json, time, re
+from datetime import datetime, date, timedelta
 import numpy as np, pandas as pd, pytz, requests, yfinance as yf
 import streamlit as st
 import streamlit.components.v1 as components
@@ -26,9 +26,9 @@ header[data-testid=stHeader],footer,#MainMenu{display:none}
 .st-key-nav h1{color:#FFC83D;font-size:1.35rem;font-weight:800;letter-spacing:.05em;margin:0!important;padding:0!important;line-height:1.4!important}
 
 .st-key-body{padding:.8rem 1.2rem 1.2rem}
-.st-key-chart_card{background:#000;border-radius:18px;padding:.8rem 1rem .6rem;box-shadow:0 10px 30px rgba(70,30,120,.3)}
-.st-key-flow_card,.st-key-strat_card{background:#15111c;border-radius:18px;padding:.9rem 1.2rem;color:#e8e6ee;box-shadow:0 10px 30px rgba(70,30,120,.25)}
-.st-key-chart_card iframe,.st-key-flow_card iframe,.st-key-strat_card iframe{border-radius:12px;display:block}
+.st-key-chart_card,.st-key-chart_card_s{background:#000;border-radius:18px;padding:.8rem 1rem .6rem;box-shadow:0 10px 30px rgba(70,30,120,.3)}
+.st-key-flow_card,.st-key-strat_card,.st-key-trade_card{background:#15111c;border-radius:18px;padding:.9rem 1.2rem;color:#e8e6ee;box-shadow:0 10px 30px rgba(70,30,120,.25)}
+.st-key-chart_card iframe,.st-key-chart_card_s iframe,.st-key-flow_card iframe{border-radius:12px;display:block}
 .ttl{color:#fff;font-size:1.05rem;font-weight:700}.ttl span{color:#8d8d99;font-size:.8rem;margin-left:.4rem;font-weight:500}
 .fl-h{color:#fff;font-size:1.05rem;font-weight:700;margin-bottom:.4rem}.fl-h small{color:#8d8d99;font-weight:400;margin-left:.5rem;font-size:.8rem}
 div[data-testid=stMetric]{background:#1e1927;border-radius:12px;padding:.5rem .8rem}
@@ -90,6 +90,44 @@ def last_10_flows():
                 out.append(x)
         d = d - pd.Timedelta(days=1)
     return out[::-1]
+
+# ───────────────────────── 交易日曆（證交所休市日） ─────────────────────────
+@st.cache_data(ttl=86400, show_spinner=False)
+def tw_holidays(year):
+    """證交所休市日 {date: 名稱}。抓取失敗直接丟例外（不快取失敗結果）。"""
+    r = requests.get("https://www.twse.com.tw/rwd/zh/holidaySchedule/holidaySchedule", timeout=8,
+                     params={"date": year, "response": "json"}, headers={"User-Agent": "Mozilla/5.0"}).json()
+    if r.get("stat") != "OK" or not r.get("data"): raise ValueError("no holiday data")
+    out = {}
+    for row in r["data"]:
+        txt = " ".join(str(x) for x in row)
+        if "開始交易" in txt or "最後交易" in txt: continue      # 這兩類是開市日，不是假日
+        s = str(row[0])
+        m = (re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", s) or re.search(r"(\d{2,3})年(\d{1,2})月(\d{1,2})日", s)
+             or re.search(r"(\d{2,3})/(\d{1,2})/(\d{1,2})", s))
+        if not m: continue
+        y, mo, dd = map(int, m.groups())
+        if y < 1911: y += 1911
+        out[date(y, mo, dd)] = str(row[1]) if len(row) > 1 else "休市"
+    return out
+
+def future_trading_days(after, k):
+    """after 之後的第 1~k 個交易日 → (日期清單, 期間遇到的平日假日 {date: 名稱}, 假日資料是否完整)"""
+    hol, ok, got = {}, True, set()
+    days, skipped, d = [], {}, after
+    while len(days) < k:
+        d += timedelta(days=1)
+        if d.year not in got:
+            got.add(d.year)
+            try: hol.update(tw_holidays(d.year))
+            except Exception: ok = False
+        if d.weekday() >= 5: continue
+        if d in hol: skipped[d] = hol[d]; continue
+        days.append(d)
+    return days, skipped, ok
+
+WD = "一二三四五六日"
+def fmt_d(d): return f"{d:%m/%d}（週{WD[d.weekday()]}）"
 
 # ───────────────────────── 圖表模組(TradingView) ─────────────────────────
 LW = '<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>'
@@ -407,7 +445,13 @@ def strategy_page():
             k[2].metric("停利價", f"{tp:,.2f}" if tp else "—", f"{(tp / s['ep'] - 1) * 100:+.2f}%" if tp else None)
         else:
             ent, stop, tp, how = entry_plan(df, s, em, xm, sl, tp1, sl1)
-            if s["cd"]: st.info(f"⏳ 冷卻中，還需 {s['cd']} 個交易日才能再進場（冷卻結束後參考下列價位）")
+            if s["cd"]:
+                days, skipped, ok = future_trading_days(df.index[-1].date(), s["cd"] + 1)
+                msg = (f"⏳ 冷卻中，還需 {s['cd']} 個交易日｜冷卻結束：{fmt_d(days[s['cd'] - 1])}　"
+                       f"最早可再進場：{fmt_d(days[s['cd']])}（冷卻結束後參考下列價位）")
+                if skipped: msg += "\n\n已排除休市日：" + "、".join(f"{fmt_d(k)} {v}" for k, v in skipped.items())
+                if not ok: msg += "\n\n⚠️ 抓不到證交所休市日資料，目前只排除週末，遇到國定假日請自行順延。"
+                st.info(msg)
             else: st.info(f"⚪ 空手：{how}")
             if ent:
                 if s["cd"]: st.caption(how)
@@ -417,6 +461,8 @@ def strategy_page():
                 k[2].metric("停利價", f"{tp:,.2f}" if tp else "—（強勢單無固定停利，跌破出場線即出）",
                             f"{(tp / ent - 1) * 100:+.2f}%" if tp else None, delta_color="off")
 
+    st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
+    with st.container(key="chart_card_s"):
         l, r = st.columns([5, 2], vertical_alignment="center")
         l.markdown(f"<div class='ttl'>00631L<span>{SYM}</span></div>", unsafe_allow_html=True)
         with r:
@@ -424,10 +470,14 @@ def strategy_page():
         if tf == "分時圖":
             d = load_5m_today(SYM)
             if d.empty: st.warning("目前抓不到 5 分 K 分時資料(可能休市或 Yahoo 暫時無回應)。")
-            else: components.html(intraday_html(d, prev_close(df, d), h=370, step=300, floor=0.5, dec=2, mm=0.01), height=380)
+            else: components.html(intraday_html(d, prev_close(df, d), h=390, step=300, floor=0.5, dec=2, mm=0.01), height=400)
         else:
-            components.html(daily_html(df, h=370, n=120), height=380)
-        if s["trades"]: st.dataframe(pd.DataFrame(s["trades"][-5:][::-1]), hide_index=True, use_container_width=True)
+            components.html(daily_html(df, h=390), height=400)
+    if s["trades"]:
+        st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
+        with st.container(key="trade_card"):
+            st.markdown("<div class='fl-h'>最近 5 筆模擬交易</div>", unsafe_allow_html=True)
+            st.dataframe(pd.DataFrame(s["trades"][-5:][::-1]), hide_index=True, use_container_width=True)
 
 # ───────────────────────── 組版 ─────────────────────────
 with st.container(key="nav"):
