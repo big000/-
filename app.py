@@ -22,11 +22,14 @@ header[data-testid=stHeader],footer,#MainMenu{display:none}
 .st-key-chart_card iframe{border-radius:12px}
 .ttl{color:#fff;font-size:1.05rem;font-weight:700}.ttl span{color:#8d8d99;font-size:.8rem;margin-left:.4rem;font-weight:500}
 .fl-h{color:#fff;font-size:0.95rem;font-weight:700;margin-bottom:.3rem}.fl-h small{color:#8d8d99;font-weight:400;margin-left:.5rem}
-.fl{display:grid;grid-template-columns:50px 110px 1fr 210px;gap:10px;align-items:center;padding:6px 0;border-top:1px solid #2a2433}
-.fl .nm{font-weight:700;color:#fff}.fl .lt{font-size:1.15rem;font-weight:800}.fl .sm{font-size:0.8rem;color:#a9a6b5;line-height:1.5}
+.fl{display:grid;grid-template-columns:50px 130px 1fr 280px;gap:12px;align-items:center;padding:6px 0;border-top:1px solid #2a2433}
+.fl .nm{font-weight:700;color:#fff}.fl .lt{font-size:1.15rem;font-weight:800}
+.fl .sm{font-size:0.8rem;color:#a9a6b5;display:flex;gap:16px;white-space:nowrap}
+.fl .sm b{font-weight:700}
 .bars{display:grid;grid-template-columns:repeat(10,1fr);gap:5px;height:42px}
-.bars>div{display:flex;flex-direction:column}.bars .u,.bars .d{flex:1;display:flex}.bars .u{align-items:flex-end}.bars .d{align-items:flex-start}
-.bars i{display:block;width:100%;border-radius:2px}
+.bars>div{display:flex;flex-direction:column;cursor:pointer}.bars .u,.bars .d{flex:1;display:flex}.bars .u{align-items:flex-end}.bars .d{align-items:flex-start}
+.bars i{display:block;width:100%;border-radius:2px;transition:opacity .2s}
+.bars>div:hover i{opacity:0.7}
 .dates{display:grid;grid-template-columns:repeat(10,1fr);gap:5px;color:#7d7a8a;font-size:0.68rem;text-align:center}
 div[data-testid=stMetric]{background:#1e1927;border-radius:12px;padding:.5rem .8rem}
 div[data-testid=stMetric] label p{color:#a9a6b5!important}div[data-testid=stMetricValue]{color:#fff}
@@ -51,7 +54,6 @@ def load_intraday():
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_5m_intraday(sym):
-    """抓取 00631L 的 5 分 K 資料以精準對齊進出場點與高低點"""
     d = _clean(yf.download(sym, period="5d", interval="5m", progress=False))
     if d.empty: return d
     d.index = d.index.tz_convert(TZ)
@@ -171,16 +173,56 @@ def flows_html(days):
         ok = (a >= 0) == up
         return f"<i style='height:{abs(a) / mx * 100:.0f}%;background:{UP if up else DN}'></i>" if ok else ""
     col = lambda a: UP if a >= 0 else DN
-    h = "<div class='fl-h'>近 10 日三大法人買賣超<small>上市 · 億元 · 紅＝買超 綠＝賣超</small></div>"
+    
+    # 準備各日數據的 JSON 結構供前端互動使用
+    raw_data = []
+    for i, x in enumerate(days):
+        v_f, v_t, v_z = x["外資"]/1e8, x["投信"]/1e8, x["自營"]/1e8
+        raw_data.append({
+            "d": x["d"],
+            "外資": f"{v_f:+,.1f}億", "外資c": col(v_f),
+            "投信": f"{v_t:+,.1f}億", "投信c": col(v_t),
+            "自營": f"{v_z:+,.1f}億", "自營c": col(v_z)
+        })
+
+    h = "<div class='fl-h'>近 10 日三大法人買賣超<small>上市 · 億元 · 紅＝買超 綠＝賣超（滑鼠移至長條可查看該日數值）</small></div>"
+    
     for k in ("外資", "投信", "自營"):
         v = [x[k] / 1e8 for x in days]; mx = max(abs(a) for a in v) or 1
-        bars = "".join(f"<div><div class='u'>{bar(a, mx, True)}</div><div class='d'>{bar(a, mx, False)}</div></div>" for a in v)
+        bars = "".join(f"<div onmouseover='updateFlow({i})'><div class='u'>{bar(a, mx, True)}</div><div class='d'>{bar(a, mx, False)}</div></div>" for i, a in enumerate(v))
         s5, s10 = sum(v[-5:]), sum(v)
-        h += (f"<div class='fl'><div class='nm'>{k}</div><div class='lt' style='color:{col(v[-1])}'>{v[-1]:+,.1f}億</div>"
-              f"<div class='bars'>{bars}</div><div class='sm'>近 5 日 <b style='color:{col(s5)}'>{s5:+,.1f}億</b><br>"
-              f"近 10 日 <b style='color:{col(s10)}'>{s10:+,.1f}億</b></div></div>")
-    dates = "".join(f"<span>{x['d']}</span>" for x in days)
-    return h + f"<div class='fl' style='border:0;padding-top:0'><div></div><div></div><div class='dates'>{dates}</div><div></div></div>"
+        last_v = v[-1]
+        
+        h += (f"<div class='fl'><div class='nm'>{k}</div>"
+              f"<div class='lt' id='val_{k}' style='color:{col(last_v)}'>{last_v:+,.1f}億</div>"
+              f"<div class='bars' onmouseleave='resetFlow()'>{bars}</div>"
+              f"<div class='sm'><div>近 5 日 <b style='color:{col(s5)}'>{s5:+,.1f}億</b></div>"
+              f"<div>近 10 日 <b style='color:{col(s10)}'>{s10:+,.1f}億</b></div></div></div>")
+        
+    dates = "".join(f"<div style='cursor:pointer' onmouseover='updateFlow({i})'>{x['d']}</div>" for i, x in enumerate(days))
+    
+    # 注入前端互動 JavaScript
+    js_code = f"""
+    <script>
+    const flowData = {json.dumps(raw_data)};
+    const lastIdx = flowData.length - 1;
+    function updateFlow(i) {{
+        const d = flowData[i];
+        if(!d) return;
+        ['外資', '投信', '自營'].forEach(k => {{
+            const el = document.getElementById('val_' + k);
+            if(el) {{
+                el.innerText = d[k];
+                el.style.color = d[k + 'c'];
+            }}
+        }});
+    }}
+    function resetFlow() {{
+        updateFlow(lastIdx);
+    }}
+    </script>
+    """
+    return h + f"<div class='fl' style='border:0;padding-top:0'><div></div><div></div><div class='dates'>{dates}</div><div></div></div>" + js_code
 
 def market_page():
     daily = load_daily("^TWII")
@@ -206,7 +248,6 @@ def market_page():
 # ───────────────────────── 頁面二：策略 B ─────────────────────────
 @st.cache_data(ttl=300, show_spinner=False)
 def strategy_data():
-    """直接從 Yahoo 取得 3 年歷史資料，並結合 5 分 K 修正當日高低點，徹底移除 Google Sheets 依賴"""
     df = load_daily("00631L.TW", "3y")
     df_5m = load_5m_intraday("00631L.TW")
     
