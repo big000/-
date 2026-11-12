@@ -1,39 +1,38 @@
 import json, time
 from datetime import datetime
-import numpy as np, pandas as pd, pytz, requests, yfinance as yf, gspread
+import numpy as np, pandas as pd, pytz, requests, yfinance as yf
 import streamlit as st
 import streamlit.components.v1 as components
 
 st.set_page_config(page_title="破產後重生之我要靠量化交易發財", page_icon="📈", layout="wide",
-                   initial_sidebar_state="collapsed")
+                    initial_sidebar_state="collapsed")
 TZ = pytz.timezone("Asia/Taipei")
-SHEET_ID = "1wFQpocCryShtp4s4o7vbGXrykayCcyp4"   # ← 請確認這是完整的試算表 ID(通常 44 字元)
-UP, DN = "#ff4d5a", "#22c55e"                     # 台股慣例：紅漲綠跌
+UP, DN = "#ff4d5a", "#22c55e"   # 台股慣例：紅漲綠跌
 
 st.markdown("""<style>
 header[data-testid=stHeader],footer,#MainMenu{display:none}
-.stApp{background:linear-gradient(135deg,#f8c8e6 0%,#dcb8fb 52%,#b9a6f7 100%);background-attachment:fixed}
-.block-container{padding:0!important;max-width:100%!important}
-.st-key-nav{background:#0b0b0e;padding:.7rem 2rem;border-bottom:1px solid #26262d;box-shadow:0 4px 24px rgba(60,20,100,.35)}
-.st-key-nav h1{color:#FFC83D;font-size:1.5rem;font-weight:800;letter-spacing:.05em;margin:0;padding:0}
-.st-key-nav [data-testid=stHorizontalBlock]{align-items:center}
-.st-key-body{padding:1.5rem 2rem 3rem}
-.st-key-chart_card{background:#000;border-radius:22px;padding:1rem 1.2rem .8rem;box-shadow:0 14px 40px rgba(70,30,120,.35)}
-.st-key-flow_card,.st-key-strat_card{background:#15111c;border-radius:22px;padding:1.1rem 1.5rem;color:#e8e6ee;box-shadow:0 14px 40px rgba(70,30,120,.3)}
-.st-key-chart_card iframe{border-radius:14px}
-.ttl{color:#fff;font-size:1.15rem;font-weight:700}.ttl span{color:#8d8d99;font-size:.85rem;margin-left:.5rem;font-weight:500}
-.fl-h{color:#fff;font-size:1.05rem;font-weight:700;margin-bottom:.4rem}.fl-h small{color:#8d8d99;font-weight:400;margin-left:.6rem}
-.fl{display:grid;grid-template-columns:60px 120px 1fr 230px;gap:14px;align-items:center;padding:9px 0;border-top:1px solid #2a2433}
-.fl .nm{font-weight:700;color:#fff}.fl .lt{font-size:1.25rem;font-weight:800}.fl .sm{font-size:.85rem;color:#a9a6b5;line-height:1.7}
-.bars{display:grid;grid-template-columns:repeat(10,1fr);gap:7px;height:58px}
+.stApp{background:linear-gradient(135deg,#f8c8e6 0%,#dcb8fb 52%,#b9a6f7 100%);background-attachment:fixed;overflow:hidden}
+.block-container{padding:0!important;max-width:100%!important;height:100vh;display:flex;flex-direction:column}
+.st-key-nav{background:#0b0b0e;padding:.5rem 1.5rem;border-bottom:1px solid #26262d;box-shadow:0 4px 24px rgba(60,20,100,.35);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.st-key-nav h1{color:#FFC83D;font-size:1.3rem;font-weight:800;letter-spacing:.05em;margin:0;padding:0;line-height:1.2}
+.st-key-nav [data-testid=stHorizontalBlock]{align-items:center;width:100%;margin:0}
+.st-key-body{padding:.8rem 1.2rem;flex:1;display:flex;flex-direction:column;overflow:hidden}
+.st-key-chart_card{background:#000;border-radius:18px;padding:.8rem 1rem .6rem;box-shadow:0 10px 30px rgba(70,30,120,.35)}
+.st-key-flow_card,.st-key-strat_card{background:#15111c;border-radius:18px;padding:.8rem 1.2rem;color:#e8e6ee;box-shadow:0 10px 30px rgba(70,30,120,.3)}
+.st-key-chart_card iframe{border-radius:12px}
+.ttl{color:#fff;font-size:1.05rem;font-weight:700}.ttl span{color:#8d8d99;font-size:.8rem;margin-left:.4rem;font-weight:500}
+.fl-h{color:#fff;font-size:1rem;font-weight:700;margin-bottom:.3rem}.fl-h small{color:#8d8d99;font-weight:400;margin-left:.5rem}
+.fl{display:grid;grid-template-columns:50px 110px 1fr 210px;gap:12px;align-items:center;padding:7px 0;border-top:1px solid #2a2433}
+.fl .nm{font-weight:700;color:#fff}.fl .lt{font-size:1.15rem;font-weight:800}.fl .sm{font-size:.8rem;color:#a9a6b5;line-height:1.6}
+.bars{display:grid;grid-template-columns:repeat(10,1fr);gap:6px;height:48px}
 .bars>div{display:flex;flex-direction:column}.bars .u,.bars .d{flex:1;display:flex}.bars .u{align-items:flex-end}.bars .d{align-items:flex-start}
 .bars i{display:block;width:100%;border-radius:3px}
-.dates{display:grid;grid-template-columns:repeat(10,1fr);gap:7px;color:#7d7a8a;font-size:.72rem;text-align:center}
-div[data-testid=stMetric]{background:#1e1927;border-radius:14px;padding:.7rem 1rem}
-div[data-testid=stMetric] label p{color:#a9a6b5!important}div[data-testid=stMetricValue]{color:#fff}
+.dates{display:grid;grid-template-columns:repeat(10,1fr);gap:6px;color:#7d7a8a;font-size:.7rem;text-align:center}
+div[data-testid=stMetric]{background:#1e1927;border-radius:12px;padding:.5rem .8rem}
+div[data-testid=stMetric] label p{color:#a9a6b5!important;font-size:.85rem}div[data-testid=stMetricValue]{color:#fff;font-size:1.25rem}
 </style>""", unsafe_allow_html=True)
 
-# ───────────────────────── 資料 ─────────────────────────
+# ───────────────────────── 資料獲取 ─────────────────────────
 def _clean(d):
     d.columns = [c[0] if isinstance(c, tuple) else c for c in d.columns]
     d = d[~d.index.duplicated()]
@@ -44,11 +43,19 @@ def load_daily(sym, period="3y"):
     return _clean(yf.download(sym, period=period, interval="1d", auto_adjust=False, progress=False))
 
 @st.cache_data(ttl=60, show_spinner=False)
-def load_intraday():
+def load_intraday_twii():
     d = _clean(yf.download("^TWII", period="5d", interval="1m", progress=False))
     if d.empty: return d
     d.index = d.index.tz_convert(TZ)
     return d[np.array([x.date() for x in d.index]) == d.index[-1].date()]
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_intraday_00631l():
+    # 抓取 00631L 近期 5 分 K 資料以提供高精度盤中判斷
+    d = _clean(yf.download("00631L.TW", period="5d", interval="5m", progress=False))
+    if d.empty: return d
+    d.index = d.index.tz_convert(TZ)
+    return d
 
 @st.cache_data(ttl=900, show_spinner=False)
 def twse_day(ymd):
@@ -70,43 +77,49 @@ def last_10_flows():
         if len(out) == 10: break
         if d.weekday() < 5:
             x = twse_day(d.strftime("%Y%m%d"))
-            if x: x["d"] = d.strftime("%m/%d"); out.append(x)
+            if x: x["d"] = f"{d.month:02d}/{d.day:02d}"; out.append(x)
         d = d - pd.Timedelta(days=1)
     return out[::-1]
 
-# ───────────────────────── 圖表(TradingView lightweight-charts) ─────────────────────────
+# ───────────────────────── 圖表(Lightweight Charts JS) ─────────────────────────
 LW = '<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>'
 BASE = LW + '''<style>html,body{margin:0;background:#000;font-family:-apple-system,"Noto Sans TC","Microsoft JhengHei",sans-serif}
 #w{position:relative}#cv{position:absolute;left:0;top:0;pointer-events:none}
-#lg{position:absolute;left:12px;top:8px;z-index:5;font-size:12.5px;line-height:1.7;color:#cfcfd8;pointer-events:none;text-shadow:0 0 5px #000}</style>
+#lg{position:absolute;left:12px;top:6px;z-index:5;font-size:12px;line-height:1.6;color:#cfcfd8;pointer-events:none;text-shadow:0 0 4px #000}</style>
 <div id="w"><div id="c"></div><canvas id="cv"></canvas><div id="lg"></div></div><script>
 const UP="#ff4d5a",DN="#22c55e",H=__H__,el=document.getElementById("c"),lg=document.getElementById("lg"),D=__DATA__;
 const pad=n=>String(n).padStart(2,"0"),f2=x=>x.toLocaleString("en",{minimumFractionDigits:2,maximumFractionDigits:2});
 const big=v=>v>=1e8?(v/1e8).toFixed(1)+"億":v>=1e4?(v/1e4).toFixed(0)+"萬":v;
+const fmtM=t=>{if(!t)return"";const parts=t.split("-");return parts.length===3?parts[1]+"/"+parts[2]:t;};
 const mk=o=>LightweightCharts.createChart(el,Object.assign({width:el.clientWidth,height:H,
-layout:{background:{color:"#000"},textColor:"#9a9aa6",fontSize:12},
-grid:{vertLines:{color:"rgba(255,255,255,.05)"},horzLines:{color:"rgba(255,255,255,.05)"}},
+layout:{background:{color:"#000"},textColor:"#9a9aa6",fontSize:11},
+grid:{vertLines:{color:"rgba(255,255,255,.04)"},horzLines:{color:"rgba(255,255,255,.04)"}},
 crosshair:{mode:0,vertLine:{style:2,width:1,color:"rgba(255,255,255,.4)",labelBackgroundColor:"#3b3b46"},
 horzLine:{style:2,width:1,color:"rgba(255,255,255,.4)",labelBackgroundColor:"#3b3b46"}},
 rightPriceScale:{borderColor:"#1f1f26"}},o));
-const tkey=t=>typeof t==="string"?t:(t&&t.year?t.year+"-"+pad(t.month)+"-"+pad(t.day):t);
+const tkey=t=>typeof t==="string"?t:(t&&t.year?t.year+"-"+pad(t.month)+"-" +pad(t.day):t);
 let chart;addEventListener("resize",()=>{chart.applyOptions({width:el.clientWidth});window.redraw&&redraw()});
 '''
-DAILY_JS = '''chart=mk({timeScale:{borderColor:"#1f1f26",rightOffset:3}});const n=D.k.length;
+DAILY_JS = '''chart=mk({timeScale:{borderColor:"#1f1f26",rightOffset:3,timeVisible:false,tickMarkFormatter:t=>{
+const d=new Date(t.year?t.year:t, (t.month?t.month:1)-1, t.day?t.day:1);
+return pad(d.getMonth()+1)+"/"+pad(d.getDate());
+}});
+const n=D.k.length;
 const cs=chart.addCandlestickSeries({upColor:UP,downColor:DN,borderUpColor:UP,borderDownColor:DN,wickUpColor:UP,wickDownColor:DN});
-cs.setData(D.k);cs.priceScale().applyOptions({scaleMargins:{top:.12,bottom:.26}});
+cs.setData(D.k);cs.priceScale().applyOptions({scaleMargins:{top:.10,bottom:.24}});
 const vs=chart.addHistogramSeries({priceFormat:{type:"volume"},priceScaleId:"v",lastValueVisible:false,priceLineVisible:false});
 vs.setData(D.k.map((b,i)=>({time:b.time,value:D.v[i],color:b.close>=b.open?"rgba(255,77,90,.55)":"rgba(34,197,94,.55)"})));
-chart.priceScale("v").applyOptions({scaleMargins:{top:.8,bottom:0}});
+chart.priceScale("v").applyOptions({scaleMargins:{top:.78,bottom:0}});
 const C={5:"#fbbf24",10:"#60a5fa",20:"#c084fc",60:"#34d399",240:"#f472b6"};
 for(const p in C){const s=chart.addLineSeries({color:C[p],lineWidth:1,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});
 s.setData(D.k.map((b,i)=>({time:b.time,value:D.m[p][i]})).filter(x=>x.value!=null))}
-chart.timeScale().setVisibleLogicalRange({from:n-40,to:n+3});
+chart.timeScale().setVisibleLogicalRange({from:n-38,to:n+3});
 const idx={};D.k.forEach((b,i)=>idx[b.time]=i);
 function show(t){const i=(t in idx)?idx[t]:n-1,b=D.k[i],p=i?D.k[i-1].close:b.open,ch=b.close-p,pc=ch/p*100,c=ch>=0?UP:DN,s=ch>=0?"+":"";
-lg.innerHTML=`<b style="color:#fff">${b.time}</b>　開 ${f2(b.open)}　高 ${f2(b.high)}　低 ${f2(b.low)}　收 <b style="color:${c}">${f2(b.close)}</b>　<span style="color:${c}">${s}${f2(ch)} (${s}${pc.toFixed(2)}%)</span>　量 ${big(D.v[i])}<br>`+
-Object.keys(C).map(k=>`<span style="color:${C[k]}">MA${k} ${D.m[k][i]==null?"--":f2(D.m[k][i])}</span>`).join("　")}
+lg.innerHTML=`<b style="color:#fff">${fmtM(b.time)}</b> 開 ${f2(b.open)} 高 ${f2(b.high)} 低 ${f2(b.low)} 收 <b style="color:${c}">${f2(b.close)}</b> <span style="color:${c}">${s}${f2(ch)} (${s}${pc.toFixed(2)}%)</span> 量 ${big(D.v[i])}<br>`+
+Object.keys(C).map(k=>`<span style="color:${C[k]}">MA${k} ${D.m[k][i]==null?"--":f2(D.m[k][i])}</span>`).join(" ")}
 chart.subscribeCrosshairMove(q=>show(tkey(q.time)));show();</script>'''
+
 INTRA_JS = '''chart=mk({handleScroll:false,handleScale:false,timeScale:{visible:false,fixLeftEdge:true,fixRightEdge:true},
 rightPriceScale:{borderColor:"#1f1f26",scaleMargins:{top:.1,bottom:.12}}});
 const s=chart.addBaselineSeries({baseValue:{type:"price",price:0},topLineColor:UP,topFillColor1:"rgba(255,77,90,.38)",topFillColor2:"rgba(255,77,90,.03)",
@@ -121,15 +134,15 @@ const cv=document.getElementById("cv"),dpr=window.devicePixelRatio||1;
 function redraw(){const w=el.clientWidth;cv.width=w*dpr;cv.height=H*dpr;cv.style.width=w+"px";cv.style.height=H+"px";
 const g=cv.getContext("2d");g.scale(dpr,dpr);g.font="11px sans-serif";g.textAlign="center";
 D.grid.forEach(t=>{const x=chart.timeScale().timeToCoordinate(t);if(x==null)return;const hr=t%3600===0,d=new Date(t*1000);
-g.strokeStyle=hr?"rgba(255,255,255,.30)":"rgba(255,255,255,.10)";g.lineWidth=hr?1.8:.8;g.beginPath();g.moveTo(x,0);g.lineTo(x,H-22);g.stroke();
-g.fillStyle=hr?"#cfcfd8":"#7d7d8a";g.fillText(pad(d.getUTCHours())+":"+pad(d.getUTCMinutes()),x,H-6)})}
+g.strokeStyle=hr?"rgba(255,255,255,.30)":"rgba(255,255,255,.10)";g.lineWidth=hr?1.6:.8;g.beginPath();g.moveTo(x,0);g.lineTo(x,H-20);g.stroke();
+g.fillStyle=hr?"#cfcfd8":"#7d7d8a";g.fillText(pad(d.getUTCHours())+":"+pad(d.getUTCMinutes()),x,H-5)})}
 chart.timeScale().subscribeVisibleLogicalRangeChange(redraw);setTimeout(redraw,80);setTimeout(redraw,400);
 function show(t){const p=have[t]||D.pts[D.pts.length-1];if(!p){lg.textContent="尚無資料";return}
 const ch=p[1],pc=ch/D.prev*100,c=ch>=0?UP:DN,s=ch>=0?"+":"",d=new Date(p[0]*1000);
-lg.innerHTML=`<b style="color:#fff">${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}</b>　指數 <b style="color:${c}">${f2(p[2])}</b>　<span style="color:${c}">${s}${f2(ch)} (${s}${pc.toFixed(2)}%)</span>　昨收 ${f2(D.prev)}`}
+lg.innerHTML=`<b style="color:#fff">${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}</b> 指數 <b style="color:${c}">${f2(p[2])}</b> <span style="color:${c}">${s}${f2(ch)} (${s}${pc.toFixed(2)}%)</span> 昨收 ${f2(D.prev)}`}
 chart.subscribeCrosshairMove(q=>show(q.time));show();</script>'''
 
-def daily_html(df, h=520, n=150):
+def daily_html(df, h=400, n=140):
     d = df.copy()
     if "Volume" not in d: d["Volume"] = 0
     for p in (5, 10, 20, 60, 240): d[f"MA{p}"] = d.Close.rolling(p).mean()
@@ -140,7 +153,7 @@ def daily_html(df, h=520, n=150):
     data = dict(k=k, v=[int(x) if pd.notna(x) else 0 for x in d.Volume], m=m)
     return (BASE + DAILY_JS).replace("__H__", str(h)).replace("__DATA__", json.dumps(data))
 
-def intraday_html(d, prev, h=470):
+def intraday_html(d, prev, h=400):
     off = 8 * 3600
     base = int(d.index[-1].normalize().timestamp()) + off
     pts = [[int(t.timestamp()) + off, round(float(c) - prev, 2), round(float(c), 2)] for t, c in d.Close.items()]
@@ -175,65 +188,34 @@ def market_page():
         l.markdown("<div class='ttl'>加權指數<span>^TWII</span></div>", unsafe_allow_html=True)
         with r: tf = pick("週期", ["分時圖", "日線圖"], "tf")
         if tf == "分時圖":
-            d = load_intraday()
+            d = load_intraday_twii()
             if d.empty or daily.empty: st.warning("目前抓不到分時資料(可能休市或 Yahoo 暫時無回應)。")
             else:
                 dts = pd.DatetimeIndex(daily.index).tz_localize(None).date
                 prev = daily.Close[dts < d.index[-1].date()].iloc[-1]
-                components.html(intraday_html(d, prev), height=480)
+                components.html(intraday_html(d, prev, h=390), height=400)
         elif daily.empty: st.warning("日線資料載入失敗。")
-        else: components.html(daily_html(daily), height=530)
-    st.markdown("<div style='height:1.2rem'></div>", unsafe_allow_html=True)
+        else: components.html(daily_html(daily, h=400), height=410)
+    st.markdown("<div style='height:.5rem'></div>", unsafe_allow_html=True)
     with st.container(key="flow_card"):
         with st.spinner("讀取證交所三大法人…"): days = last_10_flows()
         if days: st.markdown(flows_html(days), unsafe_allow_html=True)
         else: st.warning("目前無法取得證交所三大法人資料。")
 
 # ───────────────────────── 頁面二：策略 B ─────────────────────────
-@st.cache_resource
-def get_sheet():
-    gc = gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
-    return gc.open_by_key(SHEET_ID).sheet1
-
-@st.cache_data(ttl=300, show_spinner=False)
-def read_sheet():
-    df = pd.DataFrame(get_sheet().get_all_records()).rename(columns={
-        "年月日": "Date", "開盤價(元)": "Open", "最高價(元)": "High", "最低價(元)": "Low", "收盤價(元)": "Close"})
-    df["Date"] = pd.to_datetime(df["Date"].astype(str), format="%Y%m%d")
-    return df.set_index("Date")[["Open", "High", "Low", "Close"]].astype(float)
-
-def strategy_data():
-    """Google Sheets 優先；連不上就退回 Yahoo，不再讓整頁掛掉"""
-    live = load_daily("00631L.TW", "5d")
-    try:
-        df = read_sheet().copy()
-    except Exception as e:
-        return load_daily("00631L.TW"), f"未連上 Google Sheets，暫用 Yahoo 資料。原因：{type(e).__name__}: {e}"
-    if not live.empty and live.index[-1] > df.index[-1]:
-        now, row = datetime.now(TZ), live.iloc[-1]
-        if now.hour >= 14 and now.weekday() < 5 and live.index[-1].date() == now.date():
-            try:
-                get_sheet().append_row(["00631L 元大台灣50正2", live.index[-1].strftime("%Y%m%d")] +
-                                       [round(float(row[c]), 4) for c in ("Open", "High", "Low", "Close")])
-                st.toast("✅ 今日收盤資料已寫入 Google Sheets")
-            except Exception as e: st.toast(f"寫入失敗：{e}")
-        df.loc[live.index[-1]] = row[["Open", "High", "Low", "Close"]].astype(float)
-    return df, None
-
 def simulate(df, em, xm, sl, tp1, sl1, cool):
     d = df.copy()
     for p in (5, 10, 240): d[f"m{p}"] = d.Close.rolling(p).mean()
     O, Hh, L, C, M5, M10, M240 = (d[c].values for c in ("Open", "High", "Low", "Close", "m5", "m10", "m240"))
     pos, ep, reg, ei, last, tr = 0, 0., 0, 0, -9999, []
-    line = lambda ep, reg, m5: (ep * (1 - sl1), ep * (1 + tp1)) if reg == 1 else (max(ep * (1 - sl), m5 * xm), None)
     def close(i, xp, why):
         nonlocal pos, last
-        tr.append(dict(進場日=d.index[ei].date(), 進場價=round(ep, 2), 出場日=d.index[i].date(), 出場價=round(xp, 2),
+        tr.append(dict(進場日=d.index[ei].strftime("%m/%d"), 進場價=round(ep, 2), 出場日=d.index[i].strftime("%m/%d"), 出場價=round(xp, 2),
                        報酬率=f"{(xp / ep - 1) * 100 - 0.4:+.2f}%", 原因=why)); pos, last = 0, i
     for i in range(241, len(d)):
         m5, m10, m240, m5b, m10b = M5[i-1], M10[i-1], M240[i-1], M5[i-2], M10[i-2]
         if pos:
-            ln, tp = line(ep, reg, m5)
+            ln, tp = (ep * (1 - sl1), ep * (1 + tp1)) if reg == 1 else (max(ep * (1 - sl), m5 * xm), None)
             if O[i] <= ln or (tp and O[i] >= tp): close(i, O[i], "跳空出場")
             elif L[i] <= ln: close(i, ln, ("弱勢停損" if reg == 1 else "停損" if ep * (1 - sl) >= m5 * xm else "跌破均線"))
             elif tp and Hh[i] >= tp: close(i, tp, "弱勢停利")
@@ -247,20 +229,33 @@ def simulate(df, em, xm, sl, tp1, sl1, cool):
                 elif Hh[i] >= lv: ent, r = lv, 2
             if ent:
                 pos, ep, reg, ei = 1, ent, r, i
-                ln, tp = line(ep, reg, m5)
+                ln, tp = (ep * (1 - sl1), ep * (1 + tp1)) if reg == 1 else (max(ep * (1 - sl), m5 * xm), None)
                 if L[i] <= ln if ent == O[i] else C[i] <= ln: close(i, ln, "當日停損")
     N = len(d)
-    return dict(pos=pos, ep=ep, reg=reg, since=d.index[ei].date() if pos else None,
+    return dict(pos=pos, ep=ep, reg=reg, since=d.index[ei].strftime("%m/%d") if pos else None,
                 cd=max(0, cool + 1 - (N - last)) if last > 0 else 0,
                 m5=M5[-1], m10=M10[-1], m240=M240[-1], m5b=M5[-2], m10b=M10[-2], trades=tr)
 
 def strategy_page():
     with st.container(key="strat_card"):
-        st.markdown("<div class='fl-h'>策略 B：狀態與訊號<small>00631L · 依最近一根已收盤日K推算明日條件</small></div>", unsafe_allow_html=True)
-        with st.spinner("同步歷史資料…"): df, note = strategy_data()
-        if note: st.warning(note + "　（設定方式見下方說明）")
+        st.markdown("<div class='fl-h'>策略 B：狀態與訊號<small>00631L · 結合 5 分 K 與日K推算明日條件</small></div>", unsafe_allow_html=True)
+        with st.spinner("載入 00631L 歷史與 5 分 K 資料…"):
+            df = load_daily("00631L.TW")
+            intraday_631 = load_intraday_00631l()
+            # 若有當日最新 5 分 K 數據，將最新價格更新至模擬結算
+            if not intraday_631.empty:
+                latest_dt = intraday_631.index[-1].normalize()
+                latest_close = float(intraday_631.Close.iloc[-1])
+                latest_high = float(intraday_631.High.max())
+                latest_low = float(intraday_631.Low.min())
+                if latest_dt in df.index:
+                    df.loc[latest_dt, "Close"] = latest_close
+                    df.loc[latest_dt, "High"] = max(df.loc[latest_dt, "High"], latest_high)
+                    df.loc[latest_dt, "Low"] = min(df.loc[latest_dt, "Low"], latest_low)
+        
         if len(df) < 245: st.error("歷史資料不足 245 根，無法計算 240MA。"); return
-        with st.expander("策略參數"):
+        
+        with st.expander("策略參數設定"):
             c = st.columns(6)
             em = c[0].number_input("強勢進場乘數", value=1.04, step=0.01)
             xm = c[1].number_input("強勢出場乘數", value=0.98, step=0.01)
@@ -268,31 +263,40 @@ def strategy_page():
             tp1 = c[3].number_input("弱勢停利 %", value=20.0, step=1.0) / 100
             sl1 = c[4].number_input("弱勢停損 %", value=3.0, step=0.5) / 100
             cool = int(c[5].number_input("冷卻交易日", value=5, step=1))
+            
         s = simulate(df, em, xm, sl, tp1, sl1, cool)
         weak = s["m5"] < s["m240"]
         last = float(df.Close.iloc[-1])
+        
         m = st.columns(4)
         m[0].metric("最新收盤", f"{last:,.2f}", f"{(last / df.Close.iloc[-2] - 1) * 100:+.2f}%")
         m[1].metric("區間", "弱勢 (5MA<240MA)" if weak else "強勢 (5MA≥240MA)")
         m[2].metric("5MA / 10MA", f"{s['m5']:,.1f} / {s['m10']:,.1f}")
         m[3].metric("240MA", f"{s['m240']:,.1f}")
+        
         if s["pos"]:
             ln, tp = (s["ep"] * (1 - sl1), s["ep"] * (1 + tp1)) if s["reg"] == 1 else (max(s["ep"] * (1 - sl), s["m5"] * xm), None)
-            msg = f"🟢 模擬持有中（{'弱勢' if s['reg'] == 1 else '強勢'}單，{s['since']} 進場，成本 {s['ep']:,.2f}）　出場線 {ln:,.2f}" + (f"　停利 {tp:,.2f}" if tp else "")
+            msg = f"🟢 模擬持有中（{'弱勢' if s['reg'] == 1 else '強勢'}單，{s['since']} 進場，成本 {s['ep']:,.2f}） 出場線 {ln:,.2f}" + (f" 停利 {tp:,.2f}" if tp else "")
         elif s["cd"]: msg = f"⏳ 冷卻中，還需 {s['cd']} 個交易日才能再進場"
         elif weak:
             hit = s["m5"] > s["m10"] and s["m5b"] <= s["m10b"]
             msg = "🔔 昨日 5MA 上穿 10MA：明日開盤進場" if hit else "⚪ 空手：等待 5MA 上穿 10MA"
         else: msg = f"⚪ 空手：盤中價 ≥ {s['m5'] * em:,.2f}（5MA × {em}）即進場"
         st.info(msg)
-        st.caption("狀態是用歷史 K 棒依策略規則模擬出來的，不代表你的實際部位。")
-        components.html(daily_html(df, 480), height=490)
-        if s["trades"]: st.dataframe(pd.DataFrame(s["trades"][-8:][::-1]), hide_index=True, use_container_width=True)
+        
+        components.html(daily_html(df, h=330, n=120), height=340)
+        if s["trades"]: 
+            tdf = pd.DataFrame(s["trades"][-5:][::-1])
+            st.dataframe(tdf, hide_index=True, use_container_width=True)
 
-# ───────────────────────── 組版 ─────────────────────────
+# ───────────────────────── 組版 (Header + Body) ─────────────────────────
 with st.container(key="nav"):
-    a, b = st.columns([5, 2])
+    a, b = st.columns([6, 2], vertical_alignment="center")
     a.markdown("<h1>破產後重生之我要靠量化交易發財</h1>", unsafe_allow_html=True)
     with b: view = pick("頁面", ["大盤", "策略"], "view")
+
 with st.container(key="body"):
+market_page() if view == "大盤" else strategy_page()
+
+  
     market_page() if view == "大盤" else strategy_page()
