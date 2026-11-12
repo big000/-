@@ -235,5 +235,118 @@ def market_page():
     with st.container(key="chart_card"):
         l, r = st.columns([5, 2], vertical_alignment="center")
         l.markdown("<div class='ttl'>加權指數<span>^TWII</span></div>", unsafe_allow_html=True)
-        with r: tf = pick("週期", ["分時圖", "日線圖"], "tf")
+        with r: 
+            tf = pick("週期", ["分時圖", "日線圖"], "tf")
         if tf == "分時圖":
+            d = load_intraday()
+            if d.empty or daily.empty: 
+                st.warning("目前抓不到分時資料(可能休市或 Yahoo 暫時無回應)。")
+            else:
+                dts = pd.DatetimeIndex(daily.index).tz_localize(None).date
+                prev = daily.Close[dts < d.index[-1].date()].iloc[-1]
+                components.html(intraday_html(d, prev, h=390), height=400)
+        elif daily.empty: 
+            st.warning("日線資料載入失敗。")
+        else: 
+            components.html(daily_html(daily, h=390), height=400)
+            
+    st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
+    with st.container(key="flow_card"):
+        with st.spinner("讀取證交所三大法人…"): 
+            days = last_10_flows()
+        if days: 
+            st.markdown(flows_html(days), unsafe_allow_html=True)
+        else: 
+            st.warning("目前無法取得證交所三大法人資料。")
+
+# ───────────────────────── 頁面二：策略 B ─────────────────────────
+@st.cache_data(ttl=300, show_spinner=False)
+def strategy_data():
+    df = load_daily("00631L.TW", "3y")
+    df_5m = load_5m_intraday("00631L.TW")
+    
+    if not df.empty and not df_5m.empty:
+        last_idx = df.index[-1]
+        if df_5m.index[-1].date() == last_idx.date():
+            df.loc[last_idx, "High"] = max(df.loc[last_idx, "Open"], df.loc[last_idx, "Close"], df_5m["High"].max())
+            df.loc[last_idx, "Low"] = min(df.loc[last_idx, "Open"], df.loc[last_idx, "Close"], df_5m["Low"].min())
+            df.loc[last_idx, "Close"] = df_5m["Close"].iloc[-1]
+            df.loc[last_idx, "Volume"] += df_5m["Volume"].sum()
+            
+    return df, None
+
+def simulate(df, em, xm, sl, tp1, sl1, cool):
+    d = df.copy()
+    for p in (5, 10, 240): d[f"m{p}"] = d.Close.rolling(p).mean()
+    O, Hh, L, C, M5, M10, M240 = (d[c].values for c in ("Open", "High", "Low", "Close", "m5", "m10", "m240"))
+    pos, ep, reg, ei, last, tr = 0, 0., 0, 0, -9999, []
+    line = lambda ep, reg, m5: (ep * (1 - sl1), ep * (1 + tp1)) if reg == 1 else (max(ep * (1 - sl), m5 * xm), None)
+    def close(i, xp, why):
+        nonlocal pos, last
+        tr.append(dict(進場日=d.index[ei].date(), 進場價=round(ep, 2), 出場日=d.index[i].date(), 出場價=round(xp, 2),
+                       報酬率=f"{(xp / ep - 1) * 100 - 0.4:+.2f}%", 原因=why)); pos, last = 0, i
+    for i in range(241, len(d)):
+        m5, m10, m240, m5b, m10b = M5[i-1], M10[i-1], M240[i-1], M5[i-2], M10[i-2]
+        if pos:
+            ln, tp = line(ep, reg, m5)
+            if O[i] <= ln or (tp and O[i] >= tp): close(i, O[i], "跳空出場")
+            elif L[i] <= ln: close(i, ln, ("弱勢停損" if reg == 1 else "停損" if ep * (1 - sl) >= m5 * xm else "跌破均線"))
+            elif tp and Hh[i] >= tp: close(i, tp, "弱勢停利")
+        if not pos and i - last > cool:
+            ent = None
+            if m5 < m240:
+                if m5 > m10 and m5b <= m10b: ent, r = O[i], 1
+            else:
+                lv = m5 * em
+                if O[i] >= lv: ent, r = O[i], 2
+                elif Hh[i] >= lv: ent, r = lv, 2
+            if ent:
+                pos, ep, reg, ei = 1, ent, r, i
+                ln, tp = line(ep, reg, m5)
+                if L[i] <= ln if ent == O[i] else C[i] <= ln: close(i, ln, "當日停損")
+    N = len(d)
+    return dict(pos=pos, ep=ep, reg=reg, since=d.index[ei].date() if pos else None,
+                cd=max(0, cool + 1 - (N - last)) if last > 0 else 0,
+                m5=M5[-1], m10=M10[-1], m240=M240[-1], m5b=M5[-2], m10b=M10[-2], trades=tr)
+
+def strategy_page():
+    with st.container(key="strat_card"):
+        st.markdown("<div class='fl-h'>策略 B：狀態與訊號<small>00631L · 結合 5 分 K 數據精準判定進出場</small></div>", unsafe_allow_html=True)
+        with st.spinner("同步歷史資料…"): df, note = strategy_data()
+        if note: st.warning(note)
+        if len(df) < 245: st.error("歷史資料不足 245 根，無法計算 240MA。"); return
+        with st.expander("策略參數"):
+            c = st.columns(6)
+            em = c[0].number_input("強勢進場乘數", value=1.04, step=0.01)
+            xm = c[1].number_input("強勢出場乘數", value=0.98, step=0.01)
+            sl = c[2].number_input("強勢停損 %", value=3.0, step=0.5) / 100
+            tp1 = c[3].number_input("弱勢停利 %", value=20.0, step=1.0) / 100
+            sl1 = c[4].number_input("弱勢停損 %", value=3.0, step=0.5) / 100
+            cool = int(c[5].number_input("冷卻交易日", value=5, step=1))
+        s = simulate(df, em, xm, sl, tp1, sl1, cool)
+        weak = s["m5"] < s["m240"]
+        last = float(df.Close.iloc[-1])
+        m = st.columns(4)
+        m[0].metric("最新收盤", f"{last:,.2f}", f"{(last / df.Close.iloc[-2] - 1) * 100:+.2f}%")
+        m[1].metric("區間", "弱勢 (5MA<240MA)" if weak else "強勢 (5MA≥240MA)")
+        m[2].metric("5MA / 10MA", f"{s['m5']:,.1f} / {s['m10']:,.1f}")
+        m[3].metric("240MA", f"{s['m240']:,.1f}")
+        if s["pos"]:
+            ln, tp = (s["ep"] * (1 - sl1), s["ep"] * (1 + tp1)) if s["reg"] == 1 else (max(s["ep"] * (1 - sl), s["m5"] * xm), None)
+            msg = f"🟢 模擬持有中（{'弱勢' if s['reg'] == 1 else '強勢'}單，{s['since']} 進場，成本 {s['ep']:,.2f}） 出場線 {ln:,.2f}" + (f" 停利 {tp:,.2f}" if tp else "")
+        elif s["cd"]: msg = f"⏳ 冷卻中，還需 {s['cd']} 個交易日才能再進場"
+        elif weak:
+            hit = s["m5"] > s["m10"] and s["m5b"] <= s["m10b"]
+            msg = "🔔 昨日 5MA 上穿 10MA：明日開盤進場" if hit else "⚪ 空手：等待 5MA 上穿 10MA"
+        else: msg = f"⚪ 空手：盤中價 ≥ {s['m5'] * em:,.2f}（5MA × {em}）即進場"
+        st.info(msg)
+        components.html(daily_html(df, h=370, n=120), height=380)
+        if s["trades"]: st.dataframe(pd.DataFrame(s["trades"][-5:][::-1]), hide_index=True, use_container_width=True)
+
+# ───────────────────────── 組版 ─────────────────────────
+with st.container(key="nav"):
+    a, b = st.columns([5, 2])
+    a.markdown("<h1>破產後重生之我要靠量化交易發財</h1>", unsafe_allow_html=True)
+    with b: view = pick("頁面", ["大盤", "策略"], "view")
+with st.container(key="body"):
+    market_page() if view == "大盤" else strategy_page()
