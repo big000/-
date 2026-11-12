@@ -1,117 +1,298 @@
-import streamlit as st
-import yfinance as yf
-import pandas as pd
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-import requests
+import json, time
 from datetime import datetime
-import pytz
-import plotly.graph_objects as go
+import numpy as np, pandas as pd, pytz, requests, yfinance as yf, gspread
+import streamlit as st
+import streamlit.components.v1 as components
 
-st.set_page_config(page_title="量化交易監控面板", layout="wide")
+st.set_page_config(page_title="破產後重生之我要靠量化交易發財", page_icon="📈", layout="wide",
+                   initial_sidebar_state="collapsed")
+TZ = pytz.timezone("Asia/Taipei")
+SHEET_ID = "1wFQpocCryShtp4s4o7vbGXrykayCcyp4"   # ← 請確認這是完整的試算表 ID(通常 44 字元)
+UP, DN = "#ff4d5a", "#22c55e"                     # 台股慣例：紅漲綠跌
 
-@st.cache_resource
-def init_gsheets():
+st.markdown("""<style>
+header[data-testid=stHeader],footer,#MainMenu{display:none}
+.stApp{background:linear-gradient(135deg,#f8c8e6 0%,#dcb8fb 52%,#b9a6f7 100%);background-attachment:fixed}
+.block-container{padding:0!important;max-width:100%!important}
+.st-key-nav{background:#0b0b0e;padding:.7rem 2rem;border-bottom:1px solid #26262d;box-shadow:0 4px 24px rgba(60,20,100,.35)}
+.st-key-nav h1{color:#FFC83D;font-size:1.5rem;font-weight:800;letter-spacing:.05em;margin:0;padding:0}
+.st-key-nav [data-testid=stHorizontalBlock]{align-items:center}
+.st-key-body{padding:1.5rem 2rem 3rem}
+.st-key-chart_card{background:#000;border-radius:22px;padding:1rem 1.2rem .8rem;box-shadow:0 14px 40px rgba(70,30,120,.35)}
+.st-key-flow_card,.st-key-strat_card{background:#15111c;border-radius:22px;padding:1.1rem 1.5rem;color:#e8e6ee;box-shadow:0 14px 40px rgba(70,30,120,.3)}
+.st-key-chart_card iframe{border-radius:14px}
+.ttl{color:#fff;font-size:1.15rem;font-weight:700}.ttl span{color:#8d8d99;font-size:.85rem;margin-left:.5rem;font-weight:500}
+.fl-h{color:#fff;font-size:1.05rem;font-weight:700;margin-bottom:.4rem}.fl-h small{color:#8d8d99;font-weight:400;margin-left:.6rem}
+.fl{display:grid;grid-template-columns:60px 120px 1fr 230px;gap:14px;align-items:center;padding:9px 0;border-top:1px solid #2a2433}
+.fl .nm{font-weight:700;color:#fff}.fl .lt{font-size:1.25rem;font-weight:800}.fl .sm{font-size:.85rem;color:#a9a6b5;line-height:1.7}
+.bars{display:grid;grid-template-columns:repeat(10,1fr);gap:7px;height:58px}
+.bars>div{display:flex;flex-direction:column}.bars .u,.bars .d{flex:1;display:flex}.bars .u{align-items:flex-end}.bars .d{align-items:flex-start}
+.bars i{display:block;width:100%;border-radius:3px}
+.dates{display:grid;grid-template-columns:repeat(10,1fr);gap:7px;color:#7d7a8a;font-size:.72rem;text-align:center}
+div[data-testid=stMetric]{background:#1e1927;border-radius:14px;padding:.7rem 1rem}
+div[data-testid=stMetric] label p{color:#a9a6b5!important}div[data-testid=stMetricValue]{color:#fff}
+</style>""", unsafe_allow_html=True)
+
+# ───────────────────────── 資料 ─────────────────────────
+def _clean(d):
+    d.columns = [c[0] if isinstance(c, tuple) else c for c in d.columns]
+    d = d[~d.index.duplicated()]
+    return d.dropna(subset=["Close"])
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_daily(sym, period="3y"):
+    return _clean(yf.download(sym, period=period, interval="1d", auto_adjust=False, progress=False))
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_intraday():
+    d = _clean(yf.download("^TWII", period="5d", interval="1m", progress=False))
+    if d.empty: return d
+    d.index = d.index.tz_convert(TZ)
+    return d[np.array([x.date() for x in d.index]) == d.index[-1].date()]
+
+@st.cache_data(ttl=900, show_spinner=False)
+def twse_day(ymd):
     try:
-        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(st.secrets["gcp_service_account"], scope)
-        client = gspread.authorize(creds)
-        sheet = client.open_by_key('1wFQpocCryShtp4s4o7vbGXrykayCcyp4').sheet1
-        return sheet
-    except Exception as e:
-        st.error(f"Google Sheets 連線失敗: {e}")
+        r = requests.get("https://www.twse.com.tw/rwd/zh/fund/BFI82U", timeout=8,
+                         params={"dayDate": ymd, "type": "day", "response": "json"},
+                         headers={"User-Agent": "Mozilla/5.0"}).json()
+        time.sleep(0.3)
+        if r.get("stat") != "OK": return None
+        t = {row[0]: int(row[3].replace(",", "")) for row in r["data"]}
+        f = lambda k: sum(v for n, v in t.items() if n.startswith(k))
+        return {"外資": f("外資"), "投信": f("投信"), "自營": f("自營商")}
+    except Exception:
         return None
 
-@st.cache_data(ttl=3600)
-def get_twse_institutional_data():
-    url = "https://www.twse.com.tw/rwd/zh/fund/BFI82U?response=json"
-    try:
-        res = requests.get(url, timeout=5).json()
-        if res['stat'] == 'OK':
-            df = pd.DataFrame(res['data'], columns=res['fields'])
-            return df
-        return None
-    except:
-        return None
+def last_10_flows():
+    out, d = [], datetime.now(TZ)
+    for _ in range(30):
+        if len(out) == 10: break
+        if d.weekday() < 5:
+            x = twse_day(d.strftime("%Y%m%d"))
+            if x: x["d"] = d.strftime("%m/%d"); out.append(x)
+        d = d - pd.Timedelta(days=1)
+    return out[::-1]
 
-def sync_data_with_gsheet(sheet):
-    if sheet is None:
-        return pd.DataFrame()
+# ───────────────────────── 圖表(TradingView lightweight-charts) ─────────────────────────
+LW = '<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>'
+BASE = LW + '''<style>html,body{margin:0;background:#000;font-family:-apple-system,"Noto Sans TC","Microsoft JhengHei",sans-serif}
+#w{position:relative}#cv{position:absolute;left:0;top:0;pointer-events:none}
+#lg{position:absolute;left:12px;top:8px;z-index:5;font-size:12.5px;line-height:1.7;color:#cfcfd8;pointer-events:none;text-shadow:0 0 5px #000}</style>
+<div id="w"><div id="c"></div><canvas id="cv"></canvas><div id="lg"></div></div><script>
+const UP="#ff4d5a",DN="#22c55e",H=__H__,el=document.getElementById("c"),lg=document.getElementById("lg"),D=__DATA__;
+const pad=n=>String(n).padStart(2,"0"),f2=x=>x.toLocaleString("en",{minimumFractionDigits:2,maximumFractionDigits:2});
+const big=v=>v>=1e8?(v/1e8).toFixed(1)+"億":v>=1e4?(v/1e4).toFixed(0)+"萬":v;
+const mk=o=>LightweightCharts.createChart(el,Object.assign({width:el.clientWidth,height:H,
+layout:{background:{color:"#000"},textColor:"#9a9aa6",fontSize:12},
+grid:{vertLines:{color:"rgba(255,255,255,.05)"},horzLines:{color:"rgba(255,255,255,.05)"}},
+crosshair:{mode:0,vertLine:{style:2,width:1,color:"rgba(255,255,255,.4)",labelBackgroundColor:"#3b3b46"},
+horzLine:{style:2,width:1,color:"rgba(255,255,255,.4)",labelBackgroundColor:"#3b3b46"}},
+rightPriceScale:{borderColor:"#1f1f26"}},o));
+const tkey=t=>typeof t==="string"?t:(t&&t.year?t.year+"-"+pad(t.month)+"-"+pad(t.day):t);
+let chart;addEventListener("resize",()=>{chart.applyOptions({width:el.clientWidth});window.redraw&&redraw()});
+'''
+DAILY_JS = '''chart=mk({timeScale:{borderColor:"#1f1f26",rightOffset:3}});const n=D.k.length;
+const cs=chart.addCandlestickSeries({upColor:UP,downColor:DN,borderUpColor:UP,borderDownColor:DN,wickUpColor:UP,wickDownColor:DN});
+cs.setData(D.k);cs.priceScale().applyOptions({scaleMargins:{top:.12,bottom:.26}});
+const vs=chart.addHistogramSeries({priceFormat:{type:"volume"},priceScaleId:"v",lastValueVisible:false,priceLineVisible:false});
+vs.setData(D.k.map((b,i)=>({time:b.time,value:D.v[i],color:b.close>=b.open?"rgba(255,77,90,.55)":"rgba(34,197,94,.55)"})));
+chart.priceScale("v").applyOptions({scaleMargins:{top:.8,bottom:0}});
+const C={5:"#fbbf24",10:"#60a5fa",20:"#c084fc",60:"#34d399",240:"#f472b6"};
+for(const p in C){const s=chart.addLineSeries({color:C[p],lineWidth:1,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});
+s.setData(D.k.map((b,i)=>({time:b.time,value:D.m[p][i]})).filter(x=>x.value!=null))}
+chart.timeScale().setVisibleLogicalRange({from:n-40,to:n+3});
+const idx={};D.k.forEach((b,i)=>idx[b.time]=i);
+function show(t){const i=(t in idx)?idx[t]:n-1,b=D.k[i],p=i?D.k[i-1].close:b.open,ch=b.close-p,pc=ch/p*100,c=ch>=0?UP:DN,s=ch>=0?"+":"";
+lg.innerHTML=`<b style="color:#fff">${b.time}</b>　開 ${f2(b.open)}　高 ${f2(b.high)}　低 ${f2(b.low)}　收 <b style="color:${c}">${f2(b.close)}</b>　<span style="color:${c}">${s}${f2(ch)} (${s}${pc.toFixed(2)}%)</span>　量 ${big(D.v[i])}<br>`+
+Object.keys(C).map(k=>`<span style="color:${C[k]}">MA${k} ${D.m[k][i]==null?"--":f2(D.m[k][i])}</span>`).join("　")}
+chart.subscribeCrosshairMove(q=>show(tkey(q.time)));show();</script>'''
+INTRA_JS = '''chart=mk({handleScroll:false,handleScale:false,timeScale:{visible:false,fixLeftEdge:true,fixRightEdge:true},
+rightPriceScale:{borderColor:"#1f1f26",scaleMargins:{top:.1,bottom:.12}}});
+const s=chart.addBaselineSeries({baseValue:{type:"price",price:0},topLineColor:UP,topFillColor1:"rgba(255,77,90,.38)",topFillColor2:"rgba(255,77,90,.03)",
+bottomLineColor:DN,bottomFillColor1:"rgba(34,197,94,.03)",bottomFillColor2:"rgba(34,197,94,.38)",lineWidth:2,priceLineVisible:false,
+priceFormat:{type:"custom",minMove:1,formatter:v=>(v>0?"+":"")+v.toFixed(0)},
+autoscaleInfoProvider:o=>{const r=o(),m=r?Math.max(Math.abs(r.priceRange.minValue),Math.abs(r.priceRange.maxValue),20):50;return{priceRange:{minValue:-m,maxValue:m}}}});
+const have={};D.pts.forEach(p=>have[p[0]]=p);
+s.setData(D.all.map(t=>have[t]?{time:t,value:have[t][1]}:{time:t}));
+s.createPriceLine({price:0,color:"rgba(255,255,255,.6)",lineWidth:1,lineStyle:2,axisLabelVisible:true,title:"昨收 "+f2(D.prev)});
+chart.timeScale().fitContent();
+const cv=document.getElementById("cv"),dpr=window.devicePixelRatio||1;
+function redraw(){const w=el.clientWidth;cv.width=w*dpr;cv.height=H*dpr;cv.style.width=w+"px";cv.style.height=H+"px";
+const g=cv.getContext("2d");g.scale(dpr,dpr);g.font="11px sans-serif";g.textAlign="center";
+D.grid.forEach(t=>{const x=chart.timeScale().timeToCoordinate(t);if(x==null)return;const hr=t%3600===0,d=new Date(t*1000);
+g.strokeStyle=hr?"rgba(255,255,255,.30)":"rgba(255,255,255,.10)";g.lineWidth=hr?1.8:.8;g.beginPath();g.moveTo(x,0);g.lineTo(x,H-22);g.stroke();
+g.fillStyle=hr?"#cfcfd8":"#7d7d8a";g.fillText(pad(d.getUTCHours())+":"+pad(d.getUTCMinutes()),x,H-6)})}
+chart.timeScale().subscribeVisibleLogicalRangeChange(redraw);setTimeout(redraw,80);setTimeout(redraw,400);
+function show(t){const p=have[t]||D.pts[D.pts.length-1];if(!p){lg.textContent="尚無資料";return}
+const ch=p[1],pc=ch/D.prev*100,c=ch>=0?UP:DN,s=ch>=0?"+":"",d=new Date(p[0]*1000);
+lg.innerHTML=`<b style="color:#fff">${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}</b>　指數 <b style="color:${c}">${f2(p[2])}</b>　<span style="color:${c}">${s}${f2(ch)} (${s}${pc.toFixed(2)}%)</span>　昨收 ${f2(D.prev)}`}
+chart.subscribeCrosshairMove(q=>show(q.time));show();</script>'''
 
-    df_local = pd.DataFrame(sheet.get_all_records())
-    if not df_local.empty:
-        df_local.rename(columns={
-            '年月日': 'Date', '開盤價(元)': 'Open', 
-            '最高價(元)': 'High', '最低價(元)': 'Low', '收盤價(元)': 'Close'
-        }, inplace=True)
-        df_local['Date'] = pd.to_datetime(df_local['Date'].astype(str), format='%Y%m%d')
-        df_local.set_index('Date', inplace=True)
-    
-    try:
-        df_today = yf.download("00631L.TW", period="1d", interval="1d")
-        if df_today.empty:
-            return df_local
-            
-        df_today.columns = [col[0] if isinstance(col, tuple) else col for col in df_today.columns]
-        latest_market_date = df_today.index[-1]
-        
-        tw_tz = pytz.timezone('Asia/Taipei')
-        current_time = datetime.now(tw_tz)
-        
-        last_recorded_date = df_local.index[-1] if not df_local.empty else pd.Timestamp('2000-01-01')
-        
-        if latest_market_date > last_recorded_date:
-            if current_time.hour >= 14:
-                new_row = [
-                    "00631L 元大台灣50正2", latest_market_date.strftime('%Y%m%d'),
-                    round(float(df_today.iloc[-1]['Open']), 4), round(float(df_today.iloc[-1]['High']), 4),
-                    round(float(df_today.iloc[-1]['Low']), 4), round(float(df_today.iloc[-1]['Close']), 4)
-                ]
-                sheet.append_row(new_row)
-                st.toast(f"✅ {latest_market_date.strftime('%Y-%m-%d')} 收盤資料已寫入！")
-                df_local.loc[latest_market_date] = df_today.iloc[-1][['Open', 'High', 'Low', 'Close']]
+def daily_html(df, h=520, n=150):
+    d = df.copy()
+    if "Volume" not in d: d["Volume"] = 0
+    for p in (5, 10, 20, 60, 240): d[f"MA{p}"] = d.Close.rolling(p).mean()
+    d = d.tail(n)
+    k = [dict(time=i.strftime("%Y-%m-%d"), open=round(float(r.Open), 2), high=round(float(r.High), 2),
+              low=round(float(r.Low), 2), close=round(float(r.Close), 2)) for i, r in d.iterrows()]
+    m = {p: [None if pd.isna(x) else round(float(x), 2) for x in d[f"MA{p}"]] for p in (5, 10, 20, 60, 240)}
+    data = dict(k=k, v=[int(x) if pd.notna(x) else 0 for x in d.Volume], m=m)
+    return (BASE + DAILY_JS).replace("__H__", str(h)).replace("__DATA__", json.dumps(data))
+
+def intraday_html(d, prev, h=470):
+    off = 8 * 3600
+    base = int(d.index[-1].normalize().timestamp()) + off
+    pts = [[int(t.timestamp()) + off, round(float(c) - prev, 2), round(float(c), 2)] for t, c in d.Close.items()]
+    allt = [base + 9 * 3600 + m * 60 for m in range(271)]
+    data = dict(pts=pts, prev=float(prev), all=allt, grid=[t for t in allt if (t - base) % 1800 == 0])
+    return (BASE + INTRA_JS).replace("__H__", str(h)).replace("__DATA__", json.dumps(data))
+
+def pick(label, opts, key):
+    return st.segmented_control(label, opts, default=opts[0], key=key, label_visibility="collapsed") or opts[0]
+
+# ───────────────────────── 頁面一：大盤 ─────────────────────────
+def flows_html(days):
+    def bar(a, mx, up):
+        ok = (a >= 0) == up
+        return f"<i style='height:{abs(a) / mx * 100:.0f}%;background:{UP if up else DN}'></i>" if ok else ""
+    col = lambda a: UP if a >= 0 else DN
+    h = "<div class='fl-h'>近 10 日三大法人買賣超<small>上市 · 億元 · 紅＝買超 綠＝賣超</small></div>"
+    for k in ("外資", "投信", "自營"):
+        v = [x[k] / 1e8 for x in days]; mx = max(abs(a) for a in v) or 1
+        bars = "".join(f"<div><div class='u'>{bar(a, mx, True)}</div><div class='d'>{bar(a, mx, False)}</div></div>" for a in v)
+        s5, s10 = sum(v[-5:]), sum(v)
+        h += (f"<div class='fl'><div class='nm'>{k}</div><div class='lt' style='color:{col(v[-1])}'>{v[-1]:+,.1f}億</div>"
+              f"<div class='bars'>{bars}</div><div class='sm'>近 5 日 <b style='color:{col(s5)}'>{s5:+,.1f}億</b><br>"
+              f"近 10 日 <b style='color:{col(s10)}'>{s10:+,.1f}億</b></div></div>")
+    dates = "".join(f"<span>{x['d']}</span>" for x in days)
+    return h + f"<div class='fl' style='border:0;padding-top:0'><div></div><div></div><div class='dates'>{dates}</div><div></div></div>"
+
+def market_page():
+    daily = load_daily("^TWII")
+    with st.container(key="chart_card"):
+        l, r = st.columns([5, 2], vertical_alignment="center")
+        l.markdown("<div class='ttl'>加權指數<span>^TWII</span></div>", unsafe_allow_html=True)
+        with r: tf = pick("週期", ["分時圖", "日線圖"], "tf")
+        if tf == "分時圖":
+            d = load_intraday()
+            if d.empty or daily.empty: st.warning("目前抓不到分時資料(可能休市或 Yahoo 暫時無回應)。")
             else:
-                st.toast("🕒 盤中即時試算，不寫入歷史資料庫")
-                df_local.loc[latest_market_date] = df_today.iloc[-1][['Open', 'High', 'Low', 'Close']]
-                
-        return df_local
-    except Exception as e:
-        st.warning(f"即時報價抓取異常: {e}")
-        return df_local
+                dts = pd.DatetimeIndex(daily.index).tz_localize(None).date
+                prev = daily.Close[dts < d.index[-1].date()].iloc[-1]
+                components.html(intraday_html(d, prev), height=480)
+        elif daily.empty: st.warning("日線資料載入失敗。")
+        else: components.html(daily_html(daily), height=530)
+    st.markdown("<div style='height:1.2rem'></div>", unsafe_allow_html=True)
+    with st.container(key="flow_card"):
+        with st.spinner("讀取證交所三大法人…"): days = last_10_flows()
+        if days: st.markdown(flows_html(days), unsafe_allow_html=True)
+        else: st.warning("目前無法取得證交所三大法人資料。")
 
-def plot_intraday(df, title):
-    fig = go.Figure(data=[go.Scatter(x=df.index, y=df['Close'], mode='lines', fill='tozeroy')])
-    fig.update_layout(title=title, template="plotly_white", margin=dict(l=20, r=20, t=40, b=20), height=350)
-    return fig
+# ───────────────────────── 頁面二：策略 B ─────────────────────────
+@st.cache_resource
+def get_sheet():
+    gc = gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
+    return gc.open_by_key(SHEET_ID).sheet1
 
-st.title("📈 量化交易監控面板")
+@st.cache_data(ttl=300, show_spinner=False)
+def read_sheet():
+    df = pd.DataFrame(get_sheet().get_all_records()).rename(columns={
+        "年月日": "Date", "開盤價(元)": "Open", "最高價(元)": "High", "最低價(元)": "Low", "收盤價(元)": "Close"})
+    df["Date"] = pd.to_datetime(df["Date"].astype(str), format="%Y%m%d")
+    return df.set_index("Date")[["Open", "High", "Low", "Close"]].astype(float)
 
-st.header("1. 大盤分時圖與三大法人動向")
-col_chart, col_inst = st.columns([3, 2])
-
-with col_chart:
+def strategy_data():
+    """Google Sheets 優先；連不上就退回 Yahoo，不再讓整頁掛掉"""
+    live = load_daily("00631L.TW", "5d")
     try:
-        twii_intraday = yf.download("^TWII", period="1d", interval="1m")
-        twii_intraday.columns = [col[0] if isinstance(col, tuple) else col for col in twii_intraday.columns]
-        st.plotly_chart(plot_intraday(twii_intraday, "加權指數 (^TWII) 今日分時圖"), use_container_width=True)
-    except:
-        st.error("大盤分時資料載入失敗。")
+        df = read_sheet().copy()
+    except Exception as e:
+        return load_daily("00631L.TW"), f"未連上 Google Sheets，暫用 Yahoo 資料。原因：{type(e).__name__}: {e}"
+    if not live.empty and live.index[-1] > df.index[-1]:
+        now, row = datetime.now(TZ), live.iloc[-1]
+        if now.hour >= 14 and now.weekday() < 5 and live.index[-1].date() == now.date():
+            try:
+                get_sheet().append_row(["00631L 元大台灣50正2", live.index[-1].strftime("%Y%m%d")] +
+                                       [round(float(row[c]), 4) for c in ("Open", "High", "Low", "Close")])
+                st.toast("✅ 今日收盤資料已寫入 Google Sheets")
+            except Exception as e: st.toast(f"寫入失敗：{e}")
+        df.loc[live.index[-1]] = row[["Open", "High", "Low", "Close"]].astype(float)
+    return df, None
 
-with col_inst:
-    st.subheader("三大法人買賣超 (上市)")
-    inst_df = get_twse_institutional_data()
-    if inst_df is not None:
-        st.dataframe(inst_df, hide_index=True, use_container_width=True)
-    else:
-        st.error("目前無法取得證交所三大法人資料。")
+def simulate(df, em, xm, sl, tp1, sl1, cool):
+    d = df.copy()
+    for p in (5, 10, 240): d[f"m{p}"] = d.Close.rolling(p).mean()
+    O, Hh, L, C, M5, M10, M240 = (d[c].values for c in ("Open", "High", "Low", "Close", "m5", "m10", "m240"))
+    pos, ep, reg, ei, last, tr = 0, 0., 0, 0, -9999, []
+    line = lambda ep, reg, m5: (ep * (1 - sl1), ep * (1 + tp1)) if reg == 1 else (max(ep * (1 - sl), m5 * xm), None)
+    def close(i, xp, why):
+        nonlocal pos, last
+        tr.append(dict(進場日=d.index[ei].date(), 進場價=round(ep, 2), 出場日=d.index[i].date(), 出場價=round(xp, 2),
+                       報酬率=f"{(xp / ep - 1) * 100 - 0.4:+.2f}%", 原因=why)); pos, last = 0, i
+    for i in range(241, len(d)):
+        m5, m10, m240, m5b, m10b = M5[i-1], M10[i-1], M240[i-1], M5[i-2], M10[i-2]
+        if pos:
+            ln, tp = line(ep, reg, m5)
+            if O[i] <= ln or (tp and O[i] >= tp): close(i, O[i], "跳空出場")
+            elif L[i] <= ln: close(i, ln, ("弱勢停損" if reg == 1 else "停損" if ep * (1 - sl) >= m5 * xm else "跌破均線"))
+            elif tp and Hh[i] >= tp: close(i, tp, "弱勢停利")
+        if not pos and i - last > cool:
+            ent = None
+            if m5 < m240:
+                if m5 > m10 and m5b <= m10b: ent, r = O[i], 1
+            else:
+                lv = m5 * em
+                if O[i] >= lv: ent, r = O[i], 2
+                elif Hh[i] >= lv: ent, r = lv, 2
+            if ent:
+                pos, ep, reg, ei = 1, ent, r, i
+                ln, tp = line(ep, reg, m5)
+                if L[i] <= ln if ent == O[i] else C[i] <= ln: close(i, ln, "當日停損")
+    N = len(d)
+    return dict(pos=pos, ep=ep, reg=reg, since=d.index[ei].date() if pos else None,
+                cd=max(0, cool + 1 - (N - last)) if last > 0 else 0,
+                m5=M5[-1], m10=M10[-1], m240=M240[-1], m5b=M5[-2], m10b=M10[-2], trades=tr)
 
-st.divider()
+def strategy_page():
+    with st.container(key="strat_card"):
+        st.markdown("<div class='fl-h'>策略 B：狀態與訊號<small>00631L · 依最近一根已收盤日K推算明日條件</small></div>", unsafe_allow_html=True)
+        with st.spinner("同步歷史資料…"): df, note = strategy_data()
+        if note: st.warning(note + "　（設定方式見下方說明）")
+        if len(df) < 245: st.error("歷史資料不足 245 根，無法計算 240MA。"); return
+        with st.expander("策略參數"):
+            c = st.columns(6)
+            em = c[0].number_input("強勢進場乘數", value=1.04, step=0.01)
+            xm = c[1].number_input("強勢出場乘數", value=0.98, step=0.01)
+            sl = c[2].number_input("強勢停損 %", value=3.0, step=0.5) / 100
+            tp1 = c[3].number_input("弱勢停利 %", value=20.0, step=1.0) / 100
+            sl1 = c[4].number_input("弱勢停損 %", value=3.0, step=0.5) / 100
+            cool = int(c[5].number_input("冷卻交易日", value=5, step=1))
+        s = simulate(df, em, xm, sl, tp1, sl1, cool)
+        weak = s["m5"] < s["m240"]
+        last = float(df.Close.iloc[-1])
+        m = st.columns(4)
+        m[0].metric("最新收盤", f"{last:,.2f}", f"{(last / df.Close.iloc[-2] - 1) * 100:+.2f}%")
+        m[1].metric("區間", "弱勢 (5MA<240MA)" if weak else "強勢 (5MA≥240MA)")
+        m[2].metric("5MA / 10MA", f"{s['m5']:,.1f} / {s['m10']:,.1f}")
+        m[3].metric("240MA", f"{s['m240']:,.1f}")
+        if s["pos"]:
+            ln, tp = (s["ep"] * (1 - sl1), s["ep"] * (1 + tp1)) if s["reg"] == 1 else (max(s["ep"] * (1 - sl), s["m5"] * xm), None)
+            msg = f"🟢 模擬持有中（{'弱勢' if s['reg'] == 1 else '強勢'}單，{s['since']} 進場，成本 {s['ep']:,.2f}）　出場線 {ln:,.2f}" + (f"　停利 {tp:,.2f}" if tp else "")
+        elif s["cd"]: msg = f"⏳ 冷卻中，還需 {s['cd']} 個交易日才能再進場"
+        elif weak:
+            hit = s["m5"] > s["m10"] and s["m5b"] <= s["m10b"]
+            msg = "🔔 昨日 5MA 上穿 10MA：明日開盤進場" if hit else "⚪ 空手：等待 5MA 上穿 10MA"
+        else: msg = f"⚪ 空手：盤中價 ≥ {s['m5'] * em:,.2f}（5MA × {em}）即進場"
+        st.info(msg)
+        st.caption("狀態是用歷史 K 棒依策略規則模擬出來的，不代表你的實際部位。")
+        components.html(daily_html(df, 480), height=490)
+        if s["trades"]: st.dataframe(pd.DataFrame(s["trades"][-8:][::-1]), hide_index=True, use_container_width=True)
 
-st.header("2. 策略 B：狀態與訊號 (00631L)")
-
-sheet = init_gsheets()
-with st.spinner("同步 Google Sheets 歷史資料庫中..."):
-    df = sync_data_with_gsheet(sheet)
-
-if not df.empty and len(df) > 240:
-    MA_Len, Entry_Mult, Exit_Mult, StopLoss_Pct = 5, 1.04, 0.
+# ───────────────────────── 組版 ─────────────────────────
+with st.container(key="nav"):
+    a, b = st.columns([5, 2])
+    a.markdown("<h1>破產後重生之我要靠量化交易發財</h1>", unsafe_allow_html=True)
+    with b: view = pick("頁面", ["大盤", "策略"], "view")
+with st.container(key="body"):
+    market_page() if view == "大盤" else strategy_page()
