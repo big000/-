@@ -22,9 +22,11 @@ header[data-testid=stHeader],footer,#MainMenu{display:none}
 .st-key-chart_card iframe{border-radius:12px}
 .ttl{color:#fff;font-size:1.05rem;font-weight:700}.ttl span{color:#8d8d99;font-size:.8rem;margin-left:.4rem;font-weight:500}
 .fl-h{color:#fff;font-size:0.95rem;font-weight:700;margin-bottom:.3rem}.fl-h small{color:#8d8d99;font-weight:400;margin-left:.5rem}
-.fl{display:grid;grid-template-columns:50px 130px 1fr 280px;gap:12px;align-items:center;padding:6px 0;border-top:1px solid #2a2433}
+.fl{display:grid;grid-template-columns:50px 130px 1fr 320px;gap:12px;align-items:center;padding:6px 0;border-top:1px solid #2a2433}
 .fl .nm{font-weight:700;color:#fff}.fl .lt{font-size:1.15rem;font-weight:800}
-.fl .sm{font-size:0.8rem;color:#a9a6b5;display:flex;gap:16px;white-space:nowrap}
+.fl .sm{font-size:0.8rem;color:#a9a6b5;display:flex;flex-direction:column;gap:2px}
+.fl .sm .row{display:flex;gap:16px;white-space:nowrap}
+.fl .sm .headers{font-size:0.72rem;color:#7d7a8a;margin-bottom:1px}
 .fl .sm b{font-weight:700}
 .bars{display:grid;grid-template-columns:repeat(10,1fr);gap:5px;height:42px}
 .bars>div{display:flex;flex-direction:column;cursor:pointer}.bars .u,.bars .d{flex:1;display:flex}.bars .u{align-items:flex-end}.bars .d{align-items:flex-start}
@@ -174,7 +176,6 @@ def flows_html(days):
         return f"<i style='height:{abs(a) / mx * 100:.0f}%;background:{UP if up else DN}'></i>" if ok else ""
     col = lambda a: UP if a >= 0 else DN
     
-    # 準備各日數據的 JSON 結構供前端互動使用
     raw_data = []
     for i, x in enumerate(days):
         v_f, v_t, v_z = x["外資"]/1e8, x["投信"]/1e8, x["自營"]/1e8
@@ -185,7 +186,8 @@ def flows_html(days):
             "自營": f"{v_z:+,.1f}億", "自營c": col(v_z)
         })
 
-    h = "<div class='fl-h'>近 10 日三大法人買賣超<small>上市 · 億元 · 紅＝買超 綠＝賣超（滑鼠移至長條可查看該日數值）</small></div>"
+    h = "<div class='fl-h'>近 10 日三大法人買賣超<small>上市 · 億元 · 紅＝買超 綠＝賣超（滑鼠移至長條或日期可查看該日數值）</small></div>"
+    h += "<div class='fl' style='border:0;padding-bottom:2px'><div class='nm'></div><div class='lt' style='font-size:0.75rem;color:#7d7a8a'>當日買賣超</div><div class='bars' style='height:auto'></div><div class='sm'><div class='headers'><span>近 5 日累積</span><span>近 10 日累積</span></div></div></div>"
     
     for k in ("外資", "投信", "自營"):
         v = [x[k] / 1e8 for x in days]; mx = max(abs(a) for a in v) or 1
@@ -196,12 +198,13 @@ def flows_html(days):
         h += (f"<div class='fl'><div class='nm'>{k}</div>"
               f"<div class='lt' id='val_{k}' style='color:{col(last_v)}'>{last_v:+,.1f}億</div>"
               f"<div class='bars' onmouseleave='resetFlow()'>{bars}</div>"
-              f"<div class='sm'><div>近 5 日 <b style='color:{col(s5)}'>{s5:+,.1f}億</b></div>"
-              f"<div>近 10 日 <b style='color:{col(s10)}'>{s10:+,.1f}億</b></div></div></div>")
+              f"<div class='sm'><div class='row'>"
+              f"<div><b style='color:{col(s5)}'>{s5:+,.1f}億</b></div>"
+              f"<div><b style='color:{col(s10)}'>{s10:+,.1f}億</b></div>"
+              f"</div></div></div>")
         
     dates = "".join(f"<div style='cursor:pointer' onmouseover='updateFlow({i})'>{x['d']}</div>" for i, x in enumerate(days))
     
-    # 注入前端互動 JavaScript
     js_code = f"""
     <script>
     const flowData = {json.dumps(raw_data)};
