@@ -138,66 +138,67 @@ def fmt_d(d): return f"{d:%m/%d}（週{WD[d.weekday()]}）"
 # ───────────────────────── 圖表模組(TradingView) ─────────────────────────
 LW = '<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>'
 
-BASE = LW + """
-<style>html,body{margin:0;background:#000;font-family:-apple-system,"Noto Sans TC","Microsoft JhengHei",sans-serif}
-#w{position:relative}#cv{position:absolute;left:0;top:0;pointer-events:none}
-#lg{position:absolute;left:12px;top:8px;z-index:5;font-size:12px;line-height:1.6;color:#cfcfd8;pointer-events:none;text-shadow:0 0 5px #000}
-</style><div id="w"><div id="c"></div><canvas id="cv"></canvas><div id="lg"></div></div><script>
-const UP="#ff4d5a",DN="#22c55e",H=__H__,el=document.getElementById("c"),lg=document.getElementById("lg"),D=__DATA__;
-const pad=n=>String(n).padStart(2,"0"),f2=x=>x.toLocaleString("en",{minimumFractionDigits:2,maximumFractionDigits:2});
-const big=v=>v>=1e8?(v/1e8).toFixed(1)+"億":v>=1e4?(v/1e4).toFixed(0)+"萬":v;
-const mk=o=>LightweightCharts.createChart(el,Object.assign({width:el.clientWidth,height:H,
-layout:{background:{color:"#000"},textColor:"#9a9aa6",fontSize:11},
-grid:{vertLines:{color:"rgba(255,255,255,.04)"},horzLines:{color:"rgba(255,255,255,.04)"}},
-crosshair:{mode:0,vertLine:{style:2,width:1,color:"rgba(255,255,255,.4)",labelBackgroundColor:"#3b3b46"},
-horzLine:{style:2,width:1,color:"rgba(255,255,255,.4)",labelBackgroundColor:"#3b3b46"}},
-rightPriceScale:{borderColor:"#1f1f26"}},o));
-const tkey=t=>typeof t==="string"?t:(t&&t.year?t.year+"-"+pad(t.month)+"-"+pad(t.day):t);
-let chart;
-addEventListener("resize",()=>{chart.applyOptions({width:el.clientWidth});window.redraw&&redraw()});
-"""
+BASE = LW + (
+    '<style>html,body{margin:0;background:#000;font-family:-apple-system,"Noto Sans TC","Microsoft JhengHei",sans-serif}'
+    '#w{position:relative}#cv{position:absolute;left:0;top:0;pointer-events:none}'
+    '#lg{position:absolute;left:12px;top:8px;z-index:5;font-size:12px;line-height:1.6;color:#cfcfd8;pointer-events:none;text-shadow:0 0 5px #000}'
+    '</style><div id="w"><div id="c"></div><canvas id="cv"></canvas><div id="lg"></div></div><script>'
+    'const UP="#ff4d5a",DN="#22c55e",H=__H__,el=document.getElementById("c"),lg=document.getElementById("lg"),D=__DATA__;'
+    'const pad=n=>String(n).padStart(2,"0"),f2=x=>x.toLocaleString("en",{minimumFractionDigits:2,maximumFractionDigits:2});'
+    'const big=v=>v>=1e8?(v/1e8).toFixed(1)+"億":v>=1e4?(v/1e4).toFixed(0)+"萬":v;'
+    'const mk=o=>LightweightCharts.createChart(el,Object.assign({width:el.clientWidth,height:H,'
+    'layout:{background:{color:"#000"},textColor:"#9a9aa6",fontSize:11},'
+    'localization:{dateFormat:"yyyy/MM/dd"},'
+    'grid:{vertLines:{color:"rgba(255,255,255,.04)"},horzLines:{color:"rgba(255,255,255,.04)"}},'
+    'crosshair:{mode:0,vertLine:{style:2,width:1,color:"rgba(255,255,255,.4)",labelBackgroundColor:"#3b3b46"},'
+    'horzLine:{style:2,width:1,color:"rgba(255,255,255,.4)",labelBackgroundColor:"#3b3b46"}},'
+    'rightPriceScale:{borderColor:"#1f1f26"}},o));'
+    'const tkey=t=>typeof t==="string"?t:(t&&t.year?t.year+"-"+pad(t.month)+"-"+pad(t.day):t);'
+    'let chart;'
+    'addEventListener("resize",()=>{chart.applyOptions({width:el.clientWidth});window.redraw&&redraw()});'
+)
 
-DAILY_JS = """
-chart=mk({timeScale:{borderColor:"#1f1f26",rightOffset:3}});const n=D.k.length;
-const cs=chart.addCandlestickSeries({upColor:UP,downColor:DN,borderUpColor:UP,borderDownColor:DN,wickUpColor:UP,wickDownColor:DN});
-cs.setData(D.k);cs.priceScale().applyOptions({scaleMargins:{top:.1,bottom:.22}});
-const vs=chart.addHistogramSeries({priceFormat:{type:"volume"},priceScaleId:"v",lastValueVisible:false,priceLineVisible:false});
-vs.setData(D.k.map((b,i)=>({time:b.time,value:D.v[i],color:b.close>=b.open?"rgba(255,77,90,.55)":"rgba(34,197,94,.55)"})));
-chart.priceScale("v").applyOptions({scaleMargins:{top:.82,bottom:0}});
-const C={5:"#fbbf24",10:"#60a5fa",20:"#c084fc",60:"#34d399",240:"#f472b6"};
-for(const p in C){const s=chart.addLineSeries({color:C[p],lineWidth:1,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});
-s.setData(D.k.map((b,i)=>({time:b.time,value:D.m[p][i]})).filter(x=>x.value!=null))}
-chart.timeScale().setVisibleLogicalRange({from:n-35,to:n+2});
-const idx={};D.k.forEach((b,i)=>idx[b.time]=i);
-function show(t){const i=(t in idx)?idx[t]:n-1,b=D.k[i],p=i?D.k[i-1].close:b.open,ch=b.close-p,pc=ch/p*100,c=ch>=0?UP:DN,s=ch>=0?"+":"";
-lg.innerHTML=`<b style="color:#fff">${b.time}</b> 開 ${f2(b.open)} 高 ${f2(b.high)} 低 ${f2(b.low)} 收 <b style="color:${c}">${f2(b.close)}</b> <span style="color:${c}">${s}${f2(ch)} (${s}${pc.toFixed(2)}%)</span> 量 ${big(D.v[i])}<br>`+
-Object.keys(C).map(k=>`<span style="color:${C[k]}">MA${k} ${D.m[k][i]==null?"--":f2(D.m[k][i])}</span>`).join(" ")}
-chart.subscribeCrosshairMove(q=>show(tkey(q.time)));show();</script>
-"""
+DAILY_JS = (
+    'chart=mk({timeScale:{borderColor:"#1f1f26",rightOffset:3}});const n=D.k.length;'
+    'const cs=chart.addCandlestickSeries({upColor:UP,downColor:DN,borderUpColor:UP,borderDownColor:DN,wickUpColor:UP,wickDownColor:DN});'
+    'cs.setData(D.k);cs.priceScale().applyOptions({scaleMargins:{top:.1,bottom:.22}});'
+    'const vs=chart.addHistogramSeries({priceFormat:{type:"volume"},priceScaleId:"v",lastValueVisible:false,priceLineVisible:false});'
+    'vs.setData(D.k.map((b,i)=>({time:b.time,value:D.v[i],color:b.close>=b.open?"rgba(255,77,90,.55)":"rgba(34,197,94,.55)"})));'
+    'chart.priceScale("v").applyOptions({scaleMargins:{top:.82,bottom:0}});'
+    'const C={5:"#fbbf24",10:"#60a5fa",20:"#c084fc",60:"#34d399",240:"#f472b6"};'
+    'for(const p in C){const s=chart.addLineSeries({color:C[p],lineWidth:1,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});'
+    's.setData(D.k.map((b,i)=>({time:b.time,value:D.m[p][i]})).filter(x=>x.value!=null))}'
+    'chart.timeScale().setVisibleLogicalRange({from:n-35,to:n+2});'
+    'const idx={};D.k.forEach((b,i)=>idx[b.time]=i);'
+    'function show(t){const i=(t in idx)?idx[t]:n-1,b=D.k[i],p=i?D.k[i-1].close:b.open,ch=b.close-p,pc=ch/p*100,c=ch>=0?UP:DN,s=ch>=0?"+":"";'
+    'lg.innerHTML=`<b style="color:#fff">${b.time.replace(/-/g,"/")}</b> 開 ${f2(b.open)} 高 ${f2(b.high)} 低 ${f2(b.low)} 收 <b style="color:${c}">${f2(b.close)}</b> <span style="color:${c}">${s}${f2(ch)} (${s}${pc.toFixed(2)}%)</span> 量 ${big(D.v[i])}<br>`+'
+    'Object.keys(C).map(k=>`<span style="color:${C[k]}">MA${k} ${D.m[k][i]==null?"--":f2(D.m[k][i])}</span>`).join(" ")}'
+    'chart.subscribeCrosshairMove(q=>show(tkey(q.time)));show();</script>'
+)
 
-INTRA_JS = """
-chart=mk({handleScroll:false,handleScale:false,timeScale:{visible:false,fixLeftEdge:true,fixRightEdge:true},
-rightPriceScale:{borderColor:"#1f1f26",scaleMargins:{top:.1,bottom:.12}}});
-const s=chart.addBaselineSeries({baseValue:{type:"price",price:0},topLineColor:UP,topFillColor1:"rgba(255,77,90,.38)",topFillColor2:"rgba(255,77,90,.03)",
-bottomLineColor:DN,bottomFillColor1:"rgba(34,197,94,.03)",bottomFillColor2:"rgba(34,197,94,.38)",lineWidth:2,priceLineVisible:false,
-priceFormat:{type:"custom",minMove:__MM__,formatter:v=>(v>0?"+":"")+v.toFixed(__DEC__)},
-autoscaleInfoProvider:o=>{const r=o(),m=r?Math.max(Math.abs(r.priceRange.minValue),Math.abs(r.priceRange.maxValue),__FLOOR__):__FLOOR__*2.5;return{priceRange:{minValue:-m,maxValue:m}}}});
-const have={};D.pts.forEach(p=>have[p[0]]=p);
-s.setData(D.all.map(t=>have[t]?{time:t,value:have[t][1]}:{time:t}));
-s.createPriceLine({price:0,color:"rgba(255,255,255,.6)",lineWidth:1,lineStyle:2,axisLabelVisible:true,title:"昨收 "+f2(D.prev)});
-chart.timeScale().fitContent();
-const cv=document.getElementById("cv"),dpr=window.devicePixelRatio||1;
-function redraw(){const w=el.clientWidth;cv.width=w*dpr;cv.height=H*dpr;cv.style.width=w+"px";cv.style.height=H+"px";
-const g=cv.getContext("2d");g.scale(dpr,dpr);g.font="11px sans-serif";g.textAlign="center";
-D.grid.forEach(t=>{const x=chart.timeScale().timeToCoordinate(t);if(x==null)return;const hr=t%3600===0,d=new Date(t*1000);
-g.strokeStyle=hr?"rgba(255,255,255,.30)":"rgba(255,255,255,.10)";g.lineWidth=hr?1.8:.8;g.beginPath();g.moveTo(x,0);g.lineTo(x,H-20);g.stroke();
-g.fillStyle=hr?"#cfcfd8":"#7d7d8a";g.fillText(pad(d.getUTCHours())+":"+pad(d.getUTCMinutes()),x,H-5)})}
-chart.timeScale().subscribeVisibleLogicalRangeChange(redraw);setTimeout(redraw,80);setTimeout(redraw,400);
-function show(t){const p=have[t]||D.pts[D.pts.length-1];if(!p){lg.textContent="尚無資料";return}
-const ch=p[1],pc=ch/D.prev*100,c=ch>=0?UP:DN,s=ch>=0?"+":"",d=new Date(p[0]*1000);
-lg.innerHTML=`<b style="color:#fff">${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}</b> 價格 <b style="color:${c}">${f2(p[2])}</b> <span style="color:${c}">${s}${f2(ch)} (${s}${pc.toFixed(2)}%)</span> 昨收 ${f2(D.prev)}`}
-chart.subscribeCrosshairMove(q=>show(q.time));show();</script>
-"""
+INTRA_JS = (
+    'chart=mk({handleScroll:false,handleScale:false,timeScale:{visible:false,fixLeftEdge:true,fixRightEdge:true},'
+    'rightPriceScale:{borderColor:"#1f1f26",scaleMargins:{top:.1,bottom:.12}}});'
+    'const s=chart.addBaselineSeries({baseValue:{type:"price",price:0},topLineColor:UP,topFillColor1:"rgba(255,77,90,.38)",topFillColor2:"rgba(255,77,90,.03)",'
+    'bottomLineColor:DN,bottomFillColor1:"rgba(34,197,94,.03)",bottomFillColor2:"rgba(34,197,94,.38)",lineWidth:2,priceLineVisible:false,'
+    'priceFormat:{type:"custom",minMove:__MM__,formatter:v=>(v>0?"+":"")+v.toFixed(__DEC__)},'
+    'autoscaleInfoProvider:o=>{const r=o(),m=r?Math.max(Math.abs(r.priceRange.minValue),Math.abs(r.priceRange.maxValue),__FLOOR__):__FLOOR__*2.5;return{priceRange:{minValue:-m,maxValue:m}}}});'
+    'const have={};D.pts.forEach(p=>have[p[0]]=p);'
+    's.setData(D.all.map(t=>have[t]?{time:t,value:have[t][1]}:{time:t}));'
+    's.createPriceLine({price:0,color:"rgba(255,255,255,.6)",lineWidth:1,lineStyle:2,axisLabelVisible:true,title:"昨收 "+f2(D.prev)});'
+    'chart.timeScale().fitContent();'
+    'const cv=document.getElementById("cv"),dpr=window.devicePixelRatio||1;'
+    'function redraw(){const w=el.clientWidth;cv.width=w*dpr;cv.height=H*dpr;cv.style.width=w+"px";cv.style.height=H+"px";'
+    'const g=cv.getContext("2d");g.scale(dpr,dpr);g.font="11px sans-serif";g.textAlign="center";'
+    'D.grid.forEach(t=>{const x=chart.timeScale().timeToCoordinate(t);if(x==null)return;const hr=t%3600===0,d=new Date(t*1000);'
+    'g.strokeStyle=hr?"rgba(255,255,255,.30)":"rgba(255,255,255,.10)";g.lineWidth=hr?1.8:.8;g.beginPath();g.moveTo(x,0);g.lineTo(x,H-20);g.stroke();'
+    'g.fillStyle=hr?"#cfcfd8":"#7d7d8a";g.fillText(pad(d.getUTCHours())+":"+pad(d.getUTCMinutes()),x,H-5)})}'
+    'chart.timeScale().subscribeVisibleLogicalRangeChange(redraw);setTimeout(redraw,80);setTimeout(redraw,400);'
+    'function show(t){const p=have[t]||D.pts[D.pts.length-1];if(!p){lg.textContent="尚無資料";return}'
+    'const ch=p[1],pc=ch/D.prev*100,c=ch>=0?UP:DN,s=ch>=0?"+":"",d=new Date(p[0]*1000);'
+    'lg.innerHTML=`<b style="color:#fff">${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}</b> 價格 <b style="color:${c}">${f2(p[2])}</b> <span style="color:${c}">${s}${f2(ch)} (${s}${pc.toFixed(2)}%)</span> 昨收 ${f2(D.prev)}`}'
+    'chart.subscribeCrosshairMove(q=>show(q.time));show();</script>'
+)
 
 def daily_html(df, h=390, n=130):
     d = df.copy()
@@ -376,119 +377,4 @@ def simulate(df, intra, em, xm, sl, tp1, sl1, cool):
         pos, last = 0, i
 
     for i in range(241, len(d)):
-        m5, m10, m240, m5b, m10b = M5[i-1], M10[i-1], M240[i-1], M5[i-2], M10[i-2]
-        bars = intra.get(dates[i]) or [(O[i], Hh[i], L[i], C[i])]
-        for j, (bo, bh, bl, bc) in enumerate(bars):
-            if pos:
-                ln, tp = lines(ep, reg, m5)
-                if bo <= ln or (tp and bo >= tp): close(i, bo, "跳空出場")
-                elif bl <= ln: close(i, ln, "弱勢停損" if reg == 1 else "停損" if ep * (1 - sl) >= m5 * xm else "跌破均線")
-                elif tp and bh >= tp: close(i, tp, "弱勢停利")
-            elif i - last > cool:
-                ent, r = None, 0
-                if m5 < m240:
-                    if j == 0 and m5 > m10 and m5b <= m10b: ent, r = bo, 1
-                else:
-                    lv = m5 * em
-                    if bo >= lv: ent, r = bo, 2
-                    elif bh >= lv: ent, r = lv, 2
-                if ent:
-                    pos, ep, reg, ei = 1, ent, r, i
-                    ln, tp = lines(ep, reg, m5)
-                    if (bl <= ln) if ent == bo else (bc <= ln): close(i, ln, "當日停損")
-    N = len(d)
-    return dict(pos=pos, ep=ep, reg=reg, since=d.index[ei].date() if pos else None,
-                cd=max(0, cool + 1 - (N - last)) if last > 0 else 0,
-                m5=M5[-1], m10=M10[-1], m240=M240[-1], m5b=M5[-2], m10b=M10[-2], trades=tr)
-
-def entry_plan(df, s, em, xm, sl, tp1, sl1):
-    """空手時：下一個交易日的合理進場價、停損價、停利價(弱勢單才有)與說明"""
-    c = df.Close.values
-    last = float(c[-1])
-    if s["m5"] < s["m240"]:                                  # 弱勢區：等 5MA 上穿 10MA，隔日開盤進場
-        hit = s["m5"] > s["m10"] and s["m5b"] <= s["m10b"]
-        if hit:
-            ent, how = last, f"5MA 已上穿 10MA，明日開盤進場（以最新價 {last:,.2f} 估算）"
-        elif s["m5b"] > s["m10b"]:
-            return None, None, None, "5MA 已在 10MA 之上，需先回落到 10MA 下方、再重新上穿才會有進場訊號"
-        else:
-            trig = float(c[-10:-1].sum() - 2 * c[-5:-1].sum())   # 收盤價 > 此值，5MA 才會上穿 10MA
-            ent, how = trig, f"收盤價需站上 {trig:,.2f}，5MA 才會上穿 10MA，隔日開盤進場（此價為估算進場價）"
-        return ent, ent * (1 - sl1), ent * (1 + tp1), how
-    ent = s["m5"] * em                                       # 強勢區：盤中價 ≥ 5MA × 乘數
-    return ent, max(ent * (1 - sl), s["m5"] * xm), None, f"盤中價 ≥ {ent:,.2f}（5MA {s['m5']:,.2f} × {em}）即進場"
-
-def strategy_page():
-    with st.container(key="strat_card"):
-        st.markdown("<div class='fl-h'>策略 B：狀態與訊號<small>00631L · 進出場以 5 分 K 時序精準判定（避免開高走低／開低走高的假訊號）</small></div>",
-                    unsafe_allow_html=True)
-        with st.spinner("同步歷史資料…"): df, intra = strategy_data()
-        if len(df) < 245: st.error("歷史資料不足 245 根，無法計算 240MA。"); return
-        if not intra: st.warning("抓不到 5 分 K，回測退回日 K 判斷。")
-        with st.expander("策略參數"):
-            c = st.columns(6)
-            em = c[0].number_input("強勢進場乘數", value=1.04, step=0.01)
-            xm = c[1].number_input("強勢出場乘數", value=0.98, step=0.01)
-            sl = c[2].number_input("強勢停損 %", value=3.0, step=0.5) / 100
-            tp1 = c[3].number_input("弱勢停利 %", value=20.0, step=1.0) / 100
-            sl1 = c[4].number_input("弱勢停損 %", value=3.0, step=0.5) / 100
-            cool = int(c[5].number_input("冷卻交易日", value=5, step=1))
-        s = simulate(df, intra, em, xm, sl, tp1, sl1, cool)
-        weak = s["m5"] < s["m240"]
-        last = float(df.Close.iloc[-1])
-        m = st.columns(4)
-        m[0].metric("最新價", f"{last:,.2f}", f"{(last / df.Close.iloc[-2] - 1) * 100:+.2f}%")
-        m[1].metric("區間", "弱勢 (5MA<240MA)" if weak else "強勢 (5MA≥240MA)")
-        m[2].metric("5MA / 10MA", f"{s['m5']:,.1f} / {s['m10']:,.1f}")
-        m[3].metric("240MA", f"{s['m240']:,.1f}")
-
-        if s["pos"]:
-            ln, tp = (s["ep"] * (1 - sl1), s["ep"] * (1 + tp1)) if s["reg"] == 1 else (max(s["ep"] * (1 - sl), s["m5"] * xm), None)
-            st.info(f"🟢 模擬持有中（{'弱勢' if s['reg'] == 1 else '強勢'}單，{s['since']} 進場）")
-            k = st.columns(3)
-            k[0].metric("持有成本", f"{s['ep']:,.2f}", f"{(last / s['ep'] - 1) * 100:+.2f}%")
-            k[1].metric("出場線（停損）", f"{ln:,.2f}", f"{(ln / s['ep'] - 1) * 100:+.2f}%")
-            k[2].metric("停利價", f"{tp:,.2f}" if tp else "—", f"{(tp / s['ep'] - 1) * 100:+.2f}%" if tp else None)
-        else:
-            ent, stop, tp, how = entry_plan(df, s, em, xm, sl, tp1, sl1)
-            if s["cd"]:
-                days, skipped, ok = future_trading_days(df.index[-1].date(), s["cd"] + 1)
-                msg = (f"⏳ 冷卻中，還需 {s['cd']} 個交易日｜冷卻結束：{fmt_d(days[s['cd'] - 1])} "
-                       f"最早可再進場：{fmt_d(days[s['cd']])}（冷卻結束後參考下列價位）")
-                if skipped: msg += "\n\n已排除休市日：" + "、".join(f"{fmt_d(k)} {v}" for k, v in skipped.items())
-                if not ok: msg += "\n\n⚠️ 無法連接證交所 OpenAPI 獲取休假資料，目前只排除週末，遇到國定假日請自行順延。"
-                st.info(msg)
-            else: st.info(f"⚪ 空手：{how}")
-            if ent:
-                if s["cd"]: st.caption(how)
-                k = st.columns(3)
-                k[0].metric("合理進場價", f"{ent:,.2f}", f"{(ent / last - 1) * 100:+.2f}% vs 現價", delta_color="off")
-                k[1].metric("停損／出場價", f"{stop:,.2f}", f"{(stop / ent - 1) * 100:+.2f}%", delta_color="off")
-                k[2].metric("停利價", f"{tp:,.2f}" if tp else "—（強勢單無固定停利，跌破出場線即出）",
-                            f"{(tp / ent - 1) * 100:+.2f}%" if tp else None, delta_color="off")
-
-    st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
-    with st.container(key="chart_card_s"):
-        l, r = st.columns([5, 2], vertical_alignment="center")
-        l.markdown(f"<div class='ttl'>00631L<span>{SYM}</span></div>", unsafe_allow_html=True)
-        with r:
-            tf = pick("週期", ["分時圖", "日線圖"], "tf2")
-        if tf == "分時圖":
-            d = load_5m_today(SYM)
-            if d.empty: st.warning("目前抓不到 5 分 K 分時資料(可能休市或 Yahoo 暫時無回應)。")
-            else: components.html(intraday_html(d, prev_close(df, d), h=390, step=300, floor=0.5, dec=2, mm=0.01), height=400)
-        else:
-            components.html(daily_html(df, h=390), height=400)
-    if s["trades"]:
-        st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
-        with st.container(key="trade_card"):
-            st.markdown("<div class='fl-h'>最近 5 筆模擬交易</div>", unsafe_allow_html=True)
-            st.dataframe(pd.DataFrame(s["trades"][-5:][::-1]), hide_index=True, use_container_width=True)
-
-# ───────────────────────── 組版 ─────────────────────────
-with st.container(key="nav"):
-    a, b = st.columns([5, 2], vertical_alignment="center")
-    a.markdown("<h1>破產後重生之我要靠量化交易發財</h1>", unsafe_allow_html=True)
-    with b: view = pick("頁面", ["大盤", "策略"], "view")
-with st.container(key="body"):
-    market_page() if view == "大盤" else strategy_page()
+        m5, m10, m240, m5b, m10b = M5[i-1], M10[i-1], M240[i-1], M5[i-2], M10[i-
