@@ -296,7 +296,6 @@ with st.container(key="nav"):
     with b: view = pick("頁面", ["大盤", "策略"], "view")
 
 with st.container(key="body"):
-market_page() if view == "大盤" else strategy_page()
-
+    market_page() if view == "大盤" else strategy_page()
   
     market_page() if view == "大盤" else strategy_page()
