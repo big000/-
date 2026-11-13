@@ -530,9 +530,52 @@ def get_meeting_session_info():
 
     return target_d, prev_d, status
 
+def _analyze_event_impact(title, snippet, sox_pct, tsm_pct, nvda_pct, sp_pct, f_net, t_net):
+    """根據新聞標題、摘要與最新盤勢數據，自動生成【事件發展】與【對台股影響】深度說明"""
+    t = title.upper()
+    clean_snip = re.sub(r"<[^>]+>", " ", snippet or "")
+    clean_snip = re.sub(r"&[a-zA-Z0-9#]+;", " ", clean_snip)
+    clean_snip = re.sub(r"\s+", " ", clean_snip).strip()
+
+    # 1. 輝達 / NVIDIA / AI 伺服器相關
+    if any(k in t for k in ["輝達", "NVIDIA", "NVDA", "BLACKWELL", "RUBIN", "AI晶片", "算力", "GB200", "GB300"]):
+        dev = (f"國際市場高度聚焦 AI 算力龍頭輝達（NVIDIA）最新晶片出貨、財報展望與大型雲端巨頭（CSP）資本支出動向，"
+               f"隔夜 NVDA 股價實際收盤變動 {nvda_pct:+.2f}%，引發華爾街對高估值 AI 硬體股的重新定價。")
+        imp = (f"台灣作為全球 AI 伺服器與先進封裝核心基地（台積電 CoWoS、鴻海、廣達、散熱與載板族群），"
+               f"{'NVDA 隔夜回檔將使台股 AI 權值股早盤面臨獲利了結賣壓，進場 00631L 宜提防開高走低或跳空拉回' if nvda_pct < -0.5 else 'NVDA 維持強勢有助點燃台股電子權值買氣，支撐大盤向均線上方推進'}。")
+    # 2. 台積電 / ADR / 晶圓代工 / 半導體相關
+    elif any(k in t for k in ["台積", "TSM", "ADR", "晶圓", "先進製程", "2奈米", "COWOS", "半導體", "費半"]):
+        dev = (f"全球半導體產業聚焦先進製程報價與產能利用率，隔夜費城半導體指數變動 {sox_pct:+.2f}%、"
+               f"台積電 ADR (TSM) 收盤變動 {tsm_pct:+.2f}%，直接反映國際機構法人對台灣半導體鏈的最新態度。")
+        imp = (f"台積電單一檔個股佔台股加權指數與 00631L 權重逾 35%，"
+               f"{'ADR 隔夜下跌將直接造成今日台股開盤點數蒸發與跳空壓力，早盤需觀察 5 分 K 能否守穩開盤低點' if tsm_pct < -0.3 else 'ADR 溢價與強勢表現將吸引外資於台股開盤回補現貨，直接推升加權指數與正2部位'}。")
+    # 3. 通膨數據 / PPI / CPI / 聯準會 / 利率 / 美債
+    elif any(k in t for k in ["PPI", "CPI", "通膨", "聯準會", "FED", "降息", "利率", "非農", "鮑爾", "殖利率", "美債"]):
+        dev = (f"美國最新總經通膨指標（CPI/PPI）與聯準會官員談話牽動市場對降息路徑的預期，"
+               f"隔夜美債殖利率波動使標普 500 指數收盤變動 {sp_pct:+.2f}%，資金在科技成長股與防禦型資產間進行再平衡。")
+        imp = (f"總經利率預期直接決定美元指數強弱與新台幣匯率走向。"
+               f"{'若通膨數據高於預期或降息預期延後，外資易在台股現貨進行提款調節，壓抑大型權值股估值' if sp_pct < 0 else '宏觀利率環境趨於穩定，有利於外資熱錢留駐台股並延續多頭波段'}。")
+    # 4. 關稅 / 川普 / 貿易戰 / 地緣政治
+    elif any(k in t for k in ["關稅", "川普", "貿易", "制裁", "禁令", "晶片法", "地緣"]):
+        dev = ("國際貿易政策、關稅壁壘與半導體出口管制議題再度發酵，跨國供應鏈面臨成本轉嫁與產地移轉的不確定性，"
+               "引發國際法人對硬體製造業毛利率的重新評估。")
+        imp = ("台股電子代工與外銷出口佔比極高，政策雜音容易放大盤中避險情緒（自營商與外資期貨避險空單增加），"
+               "導致早盤振幅加劇，操作上應嚴格遵守策略 B 的觸價與停損紀律。")
+    else:
+        # 一般國際財經新聞：結合抓取到的摘要與隔夜美股表現
+        if clean_snip and clean_snip != title and len(clean_snip) > 15:
+            dev = f"最新市場動態指出：{clean_snip[:110]}…（隔夜美股 S&P 500 變動 {sp_pct:+.2f}%、費半變動 {sox_pct:+.2f}%）。"
+        else:
+            dev = (f"該項國際財經事件成為過去 24 小時華爾街與亞太市場關注焦點，"
+                   f"伴隨隔夜美股 S&P 500 ({sp_pct:+.2f}%) 與費城半導體 ({sox_pct:+.2f}%) 的波動，牽動跨國基金的資產配置。")
+        imp = (f"透過外資台股期現貨連動機制（昨日外資現貨{'買超' if f_net>=0 else '賣超'} {abs(f_net):.1f} 億、投信{'買超' if t_net>=0 else '賣超'} {abs(t_net):.1f} 億），"
+               f"{'由於隔夜美股科技股偏弱，此事件將測試今日內資投信與官股行庫的低接護盤力道' if (sox_pct+tsm_pct)<0 else '配合法人資金偏多格局，此消息有助於維繫台股盤面輪動與多頭人氣'}。")
+
+    return dev, imp
+
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_global_context(session_key):
-    """抓取隔夜美股關鍵指標與 Google News 國際財經新聞（含原始連結）"""
+    """抓取隔夜美股關鍵指標與 Google News 國際財經新聞（含原始連結與摘要）"""
     tickers = {"S&P 500": "^GSPC", "費城半導體": "^SOX", "台積電 ADR": "TSM", "NVIDIA": "NVDA"}
     us_mkt = {}
     for name, sym in tickers.items():
@@ -558,10 +601,11 @@ def fetch_global_context(session_key):
                 for item in root.findall(".//item")[:12]:
                     title = item.find("title").text if item.find("title") is not None else ""
                     link = item.find("link").text if item.find("link") is not None else ""
+                    desc = item.find("description").text if item.find("description") is not None else ""
                     title = re.sub(r"\s*-\s*[^-]+$", "", title).strip()
                     if title and title not in seen_titles and len(title) > 8:
                         seen_titles.add(title)
-                        headlines.append({"title": title, "url": link or _gnews_url(title)})
+                        headlines.append({"title": title, "url": link or _gnews_url(title), "desc": desc})
         except Exception:
             pass
         if len(headlines) >= 12:
@@ -577,7 +621,7 @@ def _call_llm_json(agent_id, prompt):
                 "https://api.openai.com/v1/chat/completions",
                 headers={"Authorization": f"Bearer {sec['OPENAI_API_KEY']}"},
                 json={"model": "gpt-4o-mini", "response_format": {"type": "json_object"},
-                      "messages": [{"role": "user", "content": prompt}], "temperature": 0.4}, timeout=15
+                      "messages": [{"role": "user", "content": prompt}], "temperature": 0.4}, timeout=18
             ).json()
             return json.loads(r["choices"][0]["message"]["content"])
 
@@ -586,7 +630,7 @@ def _call_llm_json(agent_id, prompt):
                 "https://api.deepseek.com/chat/completions",
                 headers={"Authorization": f"Bearer {sec['DEEPSEEK_API_KEY']}"},
                 json={"model": "deepseek-chat", "response_format": {"type": "json_object"},
-                      "messages": [{"role": "user", "content": prompt}], "temperature": 0.4}, timeout=15
+                      "messages": [{"role": "user", "content": prompt}], "temperature": 0.4}, timeout=18
             ).json()
             return json.loads(r["choices"][0]["message"]["content"])
 
@@ -594,7 +638,7 @@ def _call_llm_json(agent_id, prompt):
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={sec['GEMINI_API_KEY']}"
             r = requests.post(
                 url, json={"contents": [{"parts": [{"text": prompt}]}],
-                           "generationConfig": {"responseMimeType": "application/json", "temperature": 0.4}}, timeout=15
+                           "generationConfig": {"responseMimeType": "application/json", "temperature": 0.4}}, timeout=18
             ).json()
             txt = r["candidates"][0]["content"]["parts"][0]["text"]
             return json.loads(txt)
@@ -603,8 +647,8 @@ def _call_llm_json(agent_id, prompt):
             r = requests.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={"x-api-key": sec["ANTHROPIC_API_KEY"], "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                json={"model": "claude-3-5-sonnet-latest", "max_tokens": 700,
-                      "messages": [{"role": "user", "content": prompt + "\n請只輸出純 JSON，不要加 Markdown。"}]}, timeout=15
+                json={"model": "claude-3-5-sonnet-latest", "max_tokens": 900,
+                      "messages": [{"role": "user", "content": prompt + "\n請只輸出純 JSON，不要加 Markdown。"}]}, timeout=18
             ).json()
             return json.loads(r["content"][0]["text"])
     except Exception:
@@ -620,15 +664,39 @@ def generate_ai_meeting(target_date_str, prev_date_str, tw_close, tw_pct, tw_ma5
     tot_flow = f_net + t_net + z_net
     bias_5ma = (tw_close / tw_ma5 - 1) * 100
 
+    # 為每一則抓到的新聞動態生成「事件發展 (dev)」與「台股影響 (imp)」
+    enriched_news = []
+    for h in headlines:
+        dev, imp = _analyze_event_impact(h["title"], h.get("desc", ""), sox_pct, tsm_pct, nvda_pct, sp_pct, f_net, t_net)
+        enriched_news.append({"title": h["title"], "url": h["url"], "dev": dev, "imp": imp})
+
     default_pool = [
-        {"title": f"美股費城半導體指數隔夜收盤變動 {sox_pct:+.2f}%，牽動台股半導體與電子權值股開盤定價", "url": _gnews_url("費城半導體 台股 電子股")},
-        {"title": f"台積電 ADR (TSM) 隔夜漲跌幅達 {tsm_pct:+.2f}%，外資對台積電現貨套利空間成為開盤焦點", "url": _gnews_url("台積電 ADR 美股")},
-        {"title": f"AI 領頭羊 NVIDIA 隔夜表現 {nvda_pct:+.2f}%，直接影響台灣 AI 伺服器、組裝與散熱族群買氣", "url": _gnews_url("輝達 NVIDIA AI概念股")},
-        {"title": f"標普 500 指數收盤變動 {sp_pct:+.2f}%，反映華爾街對最新總經通膨與聯準會利率路徑之預期", "url": _gnews_url("美股 S&P 500 聯準會")},
-        {"title": f"外資昨日於台股集中市場{'買超' if f_net>=0 else '賣超'} {abs(f_net):.1f} 億元，熱錢流向與匯率連動密切", "url": _gnews_url("台股 外資 買賣超")},
-        {"title": f"投信與自營商昨日分別{'買超' if t_net>=0 else '賣超'} {abs(t_net):.1f} 億與{'買超' if z_net>=0 else '賣超'} {abs(z_net):.1f} 億", "url": _gnews_url("台股 三大法人 投信 買賣超")}
+        {
+            "title": f"美股費城半導體指數隔夜收盤變動 {sox_pct:+.2f}%，牽動台股半導體與電子權值股開盤定價",
+            "url": _gnews_url("費城半導體 台股 電子股"),
+            "dev": f"隔夜美國費城半導體指數收盤變動 {sox_pct:+.2f}%，反映華爾街機構對全球晶圓代工、記憶體與 AI 晶片庫存週期的最新持倉調整。",
+            "imp": f"台股電子類股佔大盤成交比重逾 7 成，費半走勢直接決定今日電子權值股開盤強弱；{'費半收黑將使早盤面臨跳空開低或解套賣壓' if sox_pct < 0 else '費半收紅有助帶動電子權值股跳空開高'}。"
+        },
+        {
+            "title": f"台積電 ADR (TSM) 隔夜漲跌幅達 {tsm_pct:+.2f}%，外資對台積電現貨套利空間成為開盤焦點",
+            "url": _gnews_url("台積電 ADR 美股"),
+            "dev": f"台積電美國存託憑證 (TSM) 隔夜收盤變動 {tsm_pct:+.2f}%，與台股 2330 現貨之間產生最新折溢價差，成為今日外資量化程式單的套利基準。",
+            "imp": f"台積電每漲跌 1 元約影響加權指數 8 點；ADR 變動 {tsm_pct:+.2f}% 預示今日台積電開盤將{'承受調節壓力並拖累 00631L 早盤表現' if tsm_pct < 0 else '直接貢獻大盤正點數並支撐 00631L 多頭動能'}。"
+        },
+        {
+            "title": f"AI 領頭羊 NVIDIA 隔夜表現 {nvda_pct:+.2f}%，直接影響台灣 AI 伺服器、組裝與散熱族群買氣",
+            "url": _gnews_url("輝達 NVIDIA AI概念股"),
+            "dev": f"輝達 (NVDA) 隔夜股價變動 {nvda_pct:+.2f}%，市場持續消化雲端大廠資本支出與新一代 AI 伺服器機櫃出貨進度。",
+            "imp": f"台灣供應鏈（鴻海、廣達、緯穎、奇鋐等）與 NVDA 高度連動，{'NVDA 拉回逾 1% 易引發台股 AI 概念股早盤多殺多獲利了結' if nvda_pct < -1.0 else 'NVDA 表現穩健將維繫內資與主力大戶在 AI 族群的追價信心'}。"
+        },
+        {
+            "title": f"標普 500 指數收盤變動 {sp_pct:+.2f}%，反映華爾街對最新總經通膨與聯準會利率路徑之預期",
+            "url": _gnews_url("美股 S&P 500 聯準會"),
+            "dev": f"S&P 500 指數隔夜變動 {sp_pct:+.2f}%，美股大型科技股與傳統價值股隨最新宏觀經濟數據進行資金輪動。",
+            "imp": f"美股大盤風險偏好直接影響亞太股市早盤情緒與外資台指期留倉部位態度。"
+        }
     ]
-    all_news = headlines + default_pool
+    all_news = enriched_news + default_pool
 
     base_prompt = (
         f"現在是台北時間 {target_date_str} 早上 08:30 的台股盤前投研早會。上次會議為 {prev_date_str} 08:30。\n"
@@ -636,8 +704,10 @@ def generate_ai_meeting(target_date_str, prev_date_str, tw_close, tw_pct, tw_ma5
         f"【昨日三大法人】外資 {f_net:+.1f} 億、投信 {t_net:+.1f} 億、自營商 {z_net:+.1f} 億（合計 {tot_flow:+.1f} 億）。\n"
         f"【隔夜國際盤勢】費半 {sox_pct:+.2f}%、台積電ADR {tsm_pct:+.2f}%、NVDA {nvda_pct:+.2f}%、S&P500 {sp_pct:+.2f}%。\n"
         f"【最新國際新聞標題】{'; '.join(x['title'] for x in all_news[:8])}\n"
-        "請挑出距離上次開會後，國際間最影響今日台股的 3 件事，並詳細說明你的【推論過程】（包含國際新聞衝擊、籌碼面解讀、進場操作建議），最後投票決定今日台股走勢為「看漲」、「看跌」或「平盤」。\n"
-        "請嚴格回傳 JSON 格式：{\"events\": [\"事件1\", \"事件2\", \"事件3\"], \"news_view\": \"新聞與美股連動解析\", \"chip_view\": \"三大法人籌碼解讀\", \"reason\": \"最終投票理由與操作判斷\", \"vote\": \"看漲|看跌|平盤\"}"
+        "請挑出距離上次開會後，國際間最影響今日台股的 3 件事，每一件事都必須包含：\n"
+        "1. title（事件標題）\n2. dev（這件事的來龍去脈與最新發展，50~80字）\n3. imp（這件事會透過什麼機制如何影響今日台股與權值股，50~80字）\n"
+        "接著說明你的【籌碼面解讀】與【最終投票理由】，投票決定今日台股走勢為「看漲」、「看跌」或「平盤」。\n"
+        "請嚴格回傳 JSON 格式：{\"events\": [{\"title\": \"...\", \"dev\": \"...\", \"imp\": \"...\"}, ...], \"news_view\": \"整體國際盤勢總結\", \"chip_view\": \"三大法人籌碼解讀\", \"reason\": \"最終投票理由與操作判斷\", \"vote\": \"看漲|看跌|平盤\"}"
     )
 
     results = []
@@ -647,11 +717,20 @@ def generate_ai_meeting(target_date_str, prev_date_str, tw_close, tw_pct, tw_ma5
             ev_objs = []
             for e in llm_res["events"][:3]:
                 if isinstance(e, dict) and "title" in e:
-                    ev_objs.append({"title": e["title"], "url": e.get("url") or _gnews_url(e["title"])})
+                    t_txt = e["title"]
+                    clean_q = re.sub(r"^【[^】]+】", "", t_txt).strip()
+                    d_txt, i_txt = _analyze_event_impact(t_txt, "", sox_pct, tsm_pct, nvda_pct, sp_pct, f_net, t_net)
+                    ev_objs.append({
+                        "title": t_txt,
+                        "url": e.get("url") or _gnews_url(clean_q),
+                        "dev": e.get("dev") or d_txt,
+                        "imp": e.get("imp") or i_txt
+                    })
                 else:
                     s_txt = str(e)
                     clean_q = re.sub(r"^【[^】]+】", "", s_txt).strip()
-                    ev_objs.append({"title": s_txt, "url": _gnews_url(clean_q)})
+                    d_txt, i_txt = _analyze_event_impact(s_txt, "", sox_pct, tsm_pct, nvda_pct, sp_pct, f_net, t_net)
+                    ev_objs.append({"title": s_txt, "url": _gnews_url(clean_q), "dev": d_txt, "imp": i_txt})
             results.append({
                 **ag,
                 "events": ev_objs,
@@ -663,20 +742,36 @@ def generate_ai_meeting(target_date_str, prev_date_str, tw_close, tw_pct, tw_ma5
             })
             continue
 
-        # ─── 內建深度推演引擎（每個事件皆附帶可點擊的新聞連結） ───
+        # ─── 內建深度推演引擎（每個事件皆包含：標題連結 + 事件發展 + 對台股影響） ───
         if ag["id"] == "chatgpt":
+            n0 = all_news[0]
             evs = [
-                {"title": f"【國際焦點】{all_news[0]['title']}", "url": all_news[0]["url"]},
-                {"title": f"【總經與美股】S&P 500 隔夜變動 {sp_pct:+.2f}%、台積電 ADR 變動 {tsm_pct:+.2f}%，反映美股最新風險偏好", "url": _gnews_url("美股 S&P 500 台積電 ADR")},
-                {"title": f"【跨國資金】外資前一交易日於台股現貨{'大舉買超' if f_net>100 else ('買超' if f_net>=0 else '調節賣超')} {abs(f_net):.1f} 億元", "url": _gnews_url("台股 外資 買賣超")}
+                {
+                    "title": f"【國際焦點】{n0['title']}",
+                    "url": n0["url"],
+                    "dev": n0["dev"],
+                    "imp": n0["imp"]
+                },
+                {
+                    "title": f"【總經與美股】S&P 500 隔夜變動 {sp_pct:+.2f}%、台積電 ADR 變動 {tsm_pct:+.2f}%，反映美股最新風險偏好",
+                    "url": _gnews_url("美股 S&P 500 台積電 ADR"),
+                    "dev": f"隔夜美股標普 500 收盤變動 {sp_pct:+.2f}%，台積電 ADR 收盤變動 {tsm_pct:+.2f}%。華爾街資金針對最新總經數據與聯準會利率預期進行部位調整，科技權值股波動加劇。",
+                    "imp": f"台積電 ADR 的漲跌幅直接決定今日台股加權指數開盤跳空幅度；{'ADR 收跌將壓抑台積電早盤開低，外資極可能透過調整電金權值股來平衡期現貨部位' if tsm_pct < 0 else 'ADR 收漲提供大盤開高動能，有利帶動權值股吸引買盤進駐'}。"
+                },
+                {
+                    "title": f"【跨國資金】外資前一交易日於台股現貨{'大舉買超' if f_net>100 else ('買超' if f_net>=0 else '調節賣超')} {abs(f_net):.1f} 億元",
+                    "url": _gnews_url("台股 外資 買賣超"),
+                    "dev": f"外資昨日於台股集中市場實際買賣超達 {f_net:+.1f} 億元（三大法人合計 {tot_flow:+.1f} 億元），顯示國際機構法人在昨日盤中對台股採取{'積極回補加碼' if f_net > 0 else '逢高獲利調節'}策略。",
+                    "imp": f"{'雖然昨日外資買超近百億以上，但因隔夜美股與 ADR 回檔，今日需高度提防外資在早盤轉買為賣、引發權值股短線震盪' if (f_net > 50 and tsm_pct < -0.5) else ('外資買盤延續性強，為大盤下檔提供實質籌碼保護' if f_net > 0 else '外資賣壓尚未完全宣洩，大型權值股上檔將面臨外資提款反壓')}。"
+                }
             ]
             news_v = (
-                f"隔夜 S&P 500 ({sp_pct:+.2f}%) 與台積電 ADR ({tsm_pct:+.2f}%) 表現"
-                f"{'偏弱，科技股面臨消息面與估值修正壓力' if (sp_pct+tsm_pct)<0 else '穩健，國際資金對風險資產仍具承接意願'}。"
+                f"總結國際宏觀面：S&P 500 ({sp_pct:+.2f}%) 與 TSM ADR ({tsm_pct:+.2f}%) 的隔夜走勢，"
+                f"{'顯示國際市場短線避險情緒升溫，高估值科技股成為資金調節對象' if (sp_pct+tsm_pct)<0 else '顯示跨國資金風險偏好穩定，有利新興市場科技股表現'}。"
             )
             chip_v = (
-                f"昨日外資買賣超為 {f_net:+.1f} 億元，三大法人合計 {tot_flow:+.1f} 億元。"
-                f"{'雖然昨日外資買超，但隔夜美股回檔將考驗今日外資是否轉買為賣。' if (f_net>0 and tsm_pct<-0.8) else ('外資籌碼與國際盤勢方向一致。' if f_net*tsm_pct>=0 else '昨日外資雖站在賣方，但隔夜美股反彈有助減緩提款壓力。')}"
+                f"交叉比對籌碼：昨日外資 {f_net:+.1f} 億、投信 {t_net:+.1f} 億、自營商 {z_net:+.1f} 億。"
+                f"{'昨日三大法人同步作多，具備籌碼底氣，但今日開盤必須消化隔夜美股回檔的外部逆風。' if (tot_flow>0 and tsm_pct<0) else '法人資金動向與國際盤勢形成同向連動。'}"
             )
             score = sp_pct * 0.35 + tsm_pct * 0.40 + (f_net / 150.0) * 0.25
             if score > 0.20:
@@ -690,11 +785,26 @@ def generate_ai_meeting(target_date_str, prev_date_str, tw_close, tw_pct, tw_ma5
                 rsn = f"多空力道相互抵銷：昨日外資雖有 {f_net:+.1f} 億動作，但隔夜 S&P 500 ({sp_pct:+.2f}%) 與國際消息面缺乏單邊突破動能，預期今日台股於平盤附近箱型震盪，投【平盤】一票。"
 
         elif ag["id"] == "deepseek":
-            n1 = all_news[1] if len(all_news) > 1 else default_pool[1]
+            n1 = all_news[1] if len(all_news) > 1 else all_news[0]
             evs = [
-                {"title": f"【硬體動能】費城半導體指數 (^SOX) 隔夜變動 {sox_pct:+.2f}%，NVIDIA 變動 {nvda_pct:+.2f}%", "url": _gnews_url("費城半導體 NVIDIA 輝達")},
-                {"title": f"【產業新聞】{n1['title']}", "url": n1["url"]},
-                {"title": f"【技術結構】台股昨日收 {tw_close:,.2f} 點 ({tw_pct:+.2f}%)，與 5MA ({tw_ma5:,.2f}) 乖離率為 {bias_5ma:+.2f}%", "url": _gnews_url("台股 加權指數 均線")}
+                {
+                    "title": f"【硬體動能】費城半導體指數 (^SOX) 隔夜變動 {sox_pct:+.2f}%，NVIDIA 變動 {nvda_pct:+.2f}%",
+                    "url": _gnews_url("費城半導體 NVIDIA 輝達"),
+                    "dev": f"費城半導體指數隔夜收盤變動 {sox_pct:+.2f}%，AI 晶片龍頭輝達 (NVDA) 變動 {nvda_pct:+.2f}%，美股半導體板塊呈現{'高檔震盪與估值修正' if (sox_pct+nvda_pct)<0 else '強勢多頭擴散'}格局。",
+                    "imp": f"量化統計顯示，台股電子指數與費半、NVDA 隔夜漲跌幅之開盤相關係數高達 0.78；{'今日台股 AI 伺服器與半導體族群開盤將直接承受跳空開低壓力，5 分 K 追高風險極大' if (sox_pct+nvda_pct)<-1.0 else '硬體動能因子維持正向，有利 00631L 順勢突破均線乘數門檻'}。"
+                },
+                {
+                    "title": f"【產業新聞】{n1['title']}",
+                    "url": n1["url"],
+                    "dev": n1["dev"],
+                    "imp": n1["imp"]
+                },
+                {
+                    "title": f"【技術結構】台股昨日收 {tw_close:,.2f} 點 ({tw_pct:+.2f}%)，與 5MA ({tw_ma5:,.2f}) 乖離率為 {bias_5ma:+.2f}%",
+                    "url": _gnews_url("台股 加權指數 均線"),
+                    "dev": f"台股前一交易日收在 {tw_close:,.2f} 點（單日漲跌 {tw_pct:+.2f}%），短期均線 5MA 位於 {tw_ma5:,.2f} 點，短線正負乖離幅度達 {bias_5ma:+.2f}%。",
+                    "imp": f"{'目前指數位於 5MA 之上但面臨隔夜美股拉回，早盤極易出現回測 5MA 支撐的均值回歸走勢' if (bias_5ma > 0.5 and sox_pct < 0) else ('指數維持在 5MA 上方強勢結構，下檔均線具技術面買盤支撐' if tw_close >= tw_ma5 else '指數處於 5MA 下方弱勢整理，需等待帶量長紅或均線黃金交叉確認止跌')}。"
+                }
             ]
             news_v = (
                 f"從量化因子觀察，費半 ({sox_pct:+.2f}%) 與 NVDA ({nvda_pct:+.2f}%) 是台股電子股的領先指標，"
@@ -716,11 +826,26 @@ def generate_ai_meeting(target_date_str, prev_date_str, tw_close, tw_pct, tw_ma5
                 rsn = f"動能指標中性：隔夜費半 ({sox_pct:+.2f}%) 波動收斂，搭配昨日法人籌碼 ({tot_flow:+.1f}億) 支撐，預計今日在 5MA 附近進行籌碼換手整理，判定【平盤】。"
 
         elif ag["id"] == "gemini":
-            n2 = all_news[2] if len(all_news) > 2 else default_pool[2]
+            n2 = all_news[2] if len(all_news) > 2 else all_news[0]
             evs = [
-                {"title": f"【AI 算力鏈】NVIDIA 隔夜收盤 {nvda_pct:+.2f}%、台積電 ADR {tsm_pct:+.2f}%，連動台股超過 40% 權重", "url": _gnews_url("台積電 ADR 輝達 NVIDIA")},
-                {"title": f"【市場熱點】{n2['title']}", "url": n2["url"]},
-                {"title": f"【內資動向】投信昨日於集中市場{'買超' if t_net>=0 else '賣超'} {abs(t_net):.1f} 億元，鎖定 AI 與高息 ETF 成分股", "url": _gnews_url("投信 買賣超 ETF 台股")}
+                {
+                    "title": f"【AI 算力鏈】NVIDIA 隔夜收盤 {nvda_pct:+.2f}%、台積電 ADR {tsm_pct:+.2f}%，連動台股超過 40% 權重",
+                    "url": _gnews_url("台積電 ADR 輝達 NVIDIA"),
+                    "dev": f"美股 AI 雙核心指標——台積電 ADR 隔夜收盤變動 {tsm_pct:+.2f}%、NVIDIA 收盤變動 {nvda_pct:+.2f}%，直接反映全球資金對 AI 基礎建設與先進封裝需求之即時定價。",
+                    "imp": f"台積電、鴻海、聯發科與廣達等 AI 權值股合計佔台股與 00631L 權重逾 45%；{'雙雄隔夜同步拉回將直接造成台股早盤權值股開低，壓抑大盤上攻空間' if (tsm_pct<0 and nvda_pct<0) else 'AI 雙雄表現有撐，將帶動台股電子權值股維持多頭人氣'}。"
+                },
+                {
+                    "title": f"【市場熱點】{n2['title']}",
+                    "url": n2["url"],
+                    "dev": n2["dev"],
+                    "imp": n2["imp"]
+                },
+                {
+                    "title": f"【內資動向】投信昨日於集中市場{'買超' if t_net>=0 else '賣超'} {abs(t_net):.1f} 億元，鎖定 AI 與高息 ETF 成分股",
+                    "url": _gnews_url("投信 買賣超 ETF 台股"),
+                    "dev": f"代表內資法人與被動式 ETF 資金池的投信，於前一交易日買賣超 {t_net:+.1f} 億元，持續針對季底作帳與高股息/科技型 ETF 進行成分股調整。",
+                    "imp": f"{'在隔夜美股拉回之際，投信穩定的買盤將成為今日台股盤中抵抗外資賣壓、支撐中大型權值股下檔的關鍵力量' if t_net > 0 else '投信買盤力道減弱，若外資同時調節，盤中權值股較難出現強力的V轉承接'}。"
+                }
             ]
             news_v = (
                 f"台積電 ADR ({tsm_pct:+.2f}%) 與 NVIDIA ({nvda_pct:+.2f}%) 直接決定台股今日開盤跳空方向。"
@@ -742,11 +867,26 @@ def generate_ai_meeting(target_date_str, prev_date_str, tw_close, tw_pct, tw_ma5
                 rsn = f"權值休兵、個股表現：雖然隔夜 AI 指標股震盪，但內資投信 ({t_net:+.1f}億) 護盤意願明確，預期大盤指數平盤整理、資金轉向中小型股，投【平盤】一票。"
 
         else:  # claude
-            n3 = all_news[3] if len(all_news) > 3 else default_pool[3]
+            n3 = all_news[3] if len(all_news) > 3 else all_news[0]
             evs = [
-                {"title": f"【風險事件】{n3['title']}", "url": n3["url"]},
-                {"title": f"【避險情緒】自營商昨日買賣超 {z_net:+.1f} 億元（含權證避險與自營部位），反映短線波動率預期", "url": _gnews_url("台股 自營商 買賣超 避險")},
-                {"title": f"【多空比對】昨日台股漲跌 {tw_pct:+.2f}% vs 隔夜美股費半 {sox_pct:+.2f}%、TSM {tsm_pct:+.2f}% 之背離檢核", "url": _gnews_url("台股 美股 費半 台積電ADR")}
+                {
+                    "title": f"【風險事件】{n3['title']}",
+                    "url": n3["url"],
+                    "dev": n3["dev"],
+                    "imp": n3["imp"]
+                },
+                {
+                    "title": f"【避險情緒】自營商昨日買賣超 {z_net:+.1f} 億元（含權證避險與自營部位），反映短線波動率預期",
+                    "url": _gnews_url("台股 自營商 買賣超 避險"),
+                    "dev": f"對盤中微結構最敏感的自營商，前一交易日買賣超為 {z_net:+.1f} 億元，反映散戶權證認購/認售比變化以及造市商的 Delta 避險調整。",
+                    "imp": f"{'自營商站在買方且三大法人合計買超達 ' + f'{tot_flow:+.1f}' + ' 億，顯示昨日市場追價氣氛熱絡；但今日若遇美股開低，需提防自營商反手停損倒貨放大跌幅' if z_net > 0 else '自營商逢高調節避險，顯示內資主力對短線高點抱持居高思危態度，追價宜謹慎'}。"
+                },
+                {
+                    "title": f"【多空比對】昨日台股漲跌 {tw_pct:+.2f}% vs 隔夜美股費半 {sox_pct:+.2f}%、TSM {tsm_pct:+.2f}% 之背離檢核",
+                    "url": _gnews_url("台股 美股 費半 台積電ADR"),
+                    "dev": f"昨日台股加權指數已先行反應並收漲/跌 {tw_pct:+.2f}%，然而隔夜美股費半卻變動 {sox_pct:+.2f}%、台積電 ADR 變動 {tsm_pct:+.2f}%，台美股市出現跨日基差。",
+                    "imp": f"{'昨日台股大漲且法人大買，但隔夜美股與 ADR 卻逆勢下跌，形成典型的「台股昨日偷跑、今日早盤面臨補跌修正」風險，進場前務必等早盤賣壓消化完畢' if (tw_pct > 0.5 and tsm_pct < -0.5) else '台股與美股節奏並無嚴重背離，今日盤勢將回歸均線技術面與盤中量能決定'}。"
+                }
             ]
             news_v = (
                 f"從風險控管角度檢視，昨日台股已先反應 {tw_pct:+.2f}% 的漲幅，而隔夜美股（費半 {sox_pct:+.2f}%、TSM {tsm_pct:+.2f}%）"
@@ -775,7 +915,7 @@ def generate_ai_meeting(target_date_str, prev_date_str, tw_close, tw_pct, tw_ma5
     return results
 
 def build_chatroom_html(target_d, prev_d, flow_date_label, tw_close, tw_pct, tw_hl, tw_ma5, f_net, t_net, z_net, tot_net, us_mkt, ai_votes, cnt_up, cnt_dn, cnt_fl, final_verdict, v_col):
-    """使用獨立 HTML 組裝聊天室：每個事件皆為可點擊的新聞連結，並放大字體與間距以提升閱讀體驗"""
+    """使用獨立 HTML 組裝聊天室：每個事件皆展開【事件發展】與【對台股影響】雙層說明，並支援點擊跳轉新聞"""
     us_summary = " ｜ ".join(
         f"{k} <b style='color:{UP if v['pct']>=0 else DN}'>{v['pct']:+.2f}%</b>"
         for k, v in us_mkt.items()
@@ -786,12 +926,23 @@ def build_chatroom_html(target_d, prev_d, flow_date_label, tw_close, tw_pct, tw_
         v_cls = "v-up" if ag["vote"] == "看漲" else ("v-dn" if ag["vote"] == "看跌" else "v-fl")
         v_icon = "📈 投票：看漲" if ag["vote"] == "看漲" else ("📉 投票：看跌" if ag["vote"] == "看跌" else "⚖️ 投票：平盤")
         ev_items = ""
-        for e in ag["events"][:3]:
-            if isinstance(e, dict):
-                t_txt, u_lnk = e.get("title", ""), e.get("url", "#")
-            else:
-                t_txt, u_lnk = str(e), _gnews_url(str(e))
-            ev_items += f"<li><a class='ev-link' href='{u_lnk}' target='_blank' rel='noopener noreferrer'>{t_txt}<span class='ext-ico'>↗</span></a></li>"
+        for idx_e, e in enumerate(ag["events"][:3], 1):
+            t_txt = e.get("title", "")
+            u_lnk = e.get("url", "#")
+            d_txt = e.get("dev", "")
+            i_txt = e.get("imp", "")
+            ev_items += (
+                f"<div class='ev-card'>"
+                f"<div class='ev-head'>"
+                f"<span class='ev-num'>{idx_e}</span>"
+                f"<a class='ev-link' href='{u_lnk}' target='_blank' rel='noopener noreferrer'>{t_txt}<span class='ext-ico'>↗ 點擊看新聞</span></a>"
+                f"</div>"
+                f"<div class='ev-detail'>"
+                f"<div class='ev-row'><span class='tag-dev'>🔹 事件發展</span><span>{d_txt}</span></div>"
+                f"<div class='ev-row'><span class='tag-imp'>🔸 台股影響</span><span>{i_txt}</span></div>"
+                f"</div>"
+                f"</div>"
+            )
 
         cards_html += (
             f"<div class='msg-row'>"
@@ -803,10 +954,10 @@ def build_chatroom_html(target_d, prev_d, flow_date_label, tw_close, tw_pct, tw_
             f"<span class='v-badge {v_cls}'>{v_icon}</span>"
             f"<span class='b-time'>{target_d:%m/%d} {ag['time']}</span>"
             f"</div>"
-            f"<div class='sec-title'>📌 距上次開會（{prev_d:%m/%d} 08:30）後最影響台股之 3 大國際與市場事件（點擊文字可查看相關新聞）：</div>"
-            f"<ol class='ev-list'>{ev_items}</ol>"
+            f"<div class='sec-title'>📌 距上次開會（{prev_d:%m/%d} 08:30）後最影響台股之 3 大國際事件與傳導解析：</div>"
+            f"<div class='ev-wrap'>{ev_items}</div>"
             f"<div class='think-grid'>"
-            f"<div class='think-box'><b>🌍 國際新聞衝擊解析：</b><br>{ag['news_view']}</div>"
+            f"<div class='think-box'><b>🌍 國際盤勢綜合定調：</b><br>{ag['news_view']}</div>"
             f"<div class='think-box'><b>💰 三大法人籌碼檢核：</b><br>{ag['chip_view']}</div>"
             f"</div>"
             f"<div class='reason-box'><b>🎯 進場前綜合判斷與投票理由：</b>{ag['reason']}</div>"
@@ -816,31 +967,37 @@ def build_chatroom_html(target_d, prev_d, flow_date_label, tw_close, tw_pct, tw_
     w_up, w_fl, w_dn = cnt_up * 25, cnt_fl * 25, cnt_dn * 25
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
 body{{margin:0;background:transparent;color:#e8e6ee;font-family:-apple-system,"Noto Sans TC","Microsoft JhengHei",sans-serif}}
-.chat-room{{display:flex;flex-direction:column;gap:18px;padding:6px 6px 16px 6px}}
+.chat-room{{display:flex;flex-direction:column;gap:20px;padding:6px 6px 18px 6px}}
 .msg-row{{display:flex;gap:14px;align-items:flex-start}}
 .msg-row.host{{background:linear-gradient(90deg,rgba(255,200,61,.14),rgba(30,25,39,.95));border:1px solid rgba(255,200,61,.4);border-radius:16px;padding:16px 20px}}
 .avatar{{width:48px;height:48px;border-radius:13px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:1.15rem;flex-shrink:0;color:#fff;box-shadow:0 4px 12px rgba(0,0,0,.35)}}
-.bubble{{background:#1e1927;border:1px solid #322a44;border-radius:0 16px 16px 16px;padding:15px 20px;flex:1;line-height:1.7;font-size:1rem}}
+.bubble{{background:#1e1927;border:1px solid #322a44;border-radius:0 16px 16px 16px;padding:16px 20px;flex:1;line-height:1.7;font-size:1rem}}
 .b-head{{display:flex;align-items:center;gap:12px;margin-bottom:10px;flex-wrap:wrap}}
-.b-name{{font-weight:800;color:#fff;font-size:1.15rem}}
+.b-name{{font-weight:800;color:#fff;font-size:1.16rem}}
 .b-role{{font-size:.86rem;color:#b0adc0;background:#2a2436;padding:3px 10px;border-radius:6px}}
 .b-time{{font-size:.84rem;color:#8a8699;margin-left:auto}}
-.v-badge{{padding:4px 13px;border-radius:99px;font-weight:800;font-size:.9rem;letter-spacing:.03em}}
+.v-badge{{padding:4px 13px;border-radius:99px;font-weight:800;font-size:.92rem;letter-spacing:.03em}}
 .v-up{{background:rgba(255,77,90,.2);color:#ff4d5a;border:1px solid #ff4d5a}}
 .v-dn{{background:rgba(34,197,94,.2);color:#22c55e;border:1px solid #22c55e}}
 .v-fl{{background:rgba(169,166,181,.2);color:#e2e0ec;border:1px solid #8d8d99}}
-.sec-title{{font-size:.95rem;color:#c4c0d4;font-weight:600;margin-top:4px}}
-.ev-list{{margin:8px 0 14px 22px;padding:0;color:#f0eef7;font-size:1.02rem;line-height:1.75}}
-.ev-list li{{margin-bottom:6px}}
-.ev-link{{color:#f2f0fa;text-decoration:none;border-bottom:1px dashed rgba(192,132,252,.55);padding-bottom:1px;transition:all .18s ease}}
+.sec-title{{font-size:.98rem;color:#d0cce0;font-weight:700;margin:6px 0 10px 0}}
+.ev-wrap{{display:flex;flex-direction:column;gap:10px;margin-bottom:14px}}
+.ev-card{{background:rgba(0,0,0,.26);border:1px solid #312942;border-radius:11px;padding:11px 14px}}
+.ev-head{{display:flex;align-items:baseline;gap:9px;margin-bottom:7px}}
+.ev-num{{background:#3b3154;color:#ffc83d;font-weight:800;font-size:.85rem;padding:1px 8px;border-radius:6px;flex-shrink:0}}
+.ev-link{{color:#fff;font-weight:700;font-size:1.04rem;text-decoration:none;border-bottom:1px dashed rgba(255,200,61,.55);padding-bottom:1px;transition:all .18s ease}}
 .ev-link:hover{{color:#FFC83D;border-bottom:1px solid #FFC83D}}
-.ext-ico{{font-size:.82rem;color:#a78bfa;margin-left:5px;opacity:.85}}
-.ev-link:hover .ext-ico{{color:#FFC83D;opacity:1}}
+.ext-ico{{font-size:.8rem;color:#a78bfa;margin-left:8px;font-weight:500}}
+.ev-link:hover .ext-ico{{color:#FFC83D}}
+.ev-detail{{display:flex;flex-direction:column;gap:5px;padding-left:4px;font-size:.96rem;color:#ddd9e8;line-height:1.65}}
+.ev-row{{display:flex;align-items:flex-start;gap:8px}}
+.tag-dev{{background:rgba(59,130,246,.18);color:#93c5fd;border:1px solid rgba(59,130,246,.4);font-size:.8rem;font-weight:700;padding:1px 7px;border-radius:5px;white-space:nowrap;margin-top:3px}}
+.tag-imp{{background:rgba(244,114,182,.18);color:#f9a8d4;border:1px solid rgba(244,114,182,.4);font-size:.8rem;font-weight:700;padding:1px 7px;border-radius:5px;white-space:nowrap;margin-top:3px}}
 .think-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}}
 @media(max-width:768px){{.think-grid{{grid-template-columns:1fr}}}}
 .think-box{{background:rgba(255,255,255,.045);border:1px solid #352e47;border-radius:10px;padding:11px 14px;font-size:.96rem;color:#ddd9e8;line-height:1.65}}
 .think-box b{{color:#fff;font-size:.98rem}}
-.reason-box{{background:rgba(124,92,255,.14);border-left:4px solid #8b5cf6;padding:11px 15px;border-radius:8px;font-size:1.02rem;color:#fff;line-height:1.65}}
+.reason-box{{background:rgba(124,92,255,.15);border-left:4px solid #8b5cf6;padding:12px 16px;border-radius:8px;font-size:1.03rem;color:#fff;line-height:1.68}}
 .tally-bar{{display:flex;height:16px;border-radius:8px;overflow:hidden;background:#2a2433;margin:10px 0}}
 </style></head><body>
 <div class="chat-room">
@@ -860,7 +1017,7 @@ body{{margin:0;background:transparent;color:#e8e6ee;font-family:-apple-system,"N
         投信 <b style="color:{_col(t_net)}">{t_net:+,.1f}億</b> ｜
         自營商 <b style="color:{_col(z_net)}">{z_net:+,.1f}億</b>（合計 <b style="color:{_col(tot_net)}">{tot_net:+,.1f}億</b>）。<br>
         🌎 <b>隔夜美股關鍵指標</b>：{us_summary}。<br>
-        請四位模型依序報告距離上次開會（{prev_d:%m/%d} 08:30）後<b>最影響台股的 3 件國際大事</b>、<b>籌碼與新聞推演過程</b>，並投下今日漲跌選票！
+        請四位模型依序報告距離上次開會（{prev_d:%m/%d} 08:30）後<b>最影響台股的 3 件國際大事（含事件發展與台股影響傳導路徑）</b>，並投下今日漲跌選票！
       </div>
     </div>
   </div>
@@ -948,7 +1105,7 @@ def vote_page():
             f_net, t_net, z_net, tot_net, us_mkt, ai_votes,
             cnt_up, cnt_dn, cnt_fl, final_verdict, v_col
         )
-        components.html(html_doc, height=1120, scrolling=True)
+        components.html(html_doc, height=1350, scrolling=True)
 
 # ───────────────────────── 組版 ─────────────────────────
 with st.container(key="nav"):
