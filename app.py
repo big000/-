@@ -37,7 +37,7 @@ DEFAULT_OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1")
 INDEX_TICKER = "^TWII"
 ETF_TICKER = "00631L.TW"
 SYM = ETF_TICKER
-ARCHIVE_FILE = "review_archive_6d.json"
+ARCHIVE_FILE = "review_archive_5d.json"
 MAX_ARCHIVE_DAYS = 5
 
 # ── OpenAI API Key 讀取（env > st.secrets） ──
