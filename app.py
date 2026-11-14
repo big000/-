@@ -18,7 +18,7 @@ STATE_META = {
     "開低走高": {"col": "#38bdf8", "bg": "rgba(56,189,248,.18)", "desc": "開盤 ≤ 昨收 但 收盤 ≥ 開盤（低接承接紅K）"},
     "開低走低": {"col": "#22c55e", "bg": "rgba(34,197,94,.18)", "desc": "開盤 ≤ 昨收 且 收盤 < 開盤（跳空殺低黑K）"},
 }
- FOUR_STATES = ["開高走高", "開高走低", "開低走高", "開低走低"]
+FOUR_STATES = ["開高走高", "開高走低", "開低走高", "開低走低"]
 
 st.markdown("""<style>
 header[data-testid=stHeader],footer,#MainMenu{display:none}
@@ -498,7 +498,6 @@ def strategy_page():
             st.dataframe(pd.DataFrame(s["trades"][-5:][::-1]), hide_index=True, use_container_width=True)
 
 # ───────────────────────── 頁面三：AI 投研早會與四態量化分析 ─────────────────────────
-# 修正模型名稱與實際呼叫的 Model ID 完全一致，杜絕標示不實
 AI_AGENTS = [
     {"id": "chatgpt",  "name": "ChatGPT",  "model_id": "gpt-4o-mini",              "secret_key": "OPENAI_API_KEY",    "short": "GPT", "color": "#10a37f", "role": "國際總經、利率匯率與跨國資金流向"},
     {"id": "deepseek", "name": "DeepSeek", "model_id": "deepseek-chat",            "secret_key": "DEEPSEEK_API_KEY",  "short": "DS",  "color": "#3b82f6", "role": "歷史四態條件機率、波動率與動能微結構"},
@@ -553,10 +552,7 @@ def classify_4state(open_p, close_p, prev_c):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_expanded_global_context(session_key):
-    """
-    抓取完整總經、匯率、美債、VIX、美股科技指標與真實 Google News RSS（移除假新聞池）
-    並回傳各資產最新收盤日期以供檢核時間對齊。
-    """
+    """抓取完整總經、匯率、美債、VIX、美股科技指標與真實 Google News RSS"""
     tickers = {
         "S&P 500": "^GSPC",
         "費城半導體": "^SOX",
@@ -584,7 +580,6 @@ def fetch_expanded_global_context(session_key):
         except Exception:
             pass
 
-    # 計算台積電 ADR 換算台股溢價率 (1 ADR = 5 股 2330.TW)
     tsm_adr = us_mkt.get("台積電 ADR", {}).get("close")
     fx_twd = us_mkt.get("美元兌台幣", {}).get("close")
     tsmc_tw = us_mkt.get("台積電(2330)", {}).get("close")
@@ -594,7 +589,6 @@ def fetch_expanded_global_context(session_key):
         adr_implied_twd = (tsm_adr * fx_twd) / 5.0
         adr_premium = (adr_implied_twd / tsmc_tw - 1.0) * 100.0
 
-    # 抓取真實 Google News RSS（包含標題、真實連結、發布時間、內文摘要）
     headlines = []
     seen_titles = set()
     rss_urls = [
@@ -635,11 +629,7 @@ def fetch_expanded_global_context(session_key):
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def calc_historical_4state_probs(cur_us_tech_pct, cur_bias_5ma, cur_tw_prev_pct):
-    """
-    【量化客觀歷史條件機率引擎】
-    使用過去 3 年 ^TWII、^SOX、TSM 的真實日 K 資料（以日期對齊），
-    計算在當前市場環境下，「開高走高、開高走低、開低走高、開低走低」四種狀態的真實歷史條件機率。
-    """
+    """過去 3 年歷史條件四態機率引擎"""
     tw = load_daily("^TWII", "3y").copy()
     sox = load_daily("^SOX", "3y").copy()
     tsm = load_daily("TSM", "3y").copy()
@@ -656,13 +646,11 @@ def calc_historical_4state_probs(cur_us_tech_pct, cur_bias_5ma, cur_tw_prev_pct)
     tw["IntraPct"] = (tw["Close"] / tw["Open"] - 1) * 100
     tw["DayPct"] = (tw["Close"] / tw["PrevClose"] - 1) * 100
 
-    # 對齊美股隔夜漲跌幅：台股 T 日開盤前對應的是美股 T-1 日收盤漲跌幅
     us_map = {}
     if not sox.empty and not tsm.empty:
         sox_d = pd.Series(sox["Close"].pct_change().values * 100, index=pd.DatetimeIndex(sox.index).tz_localize(None).date)
         tsm_d = pd.Series(tsm["Close"].pct_change().values * 100, index=pd.DatetimeIndex(tsm.index).tz_localize(None).date)
         for d_tw in tw["date"]:
-            # 往前找最近一個美股交易日（最多往前找 4 天以跨過週末）
             for offset in range(1, 5):
                 d_us = d_tw - timedelta(days=offset)
                 if d_us in sox_d and pd.notna(sox_d[d_us]):
@@ -675,8 +663,6 @@ def calc_historical_4state_probs(cur_us_tech_pct, cur_bias_5ma, cur_tw_prev_pct)
     df = tw.dropna(subset=["PrevClose", "MA5_prev", "US_Tech", "Open", "Close"]).copy()
     df["State"] = [classify_4state(o, c, p) for o, c, p in zip(df["Open"], df["Close"], df["PrevClose"])]
 
-    # 定義當前三大環境條件（Regime Conditions）
-    # 條件 1：隔夜美股半導體動能（強勢 > +0.5% / 弱勢 < -0.5% / 中性震盪）
     if cur_us_tech_pct > 0.5:
         c1_mask = df["US_Tech"] > 0.5
         c1_desc = f"隔夜費半/TSM 偏強 ({cur_us_tech_pct:+.2f}% > +0.5%)"
@@ -687,7 +673,6 @@ def calc_historical_4state_probs(cur_us_tech_pct, cur_bias_5ma, cur_tw_prev_pct)
         c1_mask = (df["US_Tech"] >= -0.5) & (df["US_Tech"] <= 0.5)
         c1_desc = f"隔夜費半/TSM 震盪 ({cur_us_tech_pct:+.2f}% 介於 ±0.5%)"
 
-    # 條件 2：台股前日收盤與 5MA 正負乖離狀態
     if cur_bias_5ma >= 0:
         c2_mask = df["Bias5_prev"] >= 0
         c2_desc = f"台股位於 5MA 之上 (乖離 {cur_bias_5ma:+.2f}%)"
@@ -695,7 +680,6 @@ def calc_historical_4state_probs(cur_us_tech_pct, cur_bias_5ma, cur_tw_prev_pct)
         c2_mask = df["Bias5_prev"] < 0
         c2_desc = f"台股位於 5MA 之下 (乖離 {cur_bias_5ma:+.2f}%)"
 
-    # 條件 3：台股前一日自身漲跌方向
     if cur_tw_prev_pct >= 0:
         c3_mask = df["PrevPct"] >= 0
         c3_desc = f"前日台股收紅 ({cur_tw_prev_pct:+.2f}%)"
@@ -703,7 +687,6 @@ def calc_historical_4state_probs(cur_us_tech_pct, cur_bias_5ma, cur_tw_prev_pct)
         c3_mask = df["PrevPct"] < 0
         c3_desc = f"前日台股收黑 ({cur_tw_prev_pct:+.2f}%)"
 
-    # 優先使用「三條件完全吻合」樣本；若樣本數 < 20，退回「前兩條件吻合」確保統計顯著性
     sub = df[c1_mask & c2_mask & c3_mask]
     cond_label = f"{c1_desc} ＋ {c2_desc} ＋ {c3_desc}"
     if len(sub) < 20:
@@ -732,7 +715,6 @@ def calc_historical_4state_probs(cur_us_tech_pct, cur_bias_5ma, cur_tw_prev_pct)
         }
 
     top_state = max(probs.items(), key=lambda x: x[1])[0]
-    # 近期過去 5 個交易日實際發生的四態驗證紀錄
     recent_5 = []
     for _, r in df.tail(5).iterrows():
         recent_5.append({
@@ -754,15 +736,12 @@ def calc_historical_4state_probs(cur_us_tech_pct, cur_bias_5ma, cur_tw_prev_pct)
         "top_state": top_state,
         "avg_gap_all": round(float(sub["GapPct"].mean()), 2),
         "avg_intra_all": round(float(sub["IntraPct"].mean()), 2),
-        "win_intra_up": round(probs["開高走高"] + probs["開低走高"], 1),  # 盤中收紅K機率
+        "win_intra_up": round(probs["開高走高"] + probs["開低走高"], 1),
         "recent_5": recent_5[::-1]
     }
 
 def _call_llm_strict(agent, prompt):
-    """
-    嚴格呼叫真實 LLM API，絕不靜默切換至規則模板。
-    回傳: (is_success: bool, actual_model_id: str, error_reason: str, parsed_json: dict | None)
-    """
+    """嚴格呼叫真實 LLM API，失敗或無 Key 不偽造投票"""
     sec = st.secrets if hasattr(st, "secrets") else {}
     k_name = agent["secret_key"]
     if k_name not in sec or not str(sec[k_name]).strip():
@@ -850,10 +829,6 @@ def _call_llm_strict(agent, prompt):
     return False, agent["model_id"], "未知原因", None
 
 def _build_specialized_prompt(agent, target_date_str, tw_info, flow_info, us_mkt, adr_prem, headlines, quant_4state):
-    """
-    為四位 AI 委員分別注入「不同維度的專屬資料子集」與「必答核心問題」，
-    降低模型間的共線性，並強制要求預測「開高走高、開高走低、開低走高、開低走低」四態機率。
-    """
     aid = agent["id"]
     sp = us_mkt.get("S&P 500", {})
     sox = us_mkt.get("費城半導體", {})
@@ -936,7 +911,7 @@ def run_ai_panel(session_key, target_date_str, tw_info, flow_info, us_mkt, adr_p
             raw_p = data.get("probs", {})
             p_clean = {k: max(0, int(float(raw_p.get(k, 25)))) for k in FOUR_STATES}
             tot_p = sum(p_clean.values()) or 100
-            p_norm = {k: round(v / tot_p * 100, 1) for k in FOUR_STATES}
+            p_norm = {k: round(p_clean[k] / tot_p * 100, 1) for k in FOUR_STATES}
             best_st = max(p_norm.items(), key=lambda x: x[1])[0]
 
             panel_results.append({
@@ -965,10 +940,6 @@ def run_ai_panel(session_key, target_date_str, tw_info, flow_info, us_mkt, adr_p
     return panel_results
 
 def build_4state_dashboard_html(target_d, tw_info, flow_info, us_mkt, adr_prem, adr_imp_twd, headlines, quant_4state, ai_panel):
-    """
-    組裝誠實透明的「A. 量化歷史條件機率」與「B. AI 委員獨立研究（含真實連線狀態）」雙軌決策面板
-    """
-    # 1. API 執行狀態膠囊列
     status_cards = ""
     active_agents = [a for a in ai_panel if a["api_ok"]]
     for a in ai_panel:
@@ -986,7 +957,6 @@ def build_4state_dashboard_html(target_d, tw_info, flow_info, us_mkt, adr_prem, 
             f"</div>"
         )
 
-    # 2. 量化歷史四態機率橫條與卡片
     q_probs = quant_4state["probs"]
     q_base = quant_4state["base_probs"]
     q_det = quant_4state["detail"]
@@ -1008,7 +978,6 @@ def build_4state_dashboard_html(target_d, tw_info, flow_info, us_mkt, adr_prem, 
             f"</div>"
         )
 
-    # 3. 真實 RSS 新聞清單（無假新聞）
     news_html = ""
     if headlines:
         for idx, h in enumerate(headlines[:6], 1):
@@ -1023,7 +992,6 @@ def build_4state_dashboard_html(target_d, tw_info, flow_info, us_mkt, adr_prem, 
     else:
         news_html = "<div class='n-snip'>目前無法連線 Google News RSS，系統不產生任何人工假標題。</div>"
 
-    # 4. 已連線 AI 委員研究報告（未連線者不偽造發言）
     ai_cards_html = ""
     if active_agents:
         for a in active_agents:
@@ -1059,7 +1027,6 @@ def build_4state_dashboard_html(target_d, tw_info, flow_info, us_mkt, adr_prem, 
             "</div>"
         )
 
-    # 5. 主持人雙軌對比（A. 量化歷史統計 vs B. AI 主觀共識）
     q_top = quant_4state["top_state"]
     q_top_p = q_probs[q_top]
     if active_agents:
@@ -1139,7 +1106,6 @@ code{{background:#2a2436;color:#f9a8d4;padding:1px 5px;border-radius:4px;font-si
 </style></head><body>
 <div class="wrap">
 
-  <!-- 區塊 1：API 誠實狀態檢核 -->
   <div class="sec-card">
     <div class="sec-h">
       <span>🔍 一、AI 委員 API 真實執行狀態檢核（誠實標示 · 失敗或未設 Key 絕不偽造投票）</span>
@@ -1148,7 +1114,6 @@ code{{background:#2a2436;color:#f9a8d4;padding:1px 5px;border-radius:4px;font-si
     <div class="st-grid">{status_cards}</div>
   </div>
 
-  <!-- 區塊 2：擴充盤前總經、匯率、台積電 ADR 溢價與多日籌碼結構 -->
   <div class="sec-card">
     <div class="sec-h">
       <span>🌎 二、盤前關鍵總經、ADR 溢價與法人累積籌碼（解決單日籌碼盲點與跨日時間對齊）</span>
@@ -1162,7 +1127,6 @@ code{{background:#2a2436;color:#f9a8d4;padding:1px 5px;border-radius:4px;font-si
     </div>
   </div>
 
-  <!-- 區塊 3：A 軌 — 量化客觀歷史條件四態機率模型 -->
   <div class="sec-card">
     <div class="sec-h">
       <span>📐 三、【A 軌：量化客觀判斷】過去 3 年歷史條件四態機率分佈（取代人工加權公式）</span>
@@ -1172,7 +1136,6 @@ code{{background:#2a2436;color:#f9a8d4;padding:1px 5px;border-radius:4px;font-si
     <div class="q-grid">{q_cards_html}</div>
   </div>
 
-  <!-- 區塊 4：真實國際財經新聞與摘要 -->
   <div class="sec-card">
     <div class="sec-h">
       <span>📰 四、真實 Google News 國際財經新聞與摘要（已移除人工假標題池）</span>
@@ -1181,7 +1144,6 @@ code{{background:#2a2436;color:#f9a8d4;padding:1px 5px;border-radius:4px;font-si
     {news_html}
   </div>
 
-  <!-- 區塊 5：B 軌 — 四位 AI 獨立維度研究報告 -->
   <div class="sec-card">
     <div class="sec-h">
       <span>🤖 五、【B 軌：AI 主觀研究會議】獨立資料子集與反方論證</span>
@@ -1190,7 +1152,6 @@ code{{background:#2a2436;color:#f9a8d4;padding:1px 5px;border-radius:4px;font-si
     {ai_cards_html}
   </div>
 
-  <!-- 區塊 6：C 軌 — 主持人雙軌對帳總結 -->
   <div class="verdict-banner">
     <b>⚖️ 六、【C 軌：主持人雙軌比對結論（量化統計 vs AI 投研）】</b><br>
     {comp_verdict}<br>
@@ -1263,7 +1224,6 @@ def vote_page():
             unsafe_allow_html=True
         )
 
-        # 頂部四種日內狀態歷史條件機率一覽
         qp = quant_4state["probs"]
         m = st.columns(4)
         m[0].metric("🔴 開高走高 (歷史條件機率)", f"{qp['開高走高']:.1f}%", f"跳空 {quant_4state['detail']['開高走高']['avg_gap']:+.2f}% / 盤中 {quant_4state['detail']['開高走高']['avg_intra']:+.2f}%")
