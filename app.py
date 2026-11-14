@@ -1,8 +1,3 @@
-try:
-    import trafilatura
-    st.success(f"✅ trafilatura 已成功載入！版本：{trafilatura.__version__}")
-except ImportError as e:
-    st.error(f"❌ 找不到 trafilatura：{e}。請確認是否已安裝或加入 requirements.txt")
 import os, io, csv, json, time, re, math
 import urllib.parse
 import xml.etree.ElementTree as ET
