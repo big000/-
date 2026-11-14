@@ -831,40 +831,54 @@ def _assign_topic_cluster(title_txt):
             return cl["id"], cl["name"]
     return "general_mkt", "國際財經與市場焦點"
 
-# ── 終極進化版：正文提取 (破解轉址 + 雙重解析) ───
+# ── 終極進化版：正文提取 (採納 Referer 偽裝 + 雙重解析) ───
 def _try_extract_article_snippet(url, title_str, src_name, is_paywall):
     if is_paywall:
         return False, "僅憑標題判斷（該外媒屬付費牆來源，無法取得全文）"
     
     real_url = url
+    
+    # 採納建議：加入完整的 Headers，包含 Referer 偽裝成從 Google 搜尋點擊
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://www.google.com/",  # ★ 關鍵：模擬從 Google 搜尋點擊
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1"
     }
 
     try:
         # 1. 破解 Google News 轉址
         if "news.google.com" in url:
             resp = requests.get(url, headers=headers, timeout=5, allow_redirects=True)
+            # 如果網址已經跳轉出 news.google.com，代表成功
             if "news.google.com" not in resp.url:
                 real_url = resp.url
             else:
-                # 如果還是停在 Google 的 JS 跳轉頁，用正則抓裡面的真實連結
-                match = re.search(r'<a href="([^"]+)"', resp.text, re.IGNORECASE)
+                # 如果還停在 Google 頁面，嘗試從 HTML 中挖出真實網址
+                match = re.search(r'data-n-au="([^"]+)"', resp.text)
                 if match:
                     real_url = match.group(1)
                 else:
-                    return False, "僅憑標題判斷（無法破解 Google News 轉址）"
+                    match = re.search(r'<a href="([^"]+)"', resp.text, re.IGNORECASE)
+                    if match:
+                        real_url = match.group(1)
+                    else:
+                        return False, "僅憑標題判斷（無法破解 Google News 轉址）"
 
-        # 2. 請求真實網頁
-        resp = requests.get(real_url, headers=headers, timeout=5)
+        # 2. 請求真實新聞網頁
+        if real_url != url:
+            resp = requests.get(real_url, headers=headers, timeout=5)
+        else:
+            resp = requests.get(url, headers=headers, timeout=5)
+            
         if resp.status_code != 200:
             return False, f"僅憑標題判斷（原始網頁拒絕連線，HTTP {resp.status_code}）"
             
         text = ""
         
-        # 第一重：Trafilatura
+        # 第一重：Trafilatura（精準提取）
         if _TRAFILATURA_OK:
             text = trafilatura.extract(
                 resp.text, include_comments=False, include_tables=False, favor_precision=True, deduplicate=True
@@ -1425,4 +1439,100 @@ def meeting_page():
     sched = get_schedule_state(tw_df)
     archive_dates = sched["archive_dates"]
     valid_6_strs = [d.strftime("%Y-%m-%d") for d in archive_dates]
-    store = load_rolling_archive
+    store = load_rolling_archive()
+
+    with st.spinner("載入早會簡報、白名單新聞與 6 日滾動存檔…"):
+        etf_df = load_daily(ETF_TICKER, "3y")
+        days_flow = last_15_flows()
+
+    with st.container(key="vote_card"):
+        st.markdown(
+            "<div class='fl-h'>🤖 08:30 盤前結構化早會 ＆ 17:00 盤後復盤紀錄中心"
+            "<small>只陳述事實與因果鏈 · 兩輪交叉質疑 · 條件式決策樹 · 6 日滾動存檔</small></div>",
+            unsafe_allow_html=True
+        )
+
+        if sched["banner_state"] == "live":
+            st.success(sched["banner_msg"])
+        elif sched["banner_state"] == "waiting":
+            st.warning(sched["banner_msg"])
+        else:
+            st.error(sched["banner_msg"])
+
+        opt_map = {
+            f"{'🟢 [今日早會]' if (sched['has_live_meeting'] and d == sched['cur_d']) else '📁 [歷史存檔]'} {fmt_d(d)} 08:30 早會與 17:00 復盤紀錄": d
+            for d in archive_dates
+        }
+        chosen_label = st.selectbox(
+            f"📅 選擇檢視紀錄（系統嚴格滾動保留最近 {MAX_ARCHIVE_DAYS} 個交易日，舊紀錄自動刪除）",
+            list(opt_map.keys()),
+            index=0
+        )
+        sel_d = opt_map[chosen_label]
+        is_latest = (sel_d == archive_dates[0])
+
+        briefing = build_meeting_briefing_for_date(sel_d, tw_df, etf_df, days_flow, is_latest)
+        round1, round2, host_conclusion = generate_two_round_meeting_and_tree(briefing)
+        review_rec = build_1700_review_record(sel_d, sched["now"], tw_df, etf_df, briefing, round1, host_conclusion)
+
+        d_key = sel_d.strftime("%Y-%m-%d")
+        store[d_key] = {
+            "date": d_key,
+            "stances": {m["name"]: m["stance"] for m in round1},
+            "review_ready": review_rec["ready"],
+            "state_4": review_rec.get("state_4", "待 17:00 更新"),
+            "tw_day_pct": f"{review_rec['tw_day']:+.2f}%" if review_rec["ready"] else "--",
+            "etf_day_pct": f"{review_rec['etf_day']:+.2f}%" if review_rec["ready"] else "--",
+            "tree_hit": review_rec.get("tree_hit", "待 17:00 更新"),
+        }
+        store = save_rolling_archive(store, valid_6_strs)
+
+        with st.expander(f"🗂️ 展開檢視：最近 {MAX_ARCHIVE_DAYS} 個交易日早會立場與 17:00 復盤滾動存檔一覽表", expanded=False):
+            summary_rows = []
+            for d_item in archive_dates:
+                dk = d_item.strftime("%Y-%m-%d")
+                if dk not in store:
+                    b_tmp = build_meeting_briefing_for_date(d_item, tw_df, etf_df, days_flow, False)
+                    r1_tmp, _, hc_tmp = generate_two_round_meeting_and_tree(b_tmp)
+                    rv_tmp = build_1700_review_record(d_item, sched["now"], tw_df, etf_df, b_tmp, r1_tmp, hc_tmp)
+                    store[dk] = {
+                        "date": dk,
+                        "stances": {m["name"]: m["stance"] for m in r1_tmp},
+                        "review_ready": rv_tmp["ready"],
+                        "state_4": rv_tmp.get("state_4", "待 17:00 更新"),
+                        "tw_day_pct": f"{rv_tmp['tw_day']:+.2f}%" if rv_tmp["ready"] else "--",
+                        "etf_day_pct": f"{rv_tmp['etf_day']:+.2f}%" if rv_tmp["ready"] else "--",
+                        "tree_hit": rv_tmp.get("tree_hit", "待 17:00 更新"),
+                    }
+                rec = store[dk]
+                st_map = rec["stances"]
+                summary_rows.append({
+                    "交易日": fmt_d(d_item),
+                    "基本面": st_map.get("基本面委員", "--"),
+                    "產業面": st_map.get("產業面委員", "--"),
+                    "技術面": st_map.get("技術面委員", "--"),
+                    "籌碼面": st_map.get("籌碼面委員", "--"),
+                    "17:00 實際走勢": rec["state_4"],
+                    "加權指數": rec["tw_day_pct"],
+                    "00631L": rec["etf_day_pct"],
+                    "決策樹復盤": rec["tree_hit"],
+                })
+            store = save_rolling_archive(store, valid_6_strs)
+            st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
+
+        html_doc = render_morning_meeting_html(briefing, round1, round2, host_conclusion, review_rec)
+        components.html(html_doc, height=1850, scrolling=True)
+
+# ───────────────────────── 導覽列與三頁整合組版 ─────────────────────────
+with st.container(key="nav"):
+    a, b = st.columns([5, 2], vertical_alignment="center")
+    a.markdown("<h1>破產後重生之我要靠量化交易發財</h1>", unsafe_allow_html=True)
+    with b:
+        view = pick("頁面", ["早會", "大盤", "策略"], "view")
+with st.container(key="body"):
+    if view == "早會":
+        meeting_page()
+    elif view == "大盤":
+        market_page()
+    else:
+        strategy_page()
