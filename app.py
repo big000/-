@@ -7,6 +7,13 @@ import streamlit as st
 import streamlit.components.v1 as components
 import concurrent.futures
 
+# ── 解決 Streamlit Cloud 或部分環境的 SSL 憑證問題 ──
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
+
 # ── 正文提取核心庫 ──
 try:
     import trafilatura
@@ -38,7 +45,7 @@ INDEX_TICKER = "^TWII"
 ETF_TICKER = "00631L.TW"
 SYM = ETF_TICKER
 ARCHIVE_FILE = "review_archive_5d.json"
-MAX_ARCHIVE_DAYS = 5
+MAX_ARCHIVE_DAYS = 5  # 改為 5 個交易日
 
 # ── OpenAI API Key 讀取（env > st.secrets） ──
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -48,14 +55,16 @@ if not OPENAI_API_KEY:
     except Exception:
         pass
 
-
 @st.cache_resource(show_spinner=False)
 def _get_openai_client():
     if not _OPENAI_OK or not OPENAI_API_KEY:
         return None
     try:
-        return OpenAI(api_key=OPENAI_API_KEY, timeout=90)
-    except Exception:
+        # 若有中轉站，可透過環境變數 OPENAI_BASE_URL 指定；否則預設官方網址
+        base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        return OpenAI(api_key=OPENAI_API_KEY, base_url=base_url, timeout=90)
+    except Exception as e:
+        print(f"OpenAI Client 初始化失敗: {e}")
         return None
 
 
@@ -657,8 +666,8 @@ def load_rolling_archive():
             return {}
     return {}
 
-def save_rolling_archive(store, valid_6_date_strs):
-    pruned = {k: store[k] for k in valid_6_date_strs if k in store}
+def save_rolling_archive(store, valid_5_date_strs):
+    pruned = {k: store[k] for k in valid_5_date_strs if k in store}
     try:
         with open(ARCHIVE_FILE, "w", encoding="utf-8") as f:
             json.dump(pruned, f, ensure_ascii=False, indent=2)
@@ -862,51 +871,37 @@ def _assign_topic_cluster(title_txt):
             return cl["id"], cl["name"]
     return "general_mkt", "國際財經與市場焦點"
 
-# ── 方案 B：用 Jina AI Reader 抓正文，繞反爬 ──
-def _strip_jina_wrapper(text):
-    """剝掉 r.jina.ai 回傳的 Title/URL Source 標頭，只留正文"""
-    lines = text.splitlines()
-    skip_until = -1
-    for i, ln in enumerate(lines[:12]):
-        if ln.strip().lower().startswith(("markdown content:", "markdown content：")):
-            skip_until = i
-            break
-    if skip_until >= 0:
-        text = "\n".join(lines[skip_until + 1:])
-    return text.strip()
-
-
+# ── 方案 B：改用 markdown.new 代理抓正文（繞反爬且免 Key） ──
 def _try_extract_article_snippet(url, title_str, src_name, is_paywall):
-    """改用 r.jina.ai 代理抓正文（免費、繞 Cloudflare）"""
+    """改用 markdown.new 免費代理抓正文（免 API Key，抗反爬）"""
     if is_paywall:
-        return False, "僅憑標題判斷（該外媒屬付費牆來源，無法取得全文）"
+        return False, "僅憑標題判斷（付費牆來源，無法取得全文）"
 
     try:
-        jina_url = f"https://r.jina.ai/{url}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "text/plain, text/markdown",
-        }
-        resp = requests.get(jina_url, headers=headers, timeout=28)
+        # 使用免 Key 的 markdown.new 服務
+        proxy_url = f"https://markdown.new/{url}"
+        
+        resp = requests.get(proxy_url, timeout=25)
         if resp.status_code != 200:
-            return False, f"僅憑標題判斷（Jina Reader 回應 HTTP {resp.status_code}）"
+            return False, f"僅憑標題判斷（代理回應 HTTP {resp.status_code}）"
 
         text = resp.text or ""
         if len(text) < 60:
-            return False, "僅憑標題判斷（Jina 回傳內容過短）"
+            return False, "僅憑標題判斷（回傳內容過短）"
 
-        text = _strip_jina_wrapper(text)
+        # 清理 markdown 標記與多餘空白
         text = re.sub(r"\s+", " ", text).strip()
         if title_str and title_str in text:
             text = text.replace(title_str, "", 1).strip(" -｜|—：:")
+            
         if len(text) < 50:
             return False, "僅憑標題判斷（正文過短，可能為純圖片頁）"
 
         return True, text[:2400]
     except requests.exceptions.Timeout:
-        return False, "僅憑標題判斷（Jina Reader 連線超時）"
+        return False, "僅憑標題判斷（連線超時）"
     except Exception as e:
-        return False, f"僅憑標題判斷（Jina 異常：{str(e)[:30]}）"
+        return False, f"僅憑標題判斷（異常：{str(e)[:30]}）"
 
 
 def _judge_priced_in(cluster_id, title_txt, sox_pct, tsm_pct, sp_pct):
@@ -969,7 +964,7 @@ def fetch_and_select_top5_news(window_hours, sox_pct, tsm_pct, nvda_pct, sp_pct)
         except Exception:
             continue
 
-    # 2. 先分群，每個 cluster 只取前 3 條送 Jina 抓正文（省時省頻寬）
+    # 2. 先分群，每個 cluster 只取前 3 條送代理抓正文（省時省頻寬）
     clusters_pre = {}
     for c in raw_candidates:
         clusters_pre.setdefault(c["cluster_id"], []).append(c)
@@ -1578,7 +1573,7 @@ def render_morning_meeting_html(briefing, round1, round2, host_conclusion, revie
             f"<div style='flex:1'>"
             f"<div class='b-head'>"
             f"<span class='b-name' style='color:#38bdf8'>17:00 盤後復盤紀錄（僅檢視推理品質 · 絕不回頭調參或改權重）</span>"
-            f"<span class='b-role'>滾動保存 6 個交易日</span>"
+            f"<span class='b-role'>滾動保存 5 個交易日</span>"
             f"<span class='b-time'>{review_rec['updated_at']}</span>"
             f"</div>"
             f"<div style='font-size:.96rem;line-height:1.72'>"
@@ -1703,7 +1698,7 @@ body{{margin:0;background:transparent;color:#e8e6ee;font-family:-apple-system,"N
     </div>
   </div>
 
-  <div class="sec-banner">步驟六：17:00 盤後復盤紀錄（滾動保存 6 個交易日 · 不回頭調整任何規則或權重）</div>
+  <div class="sec-banner">步驟六：17:00 盤後復盤紀錄（滾動保存 5 個交易日 · 不回頭調整任何規則或權重）</div>
   {review_html}
 
 </div>
@@ -1718,17 +1713,17 @@ def meeting_page():
 
     sched = get_schedule_state(tw_df)
     archive_dates = sched["archive_dates"]
-    valid_6_strs = [d.strftime("%Y-%m-%d") for d in archive_dates]
+    valid_5_strs = [d.strftime("%Y-%m-%d") for d in archive_dates]
     store = load_rolling_archive()
 
-    with st.spinner("載入早會簡報、白名單新聞與 6 日滾動存檔…"):
+    with st.spinner("載入早會簡報、白名單新聞與 5 日滾動存檔…"):
         etf_df = load_daily(ETF_TICKER, "3y")
         days_flow = last_15_flows()
 
     with st.container(key="vote_card"):
         st.markdown(
             "<div class='fl-h'>🤖 08:30 盤前結構化早會 ＆ 17:00 盤後復盤紀錄中心"
-            "<small>AI 生成雙輪討論 · 條件式決策樹 · 6 日滾動存檔</small></div>",
+            "<small>AI 生成雙輪討論 · 條件式決策樹 · 5 日滾動存檔</small></div>",
             unsafe_allow_html=True
         )
 
@@ -1775,7 +1770,7 @@ def meeting_page():
             "etf_day_pct": f"{review_rec['etf_day']:+.2f}%" if review_rec["ready"] else "--",
             "tree_hit": review_rec.get("tree_hit", "待 17:00 更新"),
         }
-        store = save_rolling_archive(store, valid_6_strs)
+        store = save_rolling_archive(store, valid_5_strs)
 
         with st.expander(f"🗂️ 展開檢視：最近 {MAX_ARCHIVE_DAYS} 個交易日早會立場與 17:00 復盤滾動存檔一覽表", expanded=False):
             summary_rows = []
@@ -1807,7 +1802,7 @@ def meeting_page():
                     "00631L": rec["etf_day_pct"],
                     "決策樹復盤": rec["tree_hit"],
                 })
-            store = save_rolling_archive(store, valid_6_strs)
+            store = save_rolling_archive(store, valid_5_strs)
             st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
 
         html_doc = render_morning_meeting_html(briefing, round1, round2, host_conclusion, review_rec)
