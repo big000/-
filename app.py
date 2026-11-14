@@ -1051,6 +1051,9 @@ def build_4state_dashboard_html(target_d, tw_info, flow_info, us_mkt, adr_prem, 
     tnx_v = us_mkt.get("美債10Y殖利率", {})
     vix_v = us_mkt.get("恐慌指數 VIX", {})
     fx_v = us_mkt.get("美元兌台幣", {})
+    sox_v = us_mkt.get("費城半導體", {})
+    sox_date = sox_v.get("date", "--")
+    sox_pct = sox_v.get("pct", 0.0)
 
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
 body{{margin:0;background:transparent;color:#e8e6ee;font-family:-apple-system,"Noto Sans TC","Microsoft JhengHei",sans-serif}}
@@ -1117,12 +1120,12 @@ code{{background:#2a2436;color:#f9a8d4;padding:1px 5px;border-radius:4px;font-si
   <div class="sec-card">
     <div class="sec-h">
       <span>🌎 二、盤前關鍵總經、ADR 溢價與法人累積籌碼（解決單日籌碼盲點與跨日時間對齊）</span>
-      <small>台股資料日：{tw_info['date_str']} ｜ 美股最新收盤日：{us_mkt.get('費城半導體', {{}}).get('date', '--')}</small>
+      <small>台股資料日：{tw_info['date_str']} ｜ 美股最新收盤日：{sox_date}</small>
     </div>
     <div class="macro-bar">
       <div class="m-cell">台積電 ADR 換算溢價<b>{prem_txt}</b></div>
       <div class="m-cell">美元兌台幣 / 美債10Y<b>{fx_v.get('close', 0):.2f} ({fx_v.get('pct', 0):+.2f}%) ｜ {tnx_v.get('close', 0):.2f}%</b></div>
-      <div class="m-cell">恐慌指數 VIX / 費半<b>{vix_v.get('close', 0):.2f} ({vix_v.get('pct', 0):+.2f}%) ｜ 費半 {us_mkt.get('費城半導體', {{}}).get('pct', 0):+.2f}%</b></div>
+      <div class="m-cell">恐慌指數 VIX / 費半<b>{vix_v.get('close', 0):.2f} ({vix_v.get('pct', 0):+.2f}%) ｜ 費半 {sox_pct:+.2f}%</b></div>
       <div class="m-cell">外資現貨 (昨 / 5日 / 10日)<b>{flow_info['f1']:+.0f}億 / {flow_info['f5']:+.0f}億 / {flow_info['f10']:+.0f}億</b></div>
     </div>
   </div>
