@@ -621,6 +621,66 @@ def save_rolling_archive(store, valid_6_date_strs):
         pass
     return pruned
 
+# ★★★ 新增：修復缺失的輔助函數 ★★★
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_taifex_oi_and_pcr_for_date(ymd):
+    # 佔位函數，避免 NameError。若需實際抓取請在此加入爬蟲。
+    return {"fx_oi_ok": False, "fx_label": "未取得", "pcr_ok": False, "pcr_label": "未取得"}
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_00631l_nav_info():
+    # 佔位函數，避免 NameError。若需實際抓取折溢價請在此加入爬蟲。
+    return {"ok": False, "label": "未取得"}
+
+def get_schedule_state(tw_df):
+    now = datetime.now(TZ)
+    cur_d = now.date()
+    
+    # 提取 tw_df 的所有日期
+    dts = []
+    for i in tw_df.index:
+        if hasattr(i, 'date'):
+            dts.append(i.date())
+        else:
+            dts.append(i)
+            
+    unique_dates = sorted(list(set(dts)), reverse=True)
+    is_trading, _ = is_tw_trading_day(cur_d)
+    
+    # 如果今天是交易日但 yfinance 尚未更新到今天的資料，手動加入以利排程顯示
+    if is_trading and cur_d not in unique_dates:
+        unique_dates.insert(0, cur_d)
+        
+    archive_dates = unique_dates[:MAX_ARCHIVE_DAYS]
+    has_live_meeting = cur_d in archive_dates
+    
+    banner_state = "live"
+    banner_msg = ""
+    
+    if is_trading:
+        if now.time() < dtime(8, 30):
+            banner_state = "waiting"
+            banner_msg = f"⏳ 今日（{cur_d:%Y/%m/%d}）早會將於 08:30 準時開始。目前時間：{now.strftime('%H:%M')}。"
+        elif now.time() < dtime(17, 0):
+            banner_state = "live"
+            banner_msg = f"🟢 今日（{cur_d:%Y/%m/%d}）08:30 盤前早會已上線！17:00 將自動更新盤後復盤紀錄。"
+        else:
+            banner_state = "live"
+            banner_msg = f"🟢 今日（{cur_d:%Y/%m/%d}）早會與 17:00 復盤紀錄已完整更新。"
+    else:
+        banner_state = "closed"
+        banner_msg = f"🔴 今日（{cur_d:%Y/%m/%d}）非台股交易日。顯示最近交易日（{archive_dates[0]:%Y/%m/%d}）的早會與復盤紀錄。"
+        
+    return {
+        "archive_dates": archive_dates,
+        "now": now,
+        "cur_d": cur_d,
+        "has_live_meeting": has_live_meeting,
+        "banner_state": banner_state,
+        "banner_msg": banner_msg
+    }
+# ★★★ 新增結束 ★★★
+
 def compute_tech_fact_card(df_full, upto_date, label_name, is_etf=False):
     dts = pd.DatetimeIndex(df_full.index).tz_localize(None).date
     d = df_full[dts <= upto_date].copy()
