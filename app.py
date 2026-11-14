@@ -5,14 +5,20 @@ from datetime import datetime, date, time as dtime, timedelta
 import numpy as np, pandas as pd, pytz, requests, yfinance as yf
 import streamlit as st
 import streamlit.components.v1 as components
-import concurrent.futures # ★ 新增：用於多線程併發抓取
+import concurrent.futures
 
-# ── 新增：正文提取核心庫 ──
+# ── 正文提取核心庫 ──
 try:
     import trafilatura
     _TRAFILATURA_OK = True
 except ImportError:
     _TRAFILATURA_OK = False
+
+try:
+    from bs4 import BeautifulSoup
+    _BS4_OK = True
+except ImportError:
+    _BS4_OK = False
 
 st.set_page_config(page_title="破產後重生之我要靠量化交易發財", page_icon="📈", layout="wide",
                    initial_sidebar_state="collapsed")
@@ -825,34 +831,71 @@ def _assign_topic_cluster(title_txt):
             return cl["id"], cl["name"]
     return "general_mkt", "國際財經與市場焦點"
 
-# ── ★★★ 改寫：真正的正文提取 (加入 Timeout 防卡死) ★★★ ───
+# ── 終極進化版：正文提取 (破解轉址 + 雙重解析) ───
 def _try_extract_article_snippet(url, title_str, src_name, is_paywall):
     if is_paywall:
         return False, "僅憑標題判斷（該外媒屬付費牆來源，無法取得全文）"
-    if not _TRAFILATURA_OK:
-        return False, "僅憑標題判斷（環境未安裝 trafilatura，請執行 pip install trafilatura）"
+    
+    real_url = url
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+
     try:
-        # 改用 requests 並設定 5 秒 timeout，避免單一網站卡死
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        resp = requests.get(url, headers=headers, timeout=5)
+        # 1. 破解 Google News 轉址
+        if "news.google.com" in url:
+            resp = requests.get(url, headers=headers, timeout=5, allow_redirects=True)
+            if "news.google.com" not in resp.url:
+                real_url = resp.url
+            else:
+                # 如果還是停在 Google 的 JS 跳轉頁，用正則抓裡面的真實連結
+                match = re.search(r'<a href="([^"]+)"', resp.text, re.IGNORECASE)
+                if match:
+                    real_url = match.group(1)
+                else:
+                    return False, "僅憑標題判斷（無法破解 Google News 轉址）"
+
+        # 2. 請求真實網頁
+        resp = requests.get(real_url, headers=headers, timeout=5)
         if resp.status_code != 200:
-            return False, "僅憑標題判斷（無法連線或頁面禁止抓取）"
+            return False, f"僅憑標題判斷（原始網頁拒絕連線，HTTP {resp.status_code}）"
             
-        text = trafilatura.extract(
-            resp.text, include_comments=False, include_tables=False, favor_precision=True, deduplicate=True
-        )
+        text = ""
+        
+        # 第一重：Trafilatura
+        if _TRAFILATURA_OK:
+            text = trafilatura.extract(
+                resp.text, include_comments=False, include_tables=False, favor_precision=True, deduplicate=True
+            )
+            
+        # 第二重：如果 Trafilatura 失敗，改用 BeautifulSoup 暴力提取
+        if not text and _BS4_OK:
+            try:
+                soup = BeautifulSoup(resp.text, "lxml")
+                for s in soup(["script", "style", "nav", "footer", "header"]):
+                    s.decompose()
+                # 嘗試抓取常見的內文標籤
+                body = soup.find("article") or soup.find("main") or soup.find("div", class_=re.compile(r"content|article|post", re.I)) or soup.body
+                if body:
+                    text = body.get_text(separator="\n", strip=True)
+            except Exception:
+                pass
+                
         if not text:
-            return False, "僅憑標題判斷（頁面無可提取正文，可能為 JavaScript 渲染或純圖片頁）"
+            return False, "僅憑標題判斷（頁面無可提取正文，可能為純圖片或重度 JS 渲染）"
         
         text = re.sub(r"\s+", " ", text).strip().replace(title_str, "").strip(" -｜|—")
         if len(text) < 30:
             return False, "僅憑標題判斷（提取到的正文過短，不足以分析）"
+            
         return True, text[:1500]
+        
     except requests.exceptions.Timeout:
         return False, "僅憑標題判斷（連線超時）"
-    except Exception:
-        return False, "僅憑標題判斷（提取過程發生異常）"
-# ── 改寫結束 ───
+    except Exception as e:
+        return False, f"僅憑標題判斷（異常：{str(e)[:15]}）"
 
 def _judge_priced_in(cluster_id, title_txt, sox_pct, tsm_pct, sp_pct):
     t = title_txt
@@ -876,7 +919,7 @@ def fetch_and_select_top5_news(window_hours, sox_pct, tsm_pct, nvda_pct, sp_pct)
     seen_titles = set()
     headers = {"User-Agent": "Mozilla/5.0"}
     
-    # 1. 先快速收集所有 RSS 標題與連結（不阻塞）
+    # 1. 快速收集 RSS 標題與連結
     for src in NEWS_WHITELIST:
         dom, lang = src["domain"], src["lang"]
         q_str = f"site:{dom} (台股 OR 台積電 OR 費半 OR 輝達 OR 聯準會 OR 外資 OR 半導體) when:{days_param}d" if lang == "zh" else f"site:{dom} (TSMC OR NVIDIA OR semiconductor OR Fed OR Taiwan) when:{days_param}d"
@@ -887,7 +930,7 @@ def fetch_and_select_top5_news(window_hours, sox_pct, tsm_pct, nvda_pct, sp_pct)
             root = ET.fromstring(r.content)
             cnt = 0
             for item in root.findall(".//item"):
-                if cnt >= 3: break # 每個來源最多抓 3 則
+                if cnt >= 3: break
                 raw_t = item.find("title")
                 link_el = item.find("link")
                 pub_el = item.find("pubDate")
@@ -909,7 +952,7 @@ def fetch_and_select_top5_news(window_hours, sox_pct, tsm_pct, nvda_pct, sp_pct)
         except Exception:
             continue
 
-    # 2. 使用多線程 (ThreadPoolExecutor) 併發抓取正文，大幅降低等待時間
+    # 2. 多線程併發抓取正文
     if raw_candidates:
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             future_to_candidate = {
@@ -926,7 +969,7 @@ def fetch_and_select_top5_news(window_hours, sox_pct, tsm_pct, nvda_pct, sp_pct)
                     c["has_body"] = False
                     c["snippet"] = "僅憑標題判斷（正文提取失敗）"
 
-    # 3. 後續的分群與挑選邏輯保持不變
+    # 3. 分群與挑選
     clusters = {}
     for c in raw_candidates:
         clusters.setdefault(c["cluster_id"], []).append(c)
@@ -1382,100 +1425,4 @@ def meeting_page():
     sched = get_schedule_state(tw_df)
     archive_dates = sched["archive_dates"]
     valid_6_strs = [d.strftime("%Y-%m-%d") for d in archive_dates]
-    store = load_rolling_archive()
-
-    with st.spinner("載入早會簡報、白名單新聞與 6 日滾動存檔…"):
-        etf_df = load_daily(ETF_TICKER, "3y")
-        days_flow = last_15_flows()
-
-    with st.container(key="vote_card"):
-        st.markdown(
-            "<div class='fl-h'>🤖 08:30 盤前結構化早會 ＆ 17:00 盤後復盤紀錄中心"
-            "<small>只陳述事實與因果鏈 · 兩輪交叉質疑 · 條件式決策樹 · 6 日滾動存檔</small></div>",
-            unsafe_allow_html=True
-        )
-
-        if sched["banner_state"] == "live":
-            st.success(sched["banner_msg"])
-        elif sched["banner_state"] == "waiting":
-            st.warning(sched["banner_msg"])
-        else:
-            st.error(sched["banner_msg"])
-
-        opt_map = {
-            f"{'🟢 [今日早會]' if (sched['has_live_meeting'] and d == sched['cur_d']) else '📁 [歷史存檔]'} {fmt_d(d)} 08:30 早會與 17:00 復盤紀錄": d
-            for d in archive_dates
-        }
-        chosen_label = st.selectbox(
-            f"📅 選擇檢視紀錄（系統嚴格滾動保留最近 {MAX_ARCHIVE_DAYS} 個交易日，舊紀錄自動刪除）",
-            list(opt_map.keys()),
-            index=0
-        )
-        sel_d = opt_map[chosen_label]
-        is_latest = (sel_d == archive_dates[0])
-
-        briefing = build_meeting_briefing_for_date(sel_d, tw_df, etf_df, days_flow, is_latest)
-        round1, round2, host_conclusion = generate_two_round_meeting_and_tree(briefing)
-        review_rec = build_1700_review_record(sel_d, sched["now"], tw_df, etf_df, briefing, round1, host_conclusion)
-
-        d_key = sel_d.strftime("%Y-%m-%d")
-        store[d_key] = {
-            "date": d_key,
-            "stances": {m["name"]: m["stance"] for m in round1},
-            "review_ready": review_rec["ready"],
-            "state_4": review_rec.get("state_4", "待 17:00 更新"),
-            "tw_day_pct": f"{review_rec['tw_day']:+.2f}%" if review_rec["ready"] else "--",
-            "etf_day_pct": f"{review_rec['etf_day']:+.2f}%" if review_rec["ready"] else "--",
-            "tree_hit": review_rec.get("tree_hit", "待 17:00 更新"),
-        }
-        store = save_rolling_archive(store, valid_6_strs)
-
-        with st.expander(f"🗂️ 展開檢視：最近 {MAX_ARCHIVE_DAYS} 個交易日早會立場與 17:00 復盤滾動存檔一覽表", expanded=False):
-            summary_rows = []
-            for d_item in archive_dates:
-                dk = d_item.strftime("%Y-%m-%d")
-                if dk not in store:
-                    b_tmp = build_meeting_briefing_for_date(d_item, tw_df, etf_df, days_flow, False)
-                    r1_tmp, _, hc_tmp = generate_two_round_meeting_and_tree(b_tmp)
-                    rv_tmp = build_1700_review_record(d_item, sched["now"], tw_df, etf_df, b_tmp, r1_tmp, hc_tmp)
-                    store[dk] = {
-                        "date": dk,
-                        "stances": {m["name"]: m["stance"] for m in r1_tmp},
-                        "review_ready": rv_tmp["ready"],
-                        "state_4": rv_tmp.get("state_4", "待 17:00 更新"),
-                        "tw_day_pct": f"{rv_tmp['tw_day']:+.2f}%" if rv_tmp["ready"] else "--",
-                        "etf_day_pct": f"{rv_tmp['etf_day']:+.2f}%" if rv_tmp["ready"] else "--",
-                        "tree_hit": rv_tmp.get("tree_hit", "待 17:00 更新"),
-                    }
-                rec = store[dk]
-                st_map = rec["stances"]
-                summary_rows.append({
-                    "交易日": fmt_d(d_item),
-                    "基本面": st_map.get("基本面委員", "--"),
-                    "產業面": st_map.get("產業面委員", "--"),
-                    "技術面": st_map.get("技術面委員", "--"),
-                    "籌碼面": st_map.get("籌碼面委員", "--"),
-                    "17:00 實際走勢": rec["state_4"],
-                    "加權指數": rec["tw_day_pct"],
-                    "00631L": rec["etf_day_pct"],
-                    "決策樹復盤": rec["tree_hit"],
-                })
-            store = save_rolling_archive(store, valid_6_strs)
-            st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
-
-        html_doc = render_morning_meeting_html(briefing, round1, round2, host_conclusion, review_rec)
-        components.html(html_doc, height=1850, scrolling=True)
-
-# ───────────────────────── 導覽列與三頁整合組版 ─────────────────────────
-with st.container(key="nav"):
-    a, b = st.columns([5, 2], vertical_alignment="center")
-    a.markdown("<h1>破產後重生之我要靠量化交易發財</h1>", unsafe_allow_html=True)
-    with b:
-        view = pick("頁面", ["早會", "大盤", "策略"], "view")
-with st.container(key="body"):
-    if view == "早會":
-        meeting_page()
-    elif view == "大盤":
-        market_page()
-    else:
-        strategy_page()
+    store = load_rolling_archive
