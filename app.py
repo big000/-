@@ -38,7 +38,7 @@ INDEX_TICKER = "^TWII"
 ETF_TICKER = "00631L.TW"
 SYM = ETF_TICKER
 ARCHIVE_FILE = "review_archive_6d.json"
-MAX_ARCHIVE_DAYS = 6
+MAX_ARCHIVE_DAYS = 5
 
 # ── OpenAI API Key 讀取（env > st.secrets） ──
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
