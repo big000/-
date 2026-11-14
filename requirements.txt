@@ -7,3 +7,5 @@ plotly
 pytz
 requests
 trafilatura
+beautifulsoup4
+lxml
