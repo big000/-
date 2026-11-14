@@ -1,4 +1,4 @@
-import json, time, re
+import json, time, re, math
 import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime, date, timedelta
@@ -11,15 +11,161 @@ st.set_page_config(page_title="破產後重生之我要靠量化交易發財", p
 TZ = pytz.timezone("Asia/Taipei")
 UP, DN = "#ff4d5a", "#22c55e"                   # 台股慣例：紅漲綠跌
 
-# 四種日內狀態標準配色與定義
-STATE_META = {
-    "開高走高": {"col": "#ff4d5a", "bg": "rgba(255,77,90,.18)", "icon": "🔴", "desc": "開盤 > 昨收 且 收盤 ≥ 開盤（跳空續攻紅K）"},
-    "開高走低": {"col": "#f59e0b", "bg": "rgba(245,158,11,.18)", "icon": "🟠", "desc": "開盤 > 昨收 但 收盤 < 開盤（開高出貨黑K）"},
-    "開低走高": {"col": "#38bdf8", "bg": "rgba(56,189,248,.18)", "icon": "🔵", "desc": "開盤 ≤ 昨收 但 收盤 ≥ 開盤（低接承接紅K）"},
-    "開低走低": {"col": "#22c55e", "bg": "rgba(34,197,94,.18)", "icon": "🟢", "desc": "開盤 ≤ 昨收 且 收盤 < 開盤（跳空殺低黑K）"},
-}
+# ───────────────────────── 無洩漏（Walk-Forward）四態量化引擎 ─────────────────────────
 FOUR_STATES = ["開高走高", "開高走低", "開低走高", "開低走低"]
+MIN_TRAIN = 150
+MAX_TRAIN = 500
+GRID = [(lam, hl) for lam in (5.0, 20.0, 80.0) for hl in (80.0, 250.0)]
 
+STATE_META = {
+    "開高走高": {"col": "#ff4d5a", "bg": "rgba(255,77,90,.20)", "cls": "v-up", "icon": "🔴", "desc": "開盤 > 昨收 且 收盤 ≥ 開盤（跳空續攻紅K）"},
+    "開高走低": {"col": "#f59e0b", "bg": "rgba(245,158,11,.20)", "cls": "v-hl", "icon": "🟠", "desc": "開盤 > 昨收 但 收盤 < 開盤（開高出貨黑K）"},
+    "開低走高": {"col": "#38bdf8", "bg": "rgba(56,189,248,.20)", "cls": "v-lh", "icon": "🔵", "desc": "開盤 ≤ 昨收 但 收盤 ≥ 開盤（低接承接紅K）"},
+    "開低走低": {"col": "#22c55e", "bg": "rgba(34,197,94,.20)", "cls": "v-dn", "icon": "🟢", "desc": "開盤 ≤ 昨收 且 收盤 < 開盤（跳空殺低黑K）"},
+}
+
+def _sigmoid(z):
+    return 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
+
+def _logit_fit(Z, y, w, lam, iters=8):
+    n, d = Z.shape
+    X = np.hstack([np.ones((n, 1)), Z])
+    b = np.zeros(d + 1)
+    R = np.eye(d + 1) * lam
+    R[0, 0] = 1e-4
+    for _ in range(iters):
+        p = _sigmoid(X @ b)
+        s = np.clip(p * (1 - p), 1e-4, None) * w
+        g = X.T @ (w * (p - y)) + R @ b
+        H = X.T @ (s[:, None] * X) + R
+        b = b - np.linalg.solve(H, g)
+    return b
+
+def _pred(b, z):
+    return float(_sigmoid(b[0] + z @ b[1:]))
+
+def prep(df, feature_cols):
+    """回傳 X, gap_up, intra_up, state_idx（皆為 numpy）。"""
+    X = np.nan_to_num(df[feature_cols].values.astype(float), nan=0.0, posinf=0.0, neginf=0.0)
+    gap = (df["Open"].values.astype(float) > df["PrevClose"].values.astype(float)).astype(float)
+    intra = (df["Close"].values.astype(float) >= df["Open"].values.astype(float)).astype(float)
+    sidx = np.where(gap == 1, np.where(intra == 1, 0, 1), np.where(intra == 1, 2, 3))
+    return X, gap, intra, sidx
+
+def _train_slice(t):
+    return max(0, t - MAX_TRAIN), t
+
+def fit_predict(X, gap, intra, t, cols, lam, hl):
+    """只用 [lo, t) 的資料；回傳 (pg, pu, pd, mu, sd)。"""
+    lo, hi = _train_slice(t)
+    Xtr = X[lo:hi][:, cols]
+    mu = Xtr.mean(0)
+    sd = Xtr.std(0)
+    sd[sd < 1e-6] = 1.0
+    Z = np.clip((Xtr - mu) / sd, -4, 4)
+    z = np.clip((X[t, cols] - mu) / sd, -4, 4)
+    n = len(Z)
+    w = np.exp((np.arange(n) - n) / hl)
+    w = w / w.mean()
+    g, it = gap[lo:hi], intra[lo:hi]
+
+    pg = _pred(_logit_fit(Z, g, w, lam), z)
+
+    def sub(mask):
+        if mask.sum() >= 40 and 0 < it[mask].mean() < 1:
+            ws = w[mask] / w[mask].mean()
+            return _pred(_logit_fit(Z[mask], it[mask], ws, lam * 3), z)
+        return _pred(_logit_fit(Z, it, w, lam * 3), z)
+
+    pu, pd_ = sub(g == 1), sub(g == 0)
+    c = lambda v: float(min(0.97, max(0.03, v)))
+    return c(pg), c(pu), c(pd_), mu, sd
+
+def fit_predict_detail(X, gap, intra, t, cols, lam, hl):
+    """回傳四態機率、三階段機率 (pg, pu, pd_)、當日標準化特徵 z 與各階段迴歸權重 (bg, bu, bd)。"""
+    lo, hi = _train_slice(t)
+    Xtr = X[lo:hi][:, cols]
+    mu = Xtr.mean(0)
+    sd = Xtr.std(0)
+    sd[sd < 1e-6] = 1.0
+    Z = np.clip((Xtr - mu) / sd, -4, 4)
+    z = np.clip((X[t, cols] - mu) / sd, -4, 4)
+    n = len(Z)
+    w = np.exp((np.arange(n) - n) / hl)
+    w = w / w.mean()
+    g, it = gap[lo:hi], intra[lo:hi]
+
+    bg = _logit_fit(Z, g, w, lam)
+    pg = _pred(bg, z)
+
+    def sub_fit(mask):
+        if mask.sum() >= 40 and 0 < it[mask].mean() < 1:
+            ws = w[mask] / w[mask].mean()
+            b_sub = _logit_fit(Z[mask], it[mask], ws, lam * 3)
+            return _pred(b_sub, z), b_sub
+        b_all = _logit_fit(Z, it, w, lam * 3)
+        return _pred(b_all, z), b_all
+
+    pu, bu = sub_fit(g == 1)
+    pd_, bd = sub_fit(g == 0)
+    c = lambda v: float(min(0.97, max(0.03, v)))
+    pg_c, pu_c, pd_c = c(pg), c(pu), c(pd_)
+    return state_probs(pg_c, pu_c, pd_c), (pg_c, pu_c, pd_c), z, (bg, bu, bd)
+
+def state_probs(pg, pu, pd_):
+    p = np.array([pg * pu, pg * (1 - pu), (1 - pg) * pd_, (1 - pg) * (1 - pd_)])
+    return p / p.sum()
+
+def predict_state(X, gap, intra, t, cols, lam, hl):
+    pg, pu, pd_, mu, sd = fit_predict(X, gap, intra, t, cols, lam, hl)
+    return state_probs(pg, pu, pd_), (pg, pu, pd_), (mu, sd)
+
+def baseline_state(sidx, t):
+    lo, hi = _train_slice(t)
+    return int(np.bincount(sidx[lo:hi], minlength=4).argmax())
+
+def tune(X, gap, intra, sidx, end, cols, span=60):
+    """只看 end 之前的資料，以 walk-forward log-loss 選 (lam, hl)。"""
+    idxs = [t for t in range(max(MIN_TRAIN, end - span), end)]
+    if not idxs:
+        return GRID[2]
+    best, best_ll = GRID[2], -1e9
+    for lam, hl in GRID:
+        ll = 0.0
+        for t in idxs:
+            p, _, _ = predict_state(X, gap, intra, t, cols, lam, hl)
+            ll += math.log(max(p[sidx[t]], 1e-6))
+        ll /= len(idxs)
+        if ll > best_ll:
+            best, best_ll = (lam, hl), ll
+    return best
+
+def binom_p(hits, n, p0):
+    """H0: 命中率 = p0 的單尾二項檢定 P(X>=hits)。"""
+    p0 = min(max(p0, 0.05), 0.95)
+    return float(sum(math.comb(n, k) * p0 ** k * (1 - p0) ** (n - k) for k in range(hits, n + 1)))
+
+def evaluate(X, gap, intra, sidx, idxs, cols, lam, hl):
+    idxs = [t for t in idxs if t >= MIN_TRAIN]
+    n = len(idxs)
+    if n == 0:
+        return dict(n=0, hit=0, base=0, gap=0, intra=0, p=1.0, rows=[])
+    hit = base = gh = ih = 0
+    rows = []
+    for t in idxs:
+        p, (pg, pu, pd_), _ = predict_state(X, gap, intra, t, cols, lam, hl)
+        top = int(p.argmax())
+        b = baseline_state(sidx, t)
+        hit += top == sidx[t]
+        base += b == sidx[t]
+        gh += (pg >= 0.5) == (gap[t] == 1)
+        pi = pu if pg >= 0.5 else pd_
+        ih += (pi >= 0.5) == (intra[t] == 1)
+        rows.append(dict(t=t, top=top, probs=p, pg=pg, pu=pu, pd=pd_, base_st=b, actual=int(sidx[t])))
+    return dict(n=n, hit=int(hit), base=int(base), gap=int(gh), intra=int(ih),
+                p=binom_p(int(hit), n, max(base / n, 0.25)), rows=rows)
+
+# ───────────────────────── 全域樣式 ─────────────────────────
 st.markdown("""<style>
 header[data-testid=stHeader],footer,#MainMenu{display:none}
 .stApp{background:linear-gradient(135deg,#f8c8e6 0%,#dcb8fb 52%,#b9a6f7 100%);background-attachment:fixed}
@@ -67,7 +213,6 @@ def load_intraday():
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_5m_all(sym):
-    """5 分 K（Yahoo 最多提供近 60 天），給策略模擬與分時圖使用"""
     d = _clean(yf.download(sym, period="60d", interval="5m", progress=False))
     if d.empty: return d
     d.index = d.index.tz_convert(TZ)
@@ -112,7 +257,6 @@ def last_10_flows():
 # ───────────────────────── 交易日曆（證交所休市日） ─────────────────────────
 @st.cache_data(ttl=86400, show_spinner=False)
 def tw_holidays():
-    """從證交所 OpenAPI 官方端點抓取休市日 {date: 名稱}"""
     try:
         r = requests.get("https://openapi.twse.com.tw/v1/holidaySchedule/holidaySchedule", timeout=8)
         if r.status_code != 200: raise ValueError("API Error")
@@ -131,13 +275,11 @@ def tw_holidays():
         raise ValueError("Fetch failed")
 
 def future_trading_days(after, k):
-    """after 之後的第 1~k 個交易日 → (日期清單, 期間遇到的平日假日 {date: 名稱}, 假日資料是否完整)"""
     hol, ok = {}, True
     try:
         hol = tw_holidays()
     except Exception:
         ok = False
-
     days, skipped, d = [], {}, after
     while len(days) < k:
         d += timedelta(days=1)
@@ -153,7 +295,6 @@ def fmt_d(d): return f"{d:%m/%d}（週{WD[d.weekday()]}）"
 
 # ───────────────────────── 圖表模組(TradingView) ─────────────────────────
 LW = '<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>'
-
 BASE = LW + (
     '<style>html,body{margin:0;background:#000;font-family:-apple-system,"Noto Sans TC","Microsoft JhengHei",sans-serif}'
     '#w{position:relative}#cv{position:absolute;left:0;top:0;pointer-events:none}'
@@ -170,8 +311,7 @@ BASE = LW + (
     'horzLine:{style:2,width:1,color:"rgba(255,255,255,.4)",labelBackgroundColor:"#3b3b46"}},'
     'rightPriceScale:{borderColor:"#1f1f26"}},o));'
     'const tkey=t=>typeof t==="string"?t:(t&&t.year?t.year+"-"+pad(t.month)+"-"+pad(t.day):t);'
-    'let chart;'
-    'addEventListener("resize",()=>{chart.applyOptions({width:el.clientWidth});window.redraw&&redraw()});'
+    'let chart;addEventListener("resize",()=>{chart.applyOptions({width:el.clientWidth});window.redraw&&redraw()});'
 )
 
 DAILY_JS = (
@@ -356,7 +496,6 @@ SYM = "00631L.TW"
 
 @st.cache_data(ttl=300, show_spinner=False)
 def strategy_data():
-    """回傳 (日線 df, {日期: [(O,H,L,C), ...] 5 分 K})。今日日線用 5 分 K 校正高低收。"""
     df = load_daily(SYM, "3y").copy()
     df5 = load_5m_all(SYM)
     intra = {}
@@ -378,7 +517,6 @@ def simulate(df, intra, em, xm, sl, tp1, sl1, cool):
     for p in (5, 10, 240): d[f"m{p}"] = d.Close.rolling(p).mean()
     O, Hh, L, C = d["Open"].values, d["High"].values, d["Low"].values, d["Close"].values
     M5, M10, M240 = d["m5"].values, d["m10"].values, d["m240"].values
-
     dates = [x.date() for x in d.index]
     pos, ep, reg, ei, last, tr = 0, 0., 0, 0, -9999, []
 
@@ -394,7 +532,6 @@ def simulate(df, intra, em, xm, sl, tp1, sl1, cool):
     for i in range(241, len(d)):
         m5, m10, m240 = M5[i-1], M10[i-1], M240[i-1]
         m5b, m10b = M5[i-2], M10[i-2]
-
         bars = intra.get(dates[i]) or [(O[i], Hh[i], L[i], C[i])]
         for j, (bo, bh, bl, bc) in enumerate(bars):
             if pos:
@@ -502,43 +639,95 @@ def strategy_page():
             st.markdown("<div class='fl-h'>最近 5 筆模擬交易</div>", unsafe_allow_html=True)
             st.dataframe(pd.DataFrame(s["trades"][-5:][::-1]), hide_index=True, use_container_width=True)
 
-# ───────────────────────── 頁面三：AI 投研早會聊天室 & 四態量化驗證系統 ─────────────────────────
+# ───────────────────────── 頁面三：無洩漏 Walk-Forward × 經典投研早會聊天室 ─────────────────────────
 AI_AGENTS = [
-    {"id": "chatgpt",  "name": "ChatGPT",  "model_id": "gpt-4o-mini",              "secret_key": "OPENAI_API_KEY",    "short": "GPT", "color": "#10a37f", "role": "總經跨市場迴歸與外資期現貨基差"},
-    {"id": "deepseek", "name": "DeepSeek", "model_id": "deepseek-chat",            "secret_key": "DEEPSEEK_API_KEY",  "short": "DS",  "color": "#3b82f6", "role": "Kernel-KNN 歷史相似日匹配與微結構動能"},
-    {"id": "gemini",   "name": "Gemini",   "model_id": "gemini-2.5-flash",         "secret_key": "GEMINI_API_KEY",    "short": "GEM", "color": "#8b5cf6", "role": "AI 供應鏈實證與台積電 ADR 溢價傳導"},
-    {"id": "claude",   "name": "Claude",   "model_id": "claude-3-5-sonnet-latest", "secret_key": "ANTHROPIC_API_KEY", "short": "CLD", "color": "#d97706", "role": "反方盲點檢核、均線乖離反轉與風控"},
+    {"id": "chatgpt",  "name": "ChatGPT (gpt-4o-mini)",              "model_id": "gpt-4o-mini",              "secret_key": "OPENAI_API_KEY",    "short": "GPT", "color": "#10a37f", "role": "總經宏觀與外資期現貨解讀"},
+    {"id": "deepseek", "name": "DeepSeek (deepseek-chat)",            "model_id": "deepseek-chat",            "secret_key": "DEEPSEEK_API_KEY",  "short": "DS",  "color": "#3b82f6", "role": "量化動能因子與費半微結構"},
+    {"id": "gemini",   "name": "Gemini (gemini-2.5-flash)",           "model_id": "gemini-2.5-flash",         "secret_key": "GEMINI_API_KEY",    "short": "GEM", "color": "#8b5cf6", "role": "AI 供應鏈與台積電 ADR 溢價"},
+    {"id": "claude",   "name": "Claude (claude-3-5-sonnet-latest)",   "model_id": "claude-3-5-sonnet-latest", "secret_key": "ANTHROPIC_API_KEY", "short": "CLD", "color": "#d97706", "role": "風險控管與土洋籌碼背離檢核"},
 ]
+
+FEATURE_COLS = [
+    "tsm_pct", "sox_pct", "nvda_pct", "sp_pct", "vix_pct", "fx_pct",
+    "tw_prev_pct", "prev_intra", "prev_clv", "wick_diff", "prev_hl_pct",
+    "bias5", "bias10", "bias20", "ma5_slope", "rsi5_z",
+    "lead_lag", "tsm_x_bias5", "sox_x_clv", "gap_reversal_risk", "adr_prem"
+]
+
+FEAT_NAMES = {
+    "tsm_pct": "台積電ADR漲跌",
+    "sox_pct": "費城半導體漲跌",
+    "nvda_pct": "NVIDIA漲跌",
+    "sp_pct": "標普500漲跌",
+    "vix_pct": "VIX恐慌變動",
+    "fx_pct": "台幣匯率變動",
+    "tw_prev_pct": "前日台股漲跌",
+    "prev_intra": "前日台股實體K",
+    "prev_clv": "前日收盤強弱CLV",
+    "wick_diff": "前日上下影線差",
+    "prev_hl_pct": "前日高低振幅",
+    "bias5": "5MA乖離率",
+    "bias10": "10MA乖離率",
+    "bias20": "20MA乖離率",
+    "ma5_slope": "5MA斜率",
+    "rsi5_z": "5日RSI位階",
+    "lead_lag": "台美跨日基差",
+    "tsm_x_bias5": "ADR×5MA乖離交互項",
+    "sox_x_clv": "費半×CLV交互項",
+    "gap_reversal_risk": "高檔跳空反轉風險",
+    "adr_prem": "台積電ADR溢價率",
+}
+
+AGENT_SUBSPACES = {
+    "chatgpt":  ["sp_pct", "tsm_pct", "fx_pct", "vix_pct", "lead_lag", "tw_prev_pct", "bias10", "bias20"],
+    "deepseek": ["sox_pct", "tsm_pct", "nvda_pct", "prev_intra", "prev_clv", "ma5_slope", "rsi5_z", "sox_x_clv", "lead_lag"],
+    "gemini":   ["tsm_pct", "nvda_pct", "sox_pct", "adr_prem", "lead_lag", "bias5", "ma5_slope", "tsm_x_bias5"],
+    "claude":   ["bias5", "bias10", "bias20", "wick_diff", "prev_hl_pct", "rsi5_z", "gap_reversal_risk", "tsm_x_bias5", "vix_pct", "lead_lag"],
+}
 
 def _gnews_url(query):
     return f"https://www.google.com/search?q={urllib.parse.quote(query)}&tbm=nws"
 
-def classify_4state(open_p, close_p, prev_c):
-    """將單日 K 線嚴格分類為四種日內狀態"""
-    is_gap_up = float(open_p) > float(prev_c)
-    is_intra_up = float(close_p) >= float(open_p)
-    if is_gap_up and is_intra_up:
-        return "開高走高"
-    elif is_gap_up and not is_intra_up:
-        return "開高走低"
-    elif not is_gap_up and is_intra_up:
-        return "開低走高"
-    else:
-        return "開低走低"
+def _analyze_event_impact(title, snippet, sox_pct, tsm_pct, nvda_pct, sp_pct, f_net, t_net):
+    """根據新聞標題、摘要與最新盤勢數據，自動生成【事件發展】與【對台股影響】深度說明（保留最初設計）"""
+    t = title.upper()
+    clean_snip = re.sub(r"<[^>]+>", " ", snippet or "")
+    clean_snip = re.sub(r"&[a-zA-Z0-9#]+;", " ", clean_snip)
+    clean_snip = re.sub(r"\s+", " ", clean_snip).strip()
 
-def _softmax_probs(logits):
-    x = np.array(logits, dtype=float)
-    x = x - np.max(x)
-    e = np.exp(x)
-    p = e / np.sum(e) * 100.0
-    return {FOUR_STATES[i]: round(float(p[i]), 1) for i in range(4)}
+    if any(k in t for k in ["輝達", "NVIDIA", "NVDA", "BLACKWELL", "RUBIN", "AI晶片", "算力", "GB200", "GB300"]):
+        dev = (f"國際市場高度聚焦 AI 算力龍頭輝達（NVIDIA）最新晶片出貨、財報展望與大型雲端巨頭（CSP）資本支出動向，"
+               f"隔夜 NVDA 股價實際收盤變動 {nvda_pct:+.2f}%，引發華爾街對高估值 AI 硬體股的重新定價。")
+        imp = (f"台灣作為全球 AI 伺服器與先進封裝核心基地（台積電 CoWoS、鴻海、廣達、散熱與載板族群），"
+               f"{'NVDA 隔夜回檔將使台股 AI 權值股早盤面臨獲利了結賣壓，進場 00631L 宜提防開高走低或跳空拉回' if nvda_pct < -0.5 else 'NVDA 維持強勢有助點燃台股電子權值買氣，支撐大盤向均線上方推進'}。")
+    elif any(k in t for k in ["台積", "TSM", "ADR", "晶圓", "先進製程", "2奈米", "COWOS", "半導體", "費半"]):
+        dev = (f"全球半導體產業聚焦先進製程報價與產能利用率，隔夜費城半導體指數變動 {sox_pct:+.2f}%、"
+               f"台積電 ADR (TSM) 收盤變動 {tsm_pct:+.2f}%，直接反映國際機構法人對台灣半導體鏈的最新態度。")
+        imp = (f"台積電單一檔個股佔台股加權指數與 00631L 權重逾 35%，"
+               f"{'ADR 隔夜下跌將直接造成今日台股開盤點數蒸發與跳空壓力，早盤需觀察 5 分 K 能否守穩開盤低點' if tsm_pct < -0.3 else 'ADR 溢價與強勢表現將吸引外資於台股開盤回補現貨，直接推升加權指數與正2部位'}。")
+    elif any(k in t for k in ["PPI", "CPI", "通膨", "聯準會", "FED", "降息", "利率", "非農", "鮑爾", "殖利率", "美債"]):
+        dev = (f"美國最新總經通膨指標（CPI/PPI）與聯準會官員談話牽動市場對降息路徑的預期，"
+               f"隔夜美債殖利率波動使標普 500 指數收盤變動 {sp_pct:+.2f}%，資金在科技成長股與防禦型資產間進行再平衡。")
+        imp = (f"總經利率預期直接決定美元指數強弱與新台幣匯率走向。"
+               f"{'若通膨數據高於預期或降息預期延後，外資易在台股現貨進行提款調節，壓抑大型權值股估值' if sp_pct < 0 else '宏觀利率環境趨於穩定，有利於外資熱錢留駐台股並延續多頭波段'}。")
+    elif any(k in t for k in ["關稅", "川普", "貿易", "制裁", "禁令", "晶片法", "地緣"]):
+        dev = ("國際貿易政策、關稅壁壘與半導體出口管制議題再度發酵，跨國供應鏈面臨成本轉嫁與產地移轉的不確定性，"
+               "引發國際法人對硬體製造業毛利率的重新評估。")
+        imp = ("台股電子代工與外銷出口佔比極高，政策雜音容易放大盤中避險情緒（自營商與外資期貨避險空單增加），"
+               "導致早盤振幅加劇，操作上應嚴格遵守策略 B 的觸價與停損紀律。")
+    else:
+        if clean_snip and clean_snip != title and len(clean_snip) > 15:
+            dev = f"最新市場動態指出：{clean_snip[:110]}…（隔夜美股 S&P 500 變動 {sp_pct:+.2f}%、費半變動 {sox_pct:+.2f}%）。"
+        else:
+            dev = (f"該項國際財經事件成為過去 24 小時華爾街與亞太市場關注焦點，"
+                   f"伴隨隔夜美股 S&P 500 ({sp_pct:+.2f}%) 與費城半導體 ({sox_pct:+.2f}%) 的波動，牽動跨國基金的資產配置。")
+        imp = (f"透過外資台股期現貨連動機制（昨日外資現貨{'買超' if f_net>=0 else '賣超'} {abs(f_net):.1f} 億、投信{'買超' if t_net>=0 else '賣超'} {abs(t_net):.1f} 億），"
+               f"{'由於隔夜美股科技股偏弱，此事件將測試今日內資投信與官股行庫的低接護盤力道' if (sox_pct+tsm_pct)<0 else '配合法人資金偏多格局，此消息有助於維繫台股盤面輪動與多頭人氣'}。")
+
+    return dev, imp
 
 @st.cache_data(ttl=1200, show_spinner=False)
 def build_master_feature_table():
-    """
-    建立過去 3 年完整台美股跨市場特徵表，嚴格對齊交易日。
-    每一列代表台股交易日 T，所有預測特徵（X）皆嚴格取自 T 日 08:30 開盤前已知資訊（T-1 台股與隔夜美股）。
-    """
     tw = load_daily("^TWII", "3y").copy()
     sox = load_daily("^SOX", "3y").copy()
     tsm = load_daily("TSM", "3y").copy()
@@ -549,7 +738,7 @@ def build_master_feature_table():
     fx = load_daily("USDTWD=X", "3y").copy()
     s2330 = load_daily("2330.TW", "3y").copy()
 
-    if tw.empty or len(tw) < 80:
+    if tw.empty or len(tw) < 200:
         return pd.DataFrame()
 
     tw["date"] = pd.DatetimeIndex(tw.index).tz_localize(None).date
@@ -557,13 +746,12 @@ def build_master_feature_table():
     tw["PrevOpen"] = tw["Open"].shift(1)
     tw["PrevHigh"] = tw["High"].shift(1)
     tw["PrevLow"] = tw["Low"].shift(1)
+    tw["PrevHL"] = (tw["PrevHigh"] - tw["PrevLow"]).fillna(0.0)
 
-    # T-1 台股技術與微結構特徵（嚴格於 T 日 08:30 前已知）
     tw["tw_prev_pct"] = (tw["PrevClose"] / tw["Close"].shift(2) - 1.0) * 100.0
     tw["prev_intra"] = (tw["PrevClose"] / tw["PrevOpen"] - 1.0) * 100.0
     hl_range = (tw["PrevHigh"] - tw["PrevLow"]).replace(0, np.nan)
-    tw["prev_clv"] = ((tw["PrevClose"] - tw["PrevLow"]) / hl_range - 0.5) * 2.0  # -1 ~ +1
-    tw["prev_clv"] = tw["prev_clv"].fillna(0.0)
+    tw["prev_clv"] = (((tw["PrevClose"] - tw["PrevLow"]) / hl_range - 0.5) * 2.0).fillna(0.0)
     tw["prev_hl_pct"] = (hl_range / tw["PrevClose"] * 100.0).fillna(1.0)
 
     body_top = np.maximum(tw["PrevOpen"], tw["PrevClose"])
@@ -577,23 +765,17 @@ def build_master_feature_table():
 
     tw["ma5_slope"] = (tw["ma5_prev"] / tw["Close"].rolling(5).mean().shift(2) - 1.0) * 100.0
 
-    # 5 日 RSI (T-1)
     delta_c = tw["Close"].shift(1).diff()
     gain = delta_c.clip(lower=0).rolling(5).mean()
     loss = (-delta_c.clip(upper=0)).rolling(5).mean().replace(0, 1e-4)
     rs = gain / loss
-    tw["rsi5_z"] = ((100.0 - 100.0 / (1.0 + rs)) - 50.0) / 25.0
-    tw["rsi5_z"] = tw["rsi5_z"].fillna(0.0)
+    tw["rsi5_z"] = (((100.0 - 100.0 / (1.0 + rs)) - 50.0) / 25.0).fillna(0.0)
 
-    # 輔助函數：將美股 T-1 隔夜數據對齊至台股 T 日盤前
     def _align_us_series(us_df, mode="pct"):
         if us_df is None or us_df.empty:
             return pd.Series(0.0, index=tw.index)
         idx_dates = pd.DatetimeIndex(us_df.index).tz_localize(None).date
-        if mode == "pct":
-            s_raw = pd.Series(us_df["Close"].pct_change().values * 100.0, index=idx_dates)
-        else:
-            s_raw = pd.Series(us_df["Close"].values, index=idx_dates)
+        s_raw = pd.Series(us_df["Close"].pct_change().values * 100.0, index=idx_dates) if mode == "pct" else pd.Series(us_df["Close"].values, index=idx_dates)
         s_raw = s_raw[~s_raw.index.duplicated(keep="last")]
         mapped = []
         for d_tw in tw["date"]:
@@ -618,7 +800,6 @@ def build_master_feature_table():
     tw["fx_pct"] = _align_us_series(fx, "pct")
     tw["tsm_close"] = _align_us_series(tsm, "close")
 
-    # 2330.TW T-1 收盤價與 ADR 溢價率
     if not s2330.empty:
         s2330_d = pd.Series(s2330["Close"].values, index=pd.DatetimeIndex(s2330.index).tz_localize(None).date)
         s2330_d = s2330_d[~s2330_d.index.duplicated(keep="last")]
@@ -632,243 +813,92 @@ def build_master_feature_table():
                     break
             c2330_prev.append(v2330)
         tw["c2330_prev"] = c2330_prev
-        tw["adr_prem"] = ((tw["tsm_close"] * tw["fx_close"] / 5.0) / tw["c2330_prev"] - 1.0) * 100.0
-        tw["adr_prem"] = tw["adr_prem"].fillna(15.0)
+        tw["adr_prem"] = (((tw["tsm_close"] * tw["fx_close"] / 5.0) / tw["c2330_prev"] - 1.0) * 100.0).fillna(15.0)
     else:
         tw["adr_prem"] = 15.0
 
-    # 跨日基差與非線性交互作用特徵（解決「台股昨日偷跑」與「高檔跳空出貨」）
     tw["us_tech_avg"] = 0.5 * tw["tsm_pct"] + 0.5 * tw["sox_pct"]
     tw["lead_lag"] = tw["us_tech_avg"] - 0.65 * tw["tw_prev_pct"]
     tw["tsm_x_bias5"] = tw["tsm_pct"] * tw["bias5"]
     tw["sox_x_clv"] = tw["sox_pct"] * tw["prev_clv"]
     tw["gap_reversal_risk"] = tw["us_tech_avg"] * np.maximum(0.0, tw["bias5"])
 
-    # T 日真實收盤結果（僅用於模型訓練標籤與盤後驗證，絕不作為當日輸入特徵）
     tw["ActualGapPct"] = (tw["Open"] / tw["PrevClose"] - 1.0) * 100.0
     tw["ActualIntraPct"] = (tw["Close"] / tw["Open"] - 1.0) * 100.0
     tw["ActualDayPct"] = (tw["Close"] / tw["PrevClose"] - 1.0) * 100.0
-    tw["ActualState"] = [
-        classify_4state(o, c, p)
-        for o, c, p in zip(tw["Open"], tw["Close"], tw["PrevClose"])
-    ]
 
-    df_clean = tw.dropna(subset=["PrevClose", "ma20_prev", "Open", "Close"]).copy()
+    df_clean = tw.dropna(subset=["PrevClose", "ma20_prev", "Open", "Close"]).copy().reset_index(drop=True)
     return df_clean
 
-FEATURE_COLS = [
-    "tsm_pct", "sox_pct", "nvda_pct", "sp_pct", "vix_pct", "fx_pct",
-    "tw_prev_pct", "prev_intra", "prev_clv", "wick_diff", "prev_hl_pct",
-    "bias5", "bias10", "bias20", "ma5_slope", "rsi5_z",
-    "lead_lag", "tsm_x_bias5", "sox_x_clv", "gap_reversal_risk", "adr_prem"
-]
-
-# 四位 AI 委員各自專屬的正交特徵子集
-AGENT_SUBSPACES = {
-    "chatgpt":  ["sp_pct", "tsm_pct", "fx_pct", "vix_pct", "lead_lag", "tw_prev_pct", "bias10", "bias20"],
-    "deepseek": ["sox_pct", "tsm_pct", "nvda_pct", "prev_intra", "prev_clv", "ma5_slope", "rsi5_z", "sox_x_clv", "lead_lag"],
-    "gemini":   ["tsm_pct", "nvda_pct", "sox_pct", "adr_prem", "lead_lag", "bias5", "ma5_slope", "tsm_x_bias5"],
-    "claude":   ["bias5", "bias10", "bias20", "wick_diff", "prev_hl_pct", "rsi5_z", "gap_reversal_risk", "tsm_x_bias5", "vix_pct", "lead_lag"],
-}
-
 @st.cache_data(ttl=1200, show_spinner=False)
-def fit_calibrated_4state_engine():
-    """
-    【自適應多模型四態量化校準引擎】
-    針對過去 3 年歷史樣本與近期波段結構進行指數衰減加權脊迴歸（Exponentially-Weighted Ridge Classification）
-    與 Kernel-KNN 校準，並驗證雙週 10 個交易日（11/02~11/06 與 11/09~11/13）的預測表現。
-    """
+def run_walk_forward_system():
     df = build_master_feature_table()
-    if df.empty:
+    if df.empty or len(df) <= MIN_TRAIN + 15:
         return None
 
-    # 定位雙週 10 個驗證日：
-    # Week 2 (近期 5 日): 2026-11-09 ~ 2026-11-13 (若資料集日期不同則取最後 5 個交易日)
-    # Week 1 (前週 5 日): 2026-11-02 ~ 2026-11-06 (若資料集日期不同則取倒數第 10 ~ 第 6 個交易日)
+    X, gap, intra, sidx = prep(df, FEATURE_COLS)
+    df["ActualState"] = [FOUR_STATES[i] for i in sidx]
+
+    N = len(df)
     w2_mask = (df["date"] >= date(2026, 11, 9)) & (df["date"] <= date(2026, 11, 13))
     w1_mask = (df["date"] >= date(2026, 11, 2)) & (df["date"] <= date(2026, 11, 6))
+    w2_indices = [int(i) for i in np.where(w2_mask)[0] if i >= MIN_TRAIN]
+    w1_indices = [int(i) for i in np.where(w1_mask)[0] if i >= MIN_TRAIN]
 
-    w2_indices = list(np.where(w2_mask)[0])
-    w1_indices = list(np.where(w1_mask)[0])
     if len(w2_indices) < 3:
-        w2_indices = list(range(max(0, len(df) - 5), len(df)))
+        w2_indices = list(range(max(MIN_TRAIN, N - 5), N))
     if len(w1_indices) < 3:
-        end_w1 = w2_indices[0] if w2_indices else len(df) - 5
-        w1_indices = list(range(max(0, end_w1 - 5), end_w1))
+        end_w1 = w2_indices[0] if w2_indices else N - 5
+        w1_indices = list(range(max(MIN_TRAIN, end_w1 - 5), end_w1))
 
-    # 計算特徵標準化參數
-    X_raw = df[FEATURE_COLS].values.astype(float)
-    X_raw = np.nan_to_num(X_raw, nan=0.0, posinf=0.0, neginf=0.0)
-    mu = np.mean(X_raw, axis=0)
-    sd = np.std(X_raw, axis=0)
-    sd[sd < 1e-6] = 1.0
-    Z = (X_raw - mu) / sd
+    tune_end = min(w1_indices[0] if w1_indices else N - 10, N - 10)
+    cols_all = list(range(len(FEATURE_COLS)))
+    master_lam, master_hl = tune(X, gap, intra, sidx, tune_end, cols_all, span=60)
 
-    # 加入截距與二階非線性特徵基底，提升對近期震盪盤「開高走低／開低走高」之辨識度
-    N = len(df)
-    Phi = np.hstack([
-        np.ones((N, 1)),
-        Z,
-        np.tanh(Z[:, :10] * 0.8),
-        (Z[:, 0:1] * Z[:, 6:7]),   # tsm_pct * tw_prev_pct
-        (Z[:, 1:2] * Z[:, 11:12]), # sox_pct * bias5
-    ])
+    agent_params = {}
+    for ag in AI_AGENTS:
+        aid = ag["id"]
+        sub_cols = [FEATURE_COLS.index(c) for c in AGENT_SUBSPACES[aid]]
+        ag_lam, ag_hl = tune(X, gap, intra, sidx, tune_end, sub_cols, span=60)
+        agent_params[aid] = {"cols": sub_cols, "lam": ag_lam, "hl": ag_hl}
 
-    # 建立四態 One-Hot 標籤矩陣 Y (N x 4)
-    state_to_idx = {s: i for i, s in enumerate(FOUR_STATES)}
-    y_idx = np.array([state_to_idx[s] for s in df["ActualState"]])
-    Y = np.full((N, 4), -0.25)
-    for i, c in enumerate(y_idx):
-        Y[i, c] = 1.0
-
-    # 指數衰減樣本權重（越近期的市場微結構權重越高）
-    time_steps = np.arange(N, dtype=float)
-    sample_w = np.exp((time_steps - N) / 45.0)
-    # 強化近期 25 個交易日之波段結構權重
-    sample_w[-25:] *= 8.0
-
-    # 座標微調：使模型在 Week 2 (11/9~11/13) 達到 >=4/5 正確，且在 Week 1 (11/2~11/6) 達到 4/5 正確（只有一天有出入）
-    # 若 Week 1 有 >=5 天，保留最具結構反轉代表性的 1 天作為自然市場波動誤差，其餘全數精準收斂
-    target_Y = Y.copy()
-    if len(w1_indices) >= 5:
-        # 找出 Week 1 中跳空與盤中幅度最接近邊界的一天，不強行過擬合該異常日，維持 4/5 (80%) 自然真實度
-        w1_Sub = df.iloc[w1_indices]
-        border_pos = int(np.argmin(np.abs(w1_Sub["ActualGapPct"].values) + np.abs(w1_Sub["ActualIntraPct"].values)))
-        leave_out_idx = w1_indices[border_pos]
-        sample_w[w1_indices] = 35.0
-        sample_w[leave_out_idx] = 0.05
-        # 讓該邊界日呈現次高態之自然偏差（模擬真實市場 5 天有 1 天出入）
-        alt_c = (y_idx[leave_out_idx] + 1) % 4
-        target_Y[leave_out_idx] = -0.25
-        target_Y[leave_out_idx, alt_c] = 0.85
-
-    if len(w2_indices) >= 1:
-        sample_w[w2_indices] = 45.0
-
-    # 求解加權多類別脊迴歸 W_master: (Phi^T W Phi + lambda I)^(-1) Phi^T W Y
-    W_diag = sample_w[:, None]
-    reg_eye = np.eye(Phi.shape[1]) * 1.2
-    reg_eye[0, 0] = 0.01
-    W_master = np.linalg.solve(Phi.T @ (W_diag * Phi) + reg_eye, Phi.T @ (W_diag * target_Y))
-
-    # 為四位 AI 委員分別在各自專屬特徵子空間上訓練獨立權重 W_agent
-    agent_weights = {}
-    for ag_id, sub_cols in AGENT_SUBSPACES.items():
-        col_indices = [FEATURE_COLS.index(c) for c in sub_cols]
-        Z_sub = Z[:, col_indices]
-        Phi_ag = np.hstack([
-            np.ones((N, 1)),
-            Z_sub,
-            np.tanh(Z_sub * 0.75),
-            Phi[:, -2:]
-        ])
-        reg_ag = np.eye(Phi_ag.shape[1]) * (1.8 if ag_id != "claude" else 2.5)
-        W_ag = np.linalg.solve(Phi_ag.T @ (W_diag * Phi_ag) + reg_ag, Phi_ag.T @ (W_diag * target_Y))
-        agent_weights[ag_id] = (col_indices, W_ag)
+    oos60_start = max(MIN_TRAIN, N - 60)
+    oos60_idxs = list(range(oos60_start, N))
+    lam60, hl60 = tune(X, gap, intra, sidx, oos60_start, cols_all, span=50)
+    eval_60 = evaluate(X, gap, intra, sidx, oos60_idxs, cols_all, lam60, hl60)
+    eval_w1 = evaluate(X, gap, intra, sidx, w1_indices, cols_all, master_lam, master_hl)
+    eval_w2 = evaluate(X, gap, intra, sidx, w2_indices, cols_all, master_lam, master_hl)
 
     return {
         "df": df,
-        "mu": mu,
-        "sd": sd,
-        "Phi": Phi,
-        "Z": Z,
-        "y_idx": y_idx,
-        "W_master": W_master,
-        "agent_weights": agent_weights,
+        "X": X,
+        "gap": gap,
+        "intra": intra,
+        "sidx": sidx,
+        "cols_all": cols_all,
+        "master_lam": master_lam,
+        "master_hl": master_hl,
+        "agent_params": agent_params,
         "w1_indices": w1_indices,
         "w2_indices": w2_indices,
+        "eval_60": eval_60,
+        "eval_w1": eval_w1,
+        "eval_w2": eval_w2,
     }
 
-def predict_row_4state(engine, row_idx):
-    """
-    針對指定交易日 row_idx，僅使用該日 08:30 前之盤前特徵向量，計算：
-    1. 量化主模型（Master Quant Engine）四態機率
-    2. 四位 AI 委員各自獨立模型的四態機率與投票
-    3. 歷史最相似 20 個交易日（KNN Analogues）統計
-    """
-    df = engine["df"]
-    Phi = engine["Phi"]
-    Z = engine["Z"]
-    y_idx = engine["y_idx"]
-
-    phi_t = Phi[row_idx]
-    z_t = Z[row_idx]
-
-    # 1. Master Quant 模型預測
-    master_logits = (phi_t @ engine["W_master"]) * 2.4
-    master_probs = _softmax_probs(master_logits)
-    master_top = max(master_probs.items(), key=lambda x: x[1])[0]
-
-    # 2. 歷史相似日 KNN 檢索（嚴格只取 row_idx 之前的歷史日，或排除當日之歷史樣本）
-    hist_mask = np.arange(len(df)) != row_idx
-    if row_idx >= 60:
-        hist_mask = np.arange(len(df)) < row_idx
-    Z_hist = Z[hist_mask]
-    y_hist = y_idx[hist_mask]
-    df_hist = df.iloc[np.where(hist_mask)[0]]
-
-    dists = np.sqrt(np.mean((Z_hist[:, :14] - z_t[:14]) ** 2, axis=1))
-    k_nn = min(25, len(dists))
-    nn_idx = np.argsort(dists)[:k_nn]
-    nn_weights = np.exp(-dists[nn_idx])
-    nn_weights /= np.sum(nn_weights)
-
-    knn_logits = np.zeros(4)
-    for w_i, c_i in zip(nn_weights, y_hist[nn_idx]):
-        knn_logits[c_i] += w_i * 3.2
-
-    nn_sub = df_hist.iloc[nn_idx]
-    detail_stats = {}
-    for st_name in FOUR_STATES:
-        g = nn_sub[nn_sub["ActualState"] == st_name]
-        cnt = len(g)
-        detail_stats[st_name] = {
-            "count": cnt,
-            "avg_gap": round(float(g["ActualGapPct"].mean()), 2) if cnt > 0 else round(float(nn_sub["ActualGapPct"].mean()), 2),
-            "avg_intra": round(float(g["ActualIntraPct"].mean()), 2) if cnt > 0 else round(float(nn_sub["ActualIntraPct"].mean()), 2),
-        }
-
-    # 3. 四位 AI 委員各自獨立的子空間推演
-    agent_preds = {}
-    for ag in AI_AGENTS:
-        aid = ag["id"]
-        col_idx, W_ag = engine["agent_weights"][aid]
-        z_sub = z_t[col_idx]
-        phi_ag = np.concatenate([[1.0], z_sub, np.tanh(z_sub * 0.75), phi_t[-2:]])
-        ag_logits = (phi_ag @ W_ag) * 2.2
-
-        # DeepSeek 融合 Kernel-KNN 分佈；Claude 強化乖離反轉敏感度
-        if aid == "deepseek":
-            ag_logits = 0.70 * master_logits + 0.30 * knn_logits
-        elif aid == "claude":
-            ag_logits = 0.75 * ag_logits + 0.25 * master_logits
-        else:
-            ag_logits = 0.80 * ag_logits + 0.20 * master_logits
-
-        ag_probs = _softmax_probs(ag_logits)
-        ag_top = max(ag_probs.items(), key=lambda x: x[1])[0]
-        conf = int(min(96, max(55, round(ag_probs[ag_top] * 1.35 + 18))))
-        agent_preds[aid] = {
-            "vote_state": ag_top,
-            "probs": ag_probs,
-            "confidence": conf,
-        }
-
-    return {
-        "master_probs": master_probs,
-        "master_top": master_top,
-        "detail_stats": detail_stats,
-        "agent_preds": agent_preds,
-        "k_nn": k_nn
-    }
+def _top_feature_drivers(z, b, sub_cols, top_k=2):
+    contribs = z * b[1:]
+    pairs = [(FEAT_NAMES.get(FEATURE_COLS[sub_cols[i]], FEATURE_COLS[sub_cols[i]]), float(contribs[i]), float(z[i])) for i in range(len(sub_cols))]
+    pos = sorted([p for p in pairs if p[1] > 0], key=lambda x: x[1], reverse=True)[:top_k]
+    neg = sorted([p for p in pairs if p[1] < 0], key=lambda x: x[1])[:top_k]
+    return pos, neg
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_rss_news():
-    """抓取 Google News 國際財經真實新聞"""
     headlines = []
     seen_titles = set()
     rss_urls = [
-        "https://news.google.com/rss/search?q=%E5%8F%B0%E7%A9%8D%E9%9B%BB+OR+%E8%B2%BB%E5%8D%8A+OR+%E8%BC%9D%E9%81%94+OR+%E8%81%AF%E6%BA%96%E6%9C%83+OR+%E5%8F%B0%E8%82%A1+when:3d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+        "https://news.google.com/rss/search?q=%E7%BE%8E%E8%82%A1+OR+%E5%8F%B0%E7%A9%8D%E9%9B%BB+OR+%E8%BC%9D%E9%81%94+OR+%E8%81%AF%E6%BA%96%E6%9C%83+when:2d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
         "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
     ]
     for url in rss_urls:
@@ -876,35 +906,27 @@ def fetch_rss_news():
             r = requests.get(url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
             if r.status_code == 200:
                 root = ET.fromstring(r.content)
-                for item in root.findall(".//item")[:14]:
+                for item in root.findall(".//item")[:12]:
                     raw_title = item.find("title").text if item.find("title") is not None else ""
                     link = item.find("link").text if item.find("link") is not None else ""
                     desc = item.find("description").text if item.find("description") is not None else ""
-                    source_el = item.find("source")
-                    src_name = source_el.text if source_el is not None else "財經媒體"
                     title = re.sub(r"\s*-\s*[^-]+$", "", raw_title).strip()
-                    clean_desc = re.sub(r"<[^>]+>", " ", desc or "")
-                    clean_desc = re.sub(r"&[a-zA-Z0-9#]+;", " ", clean_desc)
-                    clean_desc = re.sub(r"\s+", " ", clean_desc).strip()
                     if title and title not in seen_titles and len(title) > 8:
                         seen_titles.add(title)
-                        headlines.append({
-                            "title": title,
-                            "url": link or _gnews_url(title),
-                            "source": src_name,
-                            "desc": clean_desc[:140] if clean_desc and clean_desc != title else ""
-                        })
+                        headlines.append({"title": title, "url": link or _gnews_url(title), "desc": desc})
         except Exception:
             pass
-        if len(headlines) >= 10:
+        if len(headlines) >= 12:
             break
-    return headlines[:10]
+    return headlines[:12]
 
-def _try_call_optional_llm(agent, custom_keys, prompt):
-    """若使用者有設定 st.secrets 或於介面填入 API Key，則呼叫真實 LLM；否則回傳 None 由內建量化引擎接手"""
-    sec = st.secrets if hasattr(st, "secrets") else {}
-    k_name = agent["secret_key"]
-    api_key = str(custom_keys.get(k_name, "") or sec.get(k_name, "")).strip()
+def _try_call_secret_llm(agent, prompt):
+    try:
+        sec = st.secrets if hasattr(st, "secrets") else {}
+        k_name = agent["secret_key"]
+        api_key = str(sec.get(k_name, "")).strip()
+    except Exception:
+        api_key = ""
     if not api_key:
         return None, None
 
@@ -915,45 +937,42 @@ def _try_call_optional_llm(agent, custom_keys, prompt):
                 "https://api.openai.com/v1/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}"},
                 json={"model": agent["model_id"], "response_format": {"type": "json_object"},
-                      "messages": [{"role": "user", "content": prompt}], "temperature": 0.3},
-                timeout=15
+                      "messages": [{"role": "user", "content": prompt}], "temperature": 0.4},
+                timeout=16
             )
             if resp.status_code == 200:
                 r = resp.json()
                 return json.loads(r["choices"][0]["message"]["content"]), r.get("model", agent["model_id"])
-
         elif aid == "deepseek":
             resp = requests.post(
                 "https://api.deepseek.com/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}"},
                 json={"model": agent["model_id"], "response_format": {"type": "json_object"},
-                      "messages": [{"role": "user", "content": prompt}], "temperature": 0.3},
-                timeout=15
+                      "messages": [{"role": "user", "content": prompt}], "temperature": 0.4},
+                timeout=16
             )
             if resp.status_code == 200:
                 r = resp.json()
                 return json.loads(r["choices"][0]["message"]["content"]), r.get("model", agent["model_id"])
-
         elif aid == "gemini":
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{agent['model_id']}:generateContent?key={api_key}"
             resp = requests.post(
                 url,
                 json={"contents": [{"parts": [{"text": prompt}]}],
-                      "generationConfig": {"responseMimeType": "application/json", "temperature": 0.3}},
-                timeout=15
+                      "generationConfig": {"responseMimeType": "application/json", "temperature": 0.4}},
+                timeout=16
             )
             if resp.status_code == 200:
                 r = resp.json()
                 txt = r["candidates"][0]["content"]["parts"][0]["text"]
                 return json.loads(txt), r.get("modelVersion", agent["model_id"])
-
         elif aid == "claude":
             resp = requests.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                json={"model": agent["model_id"], "max_tokens": 900, "temperature": 0.3,
-                      "messages": [{"role": "user", "content": prompt + "\n請只輸出純 JSON。"}]},
-                timeout=15
+                json={"model": agent["model_id"], "max_tokens": 900, "temperature": 0.4,
+                      "messages": [{"role": "user", "content": prompt + "\n請只輸出純 JSON，不要加 Markdown。"}]},
+                timeout=16
             )
             if resp.status_code == 200:
                 r = resp.json()
@@ -962,219 +981,231 @@ def _try_call_optional_llm(agent, custom_keys, prompt):
         return None, None
     return None, None
 
-def build_agent_meeting_speeches(row, pred_info, flow_info, headlines, custom_keys):
+def build_walk_forward_speeches(wf_sys, t_idx, flow_info, headlines):
     """
-    為四位 AI 委員生成完整的早會聊天室發言（含 3 大事件卡片、專屬維度分析、反方盲點檢核、四態機率與投票理由）。
-    無論是否有外部 API Key，皆能產出高品質、具數據支撐且獨立的四態推論。
+    結合最初版本的「3 大國際事件展開（含事件發展 dev 與台股影響 imp）＋ 國際盤勢綜合定調 news_view ＋ 三大法人籌碼檢核 chip_view」
+    與無洩漏 Walk-Forward 三階段機率分解（P(開高)、P(走高|開高)、P(走高|開低)）。
     """
-    d_str = row["date"].strftime("%Y/%m/%d")
+    df = wf_sys["df"]
+    X, gap, intra = wf_sys["X"], wf_sys["gap"], wf_sys["intra"]
+    row = df.iloc[t_idx]
+    lo, hi = _train_slice(t_idx)
+
+    tw_close = float(row["PrevClose"])
+    tw_pct = float(row["tw_prev_pct"])
+    tw_ma5 = float(row["ma5_prev"])
+    bias_5ma = float(row["bias5"])
     sox_pct = float(row["sox_pct"])
     tsm_pct = float(row["tsm_pct"])
     nvda_pct = float(row["nvda_pct"])
     sp_pct = float(row["sp_pct"])
-    vix_pct = float(row["vix_pct"])
     fx_close = float(row["fx_close"])
-    fx_pct = float(row["fx_pct"])
     tnx_close = float(row["tnx_close"])
-    tw_prev_pct = float(row["tw_prev_pct"])
-    prev_intra = float(row["prev_intra"])
-    bias5 = float(row["bias5"])
-    bias20 = float(row["bias20"])
-    lead_lag = float(row["lead_lag"])
     adr_prem = float(row["adr_prem"])
-    prev_clv = float(row["prev_clv"])
-    wick_diff = float(row["wick_diff"])
 
-    f1, f5, f10 = flow_info["f1"], flow_info["f5"], flow_info["f10"]
-    t1, t5, t10 = flow_info["t1"], flow_info["t5"], flow_info["t10"]
-    z1, z5 = flow_info["z1"], flow_info["z5"]
+    f_net, t_net, z_net = flow_info["f1"], flow_info["t1"], flow_info["z1"]
+    tot_flow = f_net + t_net + z_net
+
+    enriched_news = []
+    for h in headlines:
+        dev, imp = _analyze_event_impact(h["title"], h.get("desc", ""), sox_pct, tsm_pct, nvda_pct, sp_pct, f_net, t_net)
+        enriched_news.append({"title": h["title"], "url": h["url"], "dev": dev, "imp": imp})
+
+    fallback_events = [
+        {
+            "title": f"美股費城半導體指數隔夜收盤變動 {sox_pct:+.2f}%，牽動台股半導體與電子權值股開盤定價",
+            "url": _gnews_url("費城半導體 台股 電子股"),
+            "dev": f"隔夜美國費城半導體指數收盤變動 {sox_pct:+.2f}%，反映華爾街機構對全球晶圓代工、記憶體與 AI 晶片庫存週期的最新持倉調整。",
+            "imp": f"台股電子類股佔大盤成交比重逾 7 成，費半走勢直接決定今日電子權值股開盤強弱；{'費半收黑將使早盤面臨跳空開低或解套賣壓' if sox_pct < 0 else '費半收紅有助帶動電子權值股跳空開高'}。"
+        },
+        {
+            "title": f"台積電 ADR (TSM) 隔夜漲跌幅達 {tsm_pct:+.2f}%（換算台股溢價率 {adr_prem:+.2f}%），套利空間成為開盤焦點",
+            "url": _gnews_url("台積電 ADR 美股"),
+            "dev": f"台積電美國存託憑證 (TSM) 隔夜收盤變動 {tsm_pct:+.2f}%，計入匯率 {fx_close:.2f} 後與台股 2330 現貨溢價 {adr_prem:+.2f}%，成為今日外資量化程式單的套利基準。",
+            "imp": f"台積電每漲跌 1 元約影響加權指數 8 點；ADR 變動 {tsm_pct:+.2f}% 預示今日台積電開盤將{'承受調節壓力並拖累 00631L 早盤表現' if tsm_pct < 0 else '直接貢獻大盤正點數並支撐 00631L 多頭動能'}。"
+        },
+        {
+            "title": f"AI 領頭羊 NVIDIA 隔夜表現 {nvda_pct:+.2f}%，直接影響台灣 AI 伺服器、組裝與散熱族群買氣",
+            "url": _gnews_url("輝達 NVIDIA AI概念股"),
+            "dev": f"輝達 (NVDA) 隔夜股價變動 {nvda_pct:+.2f}%，市場持續消化雲端大廠資本支出與新一代 AI 伺服器機櫃出貨進度。",
+            "imp": f"台灣供應鏈（鴻海、廣達、緯穎、奇鋐等）與 NVDA 高度連動，{'NVDA 拉回逾 1% 易引發台股 AI 概念股早盤多殺多獲利了結' if nvda_pct < -1.0 else 'NVDA 表現穩健將維繫內資與主力大戶在 AI 族群的追價信心'}。"
+        },
+        {
+            "title": f"標普 500 指數收盤變動 {sp_pct:+.2f}%｜10Y 美債殖利率 {tnx_close:.2f}%，反映總經與利率路徑預期",
+            "url": _gnews_url("美股 S&P 500 聯準會 美債殖利率"),
+            "dev": f"S&P 500 指數隔夜變動 {sp_pct:+.2f}%，10 年期美債殖利率報 {tnx_close:.2f}%，跨國資金隨最新宏觀數據進行風險資產再平衡。",
+            "imp": "美股大盤風險偏好與美元兌台幣匯率直接影響亞太股市早盤情緒與外資台指期現貨部位態度。"
+        }
+    ]
+    all_news = enriched_news + fallback_events
 
     speeches = []
     for idx, ag in enumerate(AI_AGENTS):
         aid = ag["id"]
-        ap = pred_info["agent_preds"][aid]
-        v_state = ap["vote_state"]
-        probs = ap["probs"]
-        conf = ap["confidence"]
+        cfg = wf_sys["agent_params"][aid]
+        sub_cols, lam, hl = cfg["cols"], cfg["lam"], cfg["hl"]
 
-        gap_word = "跳空開高" if "開高" in v_state else "開低測試支撐"
-        intra_word = "盤中買盤承接走高（收紅K）" if "走高" in v_state else "盤中逢高調節走低（收黑K）"
+        p_arr, (pg, pu, pd_), z_t, (bg, bu, bd) = fit_predict_detail(X, gap, intra, t_idx, sub_cols, lam, hl)
+        probs = {FOUR_STATES[i]: round(float(p_arr[i]) * 100.0, 1) for i in range(4)}
+        top_idx = int(p_arr.argmax())
+        v_state = FOUR_STATES[top_idx]
+        conf = int(min(95, max(52, round(probs[v_state] * 1.4 + 15))))
 
-        # 依角色分配新聞與專屬實證事件卡片
-        n_item = headlines[idx] if idx < len(headlines) else None
-        n_title = n_item["title"] if n_item else f"國際市場聚焦美股科技股（TSM {tsm_pct:+.2f}% / 費半 {sox_pct:+.2f}%）與跨國資金流向"
-        n_url = n_item["url"] if n_item else _gnews_url("台積電 ADR 費城半導體 台股")
+        pos_g, neg_g = _top_feature_drivers(z_t, bg, sub_cols, top_k=2)
+        b_intra = bu if pg >= 0.5 else bd
+        pos_i, neg_i = _top_feature_drivers(z_t, b_intra, sub_cols, top_k=2)
+        pos_g_str = "、".join(f"{n}(貢獻{cv:+.2f})" for n, cv, _ in pos_g) or "基準常數項"
+        pos_i_str = "、".join(f"{n}(貢獻{cv:+.2f})" for n, cv, _ in pos_i) or "基準常數項"
+        neg_i_str = "、".join(f"{n}(貢獻{cv:+.2f})" for n, cv, _ in neg_i) or "無顯著壓抑"
 
         if aid == "chatgpt":
+            n0 = all_news[0]
             evs = [
+                {"title": f"【國際焦點】{n0['title']}", "url": n0["url"], "dev": n0["dev"], "imp": n0["imp"]},
                 {
-                    "title": f"【總經與匯率傳導】S&P 500 隔夜 {sp_pct:+.2f}%｜10Y美債殖利率 {tnx_close:.2f}%｜台幣匯率 {fx_close:.2f} ({fx_pct:+.2f}%)",
-                    "url": _gnews_url("美股 S&P 500 美債殖利率 台幣匯率"),
-                    "dev": f"隔夜標普 500 變動 {sp_pct:+.2f}%，美國 10 年期公債殖利率報 {tnx_close:.2f}%，美元兌新台幣匯率處於 {fx_close:.2f}（單日變動 {fx_pct:+.2f}%）。",
-                    "imp": f"總經資金模型顯示，隔夜美股與台股前日漲跌（{tw_prev_pct:+.2f}%）之跨日基差為 {lead_lag:+.2f}%，預示今日 09:00 將先反應【{gap_word}】。"
+                    "title": f"【總經與美股】S&P 500 隔夜變動 {sp_pct:+.2f}%、台積電 ADR 變動 {tsm_pct:+.2f}%，P(跳空開高)={pg*100:.1f}%",
+                    "url": _gnews_url("美股 S&P 500 台積電 ADR"),
+                    "dev": f"隔夜標普 500 變動 {sp_pct:+.2f}%，台積電 ADR 變動 {tsm_pct:+.2f}%，10Y 美債殖利率 {tnx_close:.2f}%、台幣匯率 {fx_close:.2f}。Walk-Forward 跳空模型算出今日開高機率為 {pg*100:.1f}%（主力因子：{pos_g_str}）。",
+                    "imp": f"台積電 ADR 漲跌直接決定台股開盤跳空方向；開盤後條件模型顯示 P(收≥開|開高)={pu*100:.1f}%、P(收≥開|開低)={pd_*100:.1f}%。"
                 },
                 {
-                    "title": f"【外資期現貨連續性】外資昨 {f1:+.1f} 億｜近 5 日累積 {f5:+.1f} 億｜近 10 日累積 {f10:+.1f} 億",
-                    "url": _gnews_url("台股 外資 買賣超 期貨"),
-                    "dev": f"跳脫單日籌碼盲點：外資前一日買賣超 {f1:+.1f} 億元，近 5 日累積 {f5:+.1f} 億元，近 10 日累積 {f10:+.1f} 億元。",
-                    "imp": f"外資中短期資金斜率與台幣匯率連動，盤中權值股傾向【{intra_word}】，四態模型指向「{v_state}（機率 {probs[v_state]}%）」。"
-                },
-                {
-                    "title": f"【國際財經焦點】{n_title}",
-                    "url": n_url,
-                    "dev": n_item["desc"] if (n_item and n_item["desc"]) else f"華爾街機構針對最新總經數據與科技權值股估值進行跨市場部位再平衡（TSM 隔夜 {tsm_pct:+.2f}%）。",
-                    "imp": f"此事件直接影響外資早盤於台灣 50 權值股的籃子買賣單方向，是今日能否維持「{v_state}」的總經關鍵。"
+                    "title": f"【跨國資金】外資前一日現貨{'買超' if f_net>=0 else '賣超'} {abs(f_net):.1f} 億（近5日累積 {flow_info['f5']:+.1f} 億 / 10日 {flow_info['f10']:+.1f} 億）",
+                    "url": _gnews_url("台股 外資 買賣超"),
+                    "dev": f"外資昨日買賣超 {f_net:+.1f} 億元，近 5 日累積 {flow_info['f5']:+.1f} 億元、近 10 日累積 {flow_info['f10']:+.1f} 億元（昨日三大法人合計 {tot_flow:+.1f} 億元）。",
+                    "imp": f"結合外資連續籌碼與盤中因子（{pos_i_str} vs {neg_i_str}），今日四態最高機率指向「{v_state}（{probs[v_state]:.1f}%）」。"
                 }
             ]
-            bull_view = (
-                f"<b>1. 跨日基差因子：</b>隔夜美股科技均值（{0.5*tsm_pct+0.5*sox_pct:+.2f}%）對比台股前日漲跌（{tw_prev_pct:+.2f}%），基差為 {lead_lag:+.2f}%。<br>"
-                f"<b>2. 中期資金底氣：</b>外資近 5 日累積 {f5:+.1f} 億、近 10 日累積 {f10:+.1f} 億，提供明確的宏觀流動性訊號。"
+            news_v = (
+                f"總結國際宏觀面：S&P 500 ({sp_pct:+.2f}%)、TSM ADR ({tsm_pct:+.2f}%) 與台幣匯率 ({fx_close:.2f}) 交互作用下，"
+                f"無洩漏模型評估今日跳空開高機率 P(Gap Up) 為 {pg*100:.1f}%，正向驅動因子為 {pos_g_str}。"
             )
-            bear_view = (
-                f"<b>1. 匯率與殖利率牽制：</b>10Y 美債殖利率位於 {tnx_close:.2f}%，若盤中台幣貶值幅度擴大，外資現貨買盤將轉趨保守。<br>"
-                f"<b>2. 次高機率風險：</b>若開盤跳空幅度偏離預期，需提防轉入次高機率狀態之波動。"
-            )
-            reason_txt = (
-                f"綜合總經迴歸與跨日基差（{lead_lag:+.2f}%），今日開盤傾向【{gap_word}】，且考量外資 5 日籌碼慣性與匯率位階，盤中實體 K 線預期【{intra_word}】，"
-                f"故投下【{v_state}】（信心度 {conf}/100）。"
+            chip_v = (
+                f"交叉比對籌碼：外資昨 {f_net:+.1f} 億（5日累積 {flow_info['f5']:+.1f} 億）、投信昨 {t_net:+.1f} 億（5日累積 {flow_info['t5']:+.1f} 億）。"
+                f"在考量跨日基差（{float(row['lead_lag']):+.2f}%）後，盤中收紅K機率為 {probs['開高走高']+probs['開低走高']:.1f}%。"
             )
 
         elif aid == "deepseek":
+            n1 = all_news[1] if len(all_news) > 1 else all_news[0]
             evs = [
                 {
-                    "title": f"【Kernel-KNN 歷史相似日匹配】費半 {sox_pct:+.2f}%｜TSM {tsm_pct:+.2f}%｜NVDA {nvda_pct:+.2f}%",
-                    "url": _gnews_url("費城半導體 台積電ADR NVIDIA"),
-                    "dev": f"從過去 3 年台美股對齊資料庫中，以 14 維標準化特徵檢索歐氏距離最近的 {pred_info['k_nn']} 個歷史相似交易日。",
-                    "imp": f"在高度相似的歷史盤前環境下，「{v_state}」出現的條件機率最高（達 {probs[v_state]:.1f}%），平均開盤跳空 {pred_info['detail_stats'][v_state]['avg_gap']:+.2f}%、盤中實體 {pred_info['detail_stats'][v_state]['avg_intra']:+.2f}%。"
+                    "title": f"【硬體動能】費城半導體 (^SOX) 隔夜變動 {sox_pct:+.2f}%，NVIDIA 變動 {nvda_pct:+.2f}%",
+                    "url": _gnews_url("費城半導體 NVIDIA 輝達"),
+                    "dev": f"費城半導體指數隔夜收盤變動 {sox_pct:+.2f}%，AI 晶片龍頭輝達 (NVDA) 變動 {nvda_pct:+.2f}%，前日台股收盤強弱指標 CLV 為 {float(row['prev_clv']):+.2f}。",
+                    "imp": f"量化脊邏輯斯模型（僅用 [{lo}, {hi}) 歷史樣本，λ={lam:g}, hl={hl:g}）算出 P(跳空開高)={pg*100:.1f}%，盤中條件走高機率 P(收≥開|開高)={pu*100:.1f}%、P(收≥開|開低)={pd_*100:.1f}%。"
                 },
+                {"title": f"【產業新聞】{n1['title']}", "url": n1["url"], "dev": n1["dev"], "imp": n1["imp"]},
                 {
-                    "title": f"【K 線微結構動能】前日收盤位置 CLV {prev_clv:+.2f}｜前日日內實體 {prev_intra:+.2f}%｜5MA 乖離 {bias5:+.2f}%",
-                    "url": _gnews_url("台股 加權指數 技術分析 均線"),
-                    "dev": f"台股前一日收盤價位於當日高低點區間的 CLV 值為 {prev_clv:+.2f}（+1 代表收最高、-1 代表收最低），前日日內實體漲跌 {prev_intra:+.2f}%。",
-                    "imp": f"結合 5MA 斜率（{float(row['ma5_slope']):+.2f}%）與 VIX 變動（{vix_pct:+.2f}%），量化微結構判定今日為「{v_state}」格局。"
-                },
-                {
-                    "title": f"【量化追蹤新聞】{n_title}",
-                    "url": n_url,
-                    "dev": n_item["desc"] if (n_item and n_item["desc"]) else f"半導體硬體動能指標（SOX {sox_pct:+.2f}% / NVDA {nvda_pct:+.2f}%）牽動量化基金早盤演算法權重。",
-                    "imp": f"演算法單將於 09:00~09:15 集中反應隔夜價差，隨後日內走勢回歸均線乖離（{bias5:+.2f}%）之統計引力。"
+                    "title": f"【技術結構】台股昨收 {tw_close:,.2f} 點 ({tw_pct:+.2f}%)，與 5MA ({tw_ma5:,.2f}) 乖離率為 {bias_5ma:+.2f}%",
+                    "url": _gnews_url("台股 加權指數 均線"),
+                    "dev": f"台股前一日收在 {tw_close:,.2f} 點（日內實體漲跌 {float(row['prev_intra']):+.2f}%），短期均線 5MA 位於 {tw_ma5:,.2f} 點，乖離率 {bias_5ma:+.2f}%。",
+                    "imp": f"盤中動能模型由 {pos_i_str} 主導，壓抑因子為 {neg_i_str}，四態機率以「{v_state}（{probs[v_state]:.1f}%）」居首。"
                 }
             ]
-            bull_view = (
-                f"<b>1. 歷史相似樣本實證：</b>KNN 相似日分佈中，開高走高佔 {probs['開高走高']}%、開低走高佔 {probs['開低走高']}%（合計盤中收紅K機率 {probs['開高走高']+probs['開低走高']:.1f}%）。<br>"
-                f"<b>2. 動能因子斜率：</b>5MA 斜率為 {float(row['ma5_slope']):+.2f}%，前日 CLV 收盤強弱指標為 {prev_clv:+.2f}。"
+            news_v = (
+                f"從量化因子觀察，費半 ({sox_pct:+.2f}%) 與 NVDA ({nvda_pct:+.2f}%) 結合前日 CLV ({float(row['prev_clv']):+.2f})，"
+                f"推導出 P(開高)={pg*100:.1f}%、P(開低)={(1-pg)*100:.1f}%。"
             )
-            bear_view = (
-                f"<b>1. 波動率與乖離收斂：</b>目前 5MA 乖離率為 {bias5:+.2f}%、20MA 乖離率為 {bias20:+.2f}%，盤中存在均值回歸拉力。<br>"
-                f"<b>2. 盤中收黑K機率：</b>統計上開高走低（{probs['開高走低']}%）與開低走低（{probs['開低走低']}%）合計佔 {probs['開高走低']+probs['開低走低']:.1f}%。"
-            )
-            reason_txt = (
-                f"依據 Kernel-KNN 歷史相似日實證與 18 維盤前特徵內積，「{v_state}」以 {probs[v_state]}% 機率居首，"
-                f"預估開盤跳空與日內實體方向將呈現【{v_state}】，投下【{v_state}】一票。"
+            chip_v = (
+                f"昨日三大法人合計 {tot_flow:+.1f} 億元，指數收在 5MA {'之上' if tw_close>=tw_ma5 else '之下'}（乖離 {bias_5ma:+.2f}%）。"
+                f"三階段機率合成結果：開高走高 {probs['開高走高']}%、開高走低 {probs['開高走低']}%、開低走高 {probs['開低走高']}%、開低走低 {probs['開低走低']}%。"
             )
 
         elif aid == "gemini":
+            n2 = all_news[2] if len(all_news) > 2 else all_news[0]
             evs = [
                 {
-                    "title": f"【台積電 ADR 折溢價傳導】TSM 隔夜 {tsm_pct:+.2f}%｜換算台股溢價率 {adr_prem:+.2f}%｜NVDA {nvda_pct:+.2f}%",
-                    "url": _gnews_url("台積電 ADR 溢價 2330 輝達"),
-                    "dev": f"台積電 ADR 隔夜收盤變動 {tsm_pct:+.2f}%，計入最新匯率 {fx_close:.2f} 後，對比 2330.TW 現貨溢價率達 {adr_prem:+.2f}%。",
-                    "imp": f"台積電佔加權指數與 00631L 權重逾 35%，ADR 隔夜變動將直接主導今日 09:00 開盤跳空方向（{gap_word}）。"
+                    "title": f"【AI 算力鏈】NVIDIA 隔夜 {nvda_pct:+.2f}%、台積電 ADR {tsm_pct:+.2f}%（換算台股溢價率 {adr_prem:+.2f}%）",
+                    "url": _gnews_url("台積電 ADR 輝達 NVIDIA"),
+                    "dev": f"美股 AI 雙核心指標——台積電 ADR 變動 {tsm_pct:+.2f}%（溢價率 {adr_prem:+.2f}%）、NVIDIA 變動 {nvda_pct:+.2f}%，直接反映全球資金對 AI 算力與先進封裝之定價。",
+                    "imp": f"台積電、鴻海、聯發科與廣達等 AI 權值股佔台股與 00631L 權重逾 45%，模型評估今日早盤 P(跳空向上)={pg*100:.1f}%。"
                 },
+                {"title": f"【市場熱點】{n2['title']}", "url": n2["url"], "dev": n2["dev"], "imp": n2["imp"]},
                 {
-                    "title": f"【內資投信護盤動能】投信昨 {t1:+.1f} 億｜近 5 日累積 {t5:+.1f} 億｜近 10 日累積 {t10:+.1f} 億",
-                    "url": _gnews_url("投信 ETF 買賣超 AI 概念股"),
-                    "dev": f"代表內資主動型基金與 ETF 被動買盤的投信，昨日買賣超 {t1:+.1f} 億元，近 5 日累積 {t5:+.1f} 億元，近 10 日累積 {t10:+.1f} 億元。",
-                    "imp": f"開盤反應完 ADR 跳空後，09:30 後的日內走勢取決於內資投信在 AI 權值股的承接力道，模型推演盤中將【{intra_word}】。"
-                },
-                {
-                    "title": f"【AI 供應鏈重點新聞】{n_title}",
-                    "url": n_url,
-                    "dev": n_item["desc"] if (n_item and n_item["desc"]) else f"全球 AI 伺服器與先進封裝CoWoS需求動態持續影響台股電子權值股評價（NVDA {nvda_pct:+.2f}%）。",
-                    "imp": f"新聞面與供應鏈溢價結構共振，支持今日大盤走出「{v_state}」型態。"
+                    "title": f"【內資動向】投信昨{'買超' if t_net>=0 else '賣超'} {abs(t_net):.1f} 億（近5日累積 {flow_info['t5']:+.1f} 億 / 10日 {flow_info['t10']:+.1f} 億）",
+                    "url": _gnews_url("投信 買賣超 ETF 台股"),
+                    "dev": f"代表內資法人與被動式 ETF 資金池的投信，前一日買賣超 {t_net:+.1f} 億元，近 5 日累積 {flow_info['t5']:+.1f} 億元、近 10 日累積 {flow_info['t10']:+.1f} 億元。",
+                    "imp": f"開盤反應 ADR 價差後，盤中承接力道使 P(收≥開|開高)={pu*100:.1f}%、P(收≥開|開低)={pd_*100:.1f}%，最高機率落於「{v_state}」。"
                 }
             ]
-            bull_view = (
-                f"<b>1. 權值核心定價：</b>TSM ADR（{tsm_pct:+.2f}%）與溢價率（{adr_prem:+.2f}%）提供明確的早盤價差基準。<br>"
-                f"<b>2. 內資籌碼韌性：</b>投信近 5 日累積 {t5:+.1f} 億、10 日累積 {t10:+.1f} 億，為權值股提供下檔支撐。"
+            news_v = (
+                f"台積電 ADR ({tsm_pct:+.2f}%，溢價 {adr_prem:+.2f}%) 與 NVIDIA ({nvda_pct:+.2f}%) 主導早盤跳空定價，"
+                f"模型正向貢獻因子為 {pos_g_str}。"
             )
-            bear_view = (
-                f"<b>1. 跳空一步到位風險：</b>若早盤台積電開盤即完全反映 ADR 漲幅，短線當沖客易於 09:15 後逢高調節。<br>"
-                f"<b>2. 供應鏈輪動分歧：</b>需觀察廣達、鴻海等二線 AI 權值股是否與台積電同步。"
-            )
-            reason_txt = (
-                f"從台積電 ADR（{tsm_pct:+.2f}%）與內資投信 10 日籌碼（{t10:+.1f} 億）雙因子交叉檢視，"
-                f"今日開盤與盤中傳導路徑最符合【{v_state}】（機率 {probs[v_state]}%），投【{v_state}】。"
+            chip_v = (
+                f"觀察內外資延續性：外資 5 日累積 {flow_info['f5']:+.1f} 億、投信 5 日累積 {flow_info['t5']:+.1f} 億。"
+                f"結合 ADR×5MA 乖離交互項，今日日內最可能走出「{v_state}（{probs[v_state]:.1f}%）」。"
             )
 
-        else:  # claude (專職反方論證與乖離反轉風控)
+        else:  # claude
+            n3 = all_news[3] if len(all_news) > 3 else all_news[0]
             evs = [
+                {"title": f"【風險事件】{n3['title']}", "url": n3["url"], "dev": n3["dev"], "imp": n3["imp"]},
                 {
-                    "title": f"【反方盲點與偷跑檢核】昨日台股漲跌 {tw_prev_pct:+.2f}% vs 隔夜費半 {sox_pct:+.2f}%、TSM {tsm_pct:+.2f}%",
-                    "url": _gnews_url("台股 美股 背離 開高走低"),
-                    "dev": f"檢視跨日領先落後關係：台股前一日已變動 {tw_prev_pct:+.2f}%（日內實體 {prev_intra:+.2f}%），隔夜美股科技均值變動 {0.5*tsm_pct+0.5*sox_pct:+.2f}%。",
-                    "imp": f"非線性交互作用項（跳空×乖離 = {float(row['tsm_x_bias5']):+.2f}）顯示，必須嚴格區分「真突破」與「開高走低／開低走高」反轉陷阱。"
+                    "title": f"【避險情緒】自營商昨日買賣超 {z_net:+.1f} 億元（近5日 {flow_info['z5']:+.1f} 億）｜VIX 恐慌指數 {float(row['vix_close']):.2f}",
+                    "url": _gnews_url("台股 自營商 買賣超 避險"),
+                    "dev": f"對盤中微結構最敏感的自營商前一日買賣超 {z_net:+.1f} 億元，隔夜 VIX 恐慌指數變動 {float(row['vix_pct']):+.2f}%（收 {float(row['vix_close']):.2f}）。",
+                    "imp": f"若早盤跳空開高但乖離過熱，需高度提防自營商與短線客逢高調節（開高走低機率為 {probs['開高走低']:.1f}%）。"
                 },
                 {
-                    "title": f"【均線乖離與影線壓力】5MA 乖離 {bias5:+.2f}%｜20MA 乖離 {bias20:+.2f}%｜前日上下影線差 {wick_diff:+.2f}%",
-                    "url": _gnews_url("台股 均線乖離 獲利了結 避險"),
-                    "dev": f"目前指數與 5MA 乖離 {bias5:+.2f}%、與 20MA 乖離 {bias20:+.2f}%，前日 K 線上下影線差為 {wick_diff:+.2f}%，自營商近 5 日累積 {z5:+.1f} 億。",
-                    "imp": f"風控模型將乖離極端值納入懲罰項後，判定今日最高機率狀態為「{v_state}（{probs[v_state]}%）」。"
-                },
-                {
-                    "title": f"【風險事件監測】{n_title}",
-                    "url": n_url,
-                    "dev": n_item["desc"] if (n_item and n_item["desc"]) else f"市場消息面往往滯後於價格反應，恐慌指數 VIX 隔夜變動 {vix_pct:+.2f}%（收 {float(row['vix_close']):.2f}）。",
-                    "imp": f"針對 00631L 兩倍槓桿部位，必須防範早盤反向洗盤，嚴守 5 分 K 出場紀律。"
+                    "title": f"【多空背離檢核】昨日台股漲跌 {tw_pct:+.2f}% vs 隔夜費半 {sox_pct:+.2f}%、TSM {tsm_pct:+.2f}%（跨日基差 {float(row['lead_lag']):+.2f}%）",
+                    "url": _gnews_url("台股 美股 費半 台積電ADR"),
+                    "dev": f"昨日台股已先行反應 {tw_pct:+.2f}%，隔夜費半變動 {sox_pct:+.2f}%、TSM 變動 {tsm_pct:+.2f}%，跨日領先落後基差為 {float(row['lead_lag']):+.2f}%。",
+                    "imp": f"風控模型經無洩漏校準後，評估 P(跳空開高)={pg*100:.1f}%、盤中走高機率 P(收≥開|開高)={pu*100:.1f}%、P(收≥開|開低)={pd_*100:.1f}%，判定「{v_state}」。"
                 }
             ]
-            bull_view = (
-                f"<b>1. 超跌反彈或順勢條件：</b>當負乖離過大或下影線支撐強勁時，開低後極易引來低接買盤形成「開低走高」（機率 {probs['開低走高']}%）。<br>"
-                f"<b>2. 強勢續攻條件：</b>若量能配合且乖離未過熱，「開高走高」機率為 {probs['開高走高']}%。"
+            news_v = (
+                f"從反方風控角度檢視，昨日台股漲跌 {tw_pct:+.2f}%（5MA 乖離 {bias_5ma:+.2f}%、20MA 乖離 {float(row['bias20']):+.2f}%），"
+                f"對比隔夜美股表現，今日開高走低機率為 {probs['開高走低']:.1f}%、開低走低機率為 {probs['開低走低']:.1f}%。"
             )
-            bear_view = (
-                f"<b>1. 開高走低出貨警示：</b>當正乖離偏高且隔夜利多跳空時，極易觸發獲利了結形成「開高走低」（機率 {probs['開高走低']}%）。<br>"
-                f"<b>2. 順勢殺低風險：</b>若跌破短期均線且外資提款，「開低走低」機率為 {probs['開低走低']}%。"
-            )
-            reason_txt = (
-                f"站在反方風控與均值回歸視角，綜合 5MA 乖離（{bias5:+.2f}%）與跨日基差檢核，今日最需鎖定的日內型態為【{v_state}】（信心度 {conf}/100），投【{v_state}】。"
+            chip_v = (
+                f"昨日三大法人外資 {f_net:+.1f} 億、投信 {t_net:+.1f} 億、自營商 {z_net:+.1f} 億。"
+                f"模型負向風險因子為 {neg_i_str}，正向支撐因子為 {pos_i_str}。"
             )
 
-        # 若使用者有提供真實 LLM API Key，嘗試以真實 API 覆寫文字分析（但保留校準後之精準四態機率）
-        llm_prompt = (
-            f"你是 {ag['name']} ({ag['role']})。目前進行 {d_str} 08:30 台股盤前早會。\n"
-            f"台股昨收漲跌 {tw_prev_pct:+.2f}%，5MA乖離 {bias5:+.2f}%；隔夜費半 {sox_pct:+.2f}%、TSM {tsm_pct:+.2f}%、NVDA {nvda_pct:+.2f}%。\n"
-            f"系統量化校準模型算出你的四態機率為：{json.dumps(probs, ensure_ascii=False)}，最高機率為「{v_state}」。\n"
-            "請回傳 JSON：{\"reason\": \"80字內說明為何今日會呈現該四態走勢以及對00631L的操作建議\"}"
+        reason_txt = (
+            f"無洩漏 Walk-Forward 模型（訓練區間 [{lo}, {hi})，λ={lam:g}, 半衰期={hl:g}日）三階段推演："
+            f"P(跳空開高)={pg*100:.1f}%、P(收≥開|開高)={pu*100:.1f}%、P(收≥開|開低)={pd_*100:.1f}%。"
+            f"四態合成機率以【{v_state}（{probs[v_state]:.1f}%）】最高（正向驅動：{pos_g_str} / {pos_i_str}），投下【{v_state}】一票！"
         )
-        llm_json, actual_mod = _try_call_optional_llm(ag, custom_keys, llm_prompt)
+
+        llm_prompt = (
+            f"你是 {ag['name']}，專長為{ag['role']}。現在進行台股 08:30 盤前早會。\n"
+            f"無洩漏 Walk-Forward 量化模型算出：P(跳空開高)={pg*100:.1f}%，P(收>=開|開高)={pu*100:.1f}%，P(收>=開|開低)={pd_*100:.1f}%。\n"
+            f"四態機率：{json.dumps(probs, ensure_ascii=False)}，最高為「{v_state}」。\n"
+            "請回傳 JSON：{\"news_view\": \"60字內國際盤勢定調\", \"chip_view\": \"60字內三大法人籌碼解讀\", \"reason\": \"80字內說明為何投該四態與00631L操作建議\"}"
+        )
+        llm_json, actual_mod = _try_call_secret_llm(ag, llm_prompt)
         if llm_json and isinstance(llm_json.get("reason"), str) and len(llm_json["reason"]) > 10:
+            news_v = llm_json.get("news_view") or news_v
+            chip_v = llm_json.get("chip_view") or chip_v
             reason_txt = llm_json["reason"]
-            engine_badge = f"🟢 真實 API ({actual_mod})"
+            engine_badge = f"🟢 真實 API ({actual_mod}) + Walk-Forward"
         else:
-            engine_badge = "⚡ 量化自決引擎 (Walk-Forward 校準)"
+            engine_badge = f"📐 Walk-Forward 脊邏輯斯 (λ={lam:g}, hl={hl:g})"
 
         speeches.append({
             **ag,
             "engine_badge": engine_badge,
-            "vote_state": v_state,
-            "probs": probs,
-            "confidence": conf,
             "events": evs,
-            "bull_view": bull_view,
-            "bear_view": bear_view,
+            "news_view": news_v,
+            "chip_view": chip_v,
             "reason": reason_txt,
+            "vote": v_state,
+            "probs": probs,
+            "pg": pg,
+            "pu": pu,
+            "pd": pd_,
+            "confidence": conf,
             "time": f"08:30:{12 + idx * 9:02d}"
         })
 
     return speeches
 
-def build_chatroom_html(target_d, prev_d, row, flow_info, speeches, master_probs, master_top, is_historical_verified):
-    """
-    組裝完整的【AI 盤前投研早會聊天室】HTML（含主持人開場、四位委員對話泡泡、四態機率條、3 大事件展開卡片、主持人計票總結與收盤實證對帳）
-    """
+def build_chatroom_html(target_d, prev_d, row, flow_info, speeches, master_probs, master_decomp, master_top, base_st_name, eval_60):
+    """完整保留最初版本的大字體聊天室視覺（雙層事件卡 + 國際盤勢定調 + 三大法人籌碼檢核 + 計票進度條），並融合四態機率"""
     tw_close = float(row["PrevClose"])
     tw_pct = float(row["tw_prev_pct"])
+    tw_hl = float(row["PrevHL"])
     tw_ma5 = float(row["ma5_prev"])
     bias5 = float(row["bias5"])
     sox_pct = float(row["sox_pct"])
@@ -1184,14 +1215,24 @@ def build_chatroom_html(target_d, prev_d, row, flow_info, speeches, master_probs
     vix_close = float(row["vix_close"])
     fx_close = float(row["fx_close"])
     adr_prem = float(row["adr_prem"])
+    f_net, t_net, z_net = flow_info["f1"], flow_info["t1"], flow_info["z1"]
+    tot_net = f_net + t_net + z_net
+    pg_m, pu_m, pd_m = master_decomp
+
+    us_summary = (
+        f"S&P 500 <b style='color:{_col(sp_pct)}'>{sp_pct:+.2f}%</b> ｜ "
+        f"費城半導體 <b style='color:{_col(sox_pct)}'>{sox_pct:+.2f}%</b> ｜ "
+        f"台積電 ADR <b style='color:{_col(tsm_pct)}'>{tsm_pct:+.2f}%</b>（溢價 <b>{adr_prem:+.2f}%</b>）｜ "
+        f"NVIDIA <b style='color:{_col(nvda_pct)}'>{nvda_pct:+.2f}%</b> ｜ "
+        f"VIX <b>{vix_close:.2f}</b> ｜ 台幣 <b>{fx_close:.2f}</b>"
+    )
 
     cards_html = ""
     for ag in speeches:
-        v_st = ag["vote_state"]
+        v_st = ag["vote"]
         s_meta = STATE_META[v_st]
         p = ag["probs"]
 
-        # 委員專屬四態機率條
         p_bar = "".join(
             f"<div style='width:{max(p[k], 2)}%;background:{STATE_META[k]['col']}' title='{k}: {p[k]}%'></div>"
             for k in FOUR_STATES
@@ -1203,16 +1244,21 @@ def build_chatroom_html(target_d, prev_d, row, flow_info, speeches, master_probs
 
         ev_items = ""
         for idx_e, e in enumerate(ag["events"][:3], 1):
+            t_txt = e.get("title", "")
+            u_lnk = e.get("url", "#")
+            d_txt = e.get("dev", "")
+            i_txt = e.get("imp", "")
             ev_items += (
                 f"<div class='ev-card'>"
                 f"<div class='ev-head'>"
                 f"<span class='ev-num'>{idx_e}</span>"
-                f"<a class='ev-link' href='{e['url']}' target='_blank' rel='noopener noreferrer'>{e['title']}<span class='ext-ico'>↗ 點擊看新聞</span></a>"
+                f"<a class='ev-link' href='{u_lnk}' target='_blank' rel='noopener noreferrer'>{t_txt}<span class='ext-ico'>↗ 點擊看新聞</span></a>"
                 f"</div>"
                 f"<div class='ev-detail'>"
-                f"<div class='ev-row'><span class='tag-dev'>🔹 事件發展</span><span>{e['dev']}</span></div>"
-                f"<div class='ev-row'><span class='tag-imp'>🔸 台股影響</span><span>{e['imp']}</span></div>"
-                f"</div></div>"
+                f"<div class='ev-row'><span class='tag-dev'>🔹 事件發展</span><span>{d_txt}</span></div>"
+                f"<div class='ev-row'><span class='tag-imp'>🔸 台股影響</span><span>{i_txt}</span></div>"
+                f"</div>"
+                f"</div>"
             )
 
         cards_html += (
@@ -1224,239 +1270,200 @@ def build_chatroom_html(target_d, prev_d, row, flow_info, speeches, master_probs
             f"<span class='b-role'>{ag['role']}</span>"
             f"<span class='eng-tag'>{ag['engine_badge']}</span>"
             f"<span class='v-badge' style='background:{s_meta['bg']};color:{s_meta['col']};border:1px solid {s_meta['col']}'>"
-            f"{s_meta['icon']} 投票：{v_st} (信心 {ag['confidence']}%)</span>"
+            f"{s_meta['icon']} 投票：{v_st} ({p[v_st]}%)</span>"
             f"<span class='b-time'>{target_d:%m/%d} {ag['time']}</span>"
             f"</div>"
             f"<div class='prob-box'>"
-            f"<div style='display:flex;justify-content:space-between;flex-wrap:wrap;margin-bottom:4px'>"
-            f"<span>📊 <b>委員四態機率評估：</b>{p_labels}</span>"
-            f"</div>"
+            f"🧩 <b>三階段分解：</b>P(跳空開高)=<b>{ag['pg']*100:.1f}%</b> ｜ P(收≥開|開高)=<b>{ag['pu']*100:.1f}%</b> ｜ P(收≥開|開低)=<b>{ag['pd']*100:.1f}%</b><br>"
+            f"📊 <b>四態合成機率：</b>{p_labels}"
             f"<div class='mini-bar'>{p_bar}</div>"
             f"</div>"
-            f"<div class='sec-title'>📌 距上次開會（{prev_d:%m/%d} 08:30）後最影響台股之 3 大關鍵事件與傳導解析：</div>"
+            f"<div class='sec-title'>📌 距上次開會（{prev_d:%m/%d} 08:30）後最影響台股之 3 大國際事件與傳導解析：</div>"
             f"<div class='ev-wrap'>{ev_items}</div>"
             f"<div class='think-grid'>"
-            f"<div class='think-box'><b>📈 專屬維度與走高實證 (Bull Case)：</b><br>{ag['bull_view']}</div>"
-            f"<div class='think-box'><b>🛡️ 反方盲點與走低風控 (Bear Case)：</b><br>{ag['bear_view']}</div>"
+            f"<div class='think-box'><b>🌍 國際盤勢綜合定調：</b><br>{ag['news_view']}</div>"
+            f"<div class='think-box'><b>💰 三大法人籌碼檢核：</b><br>{ag['chip_view']}</div>"
             f"</div>"
-            f"<div class='reason-box'><b>🎯 08:30 綜合判斷與四態投票理由：</b>{ag['reason']}</div>"
+            f"<div class='reason-box'><b>🎯 進場前綜合判斷與投票理由：</b>{ag['reason']}</div>"
             f"</div></div>"
         )
 
-    # 統計四位 AI 委員選票與最終決議
-    vote_counts = {k: sum(1 for a in speeches if a["vote_state"] == k) for k in FOUR_STATES}
+    vote_counts = {k: sum(1 for a in speeches if a["vote"] == k) for k in FOUR_STATES}
     tally_str = " ｜ ".join(
-        f"<span style='color:{STATE_META[k]['col']}'>{STATE_META[k]['icon']} {k} <b>{vote_counts[k]} 票</b> (量化機率 {master_probs[k]}%)</span>"
+        f"<b style='color:{STATE_META[k]['col']}'>{STATE_META[k]['icon']} {k} {vote_counts[k]} 票 (主模型 {master_probs[k]}%)</b>"
         for k in FOUR_STATES
     )
     tally_bar = "".join(
         f"<div style='width:{max(master_probs[k], 2)}%;background:{STATE_META[k]['col']}'></div>"
         for k in FOUR_STATES
     )
-
     win_meta = STATE_META[master_top]
-    # 針對最終決議四態給出 00631L 具體操作劇本
-    if master_top == "開高走高":
-        action_guide = "早盤跳空開高後買盤具備延續性，若 00631L 5 分 K 突破強勢進場乘數（5MA × 1.04）或站穩早盤高點，可順勢執行做多訊號。"
-    elif master_top == "開高走低":
-        action_guide = "⚠️ 高度提防「早盤跳空開高後逢高出貨（收黑K）」！09:00~09:15 切勿看到跳空大漲就盲目追進 00631L，務必等待盤中賣壓消化並守穩出場線後再評估。"
-    elif master_top == "開低走高":
-        action_guide = "早盤受隔夜逆風影響開低，但下檔低接承接力道強勁（易拉出紅K下影線）。持有部位切勿在開盤第一根 5 分 K 恐慌砍在最低點，空手者可留意盤中站回均線之轉強訊號。"
-    else:  # 開低走低
-        action_guide = "⚠️ 隔夜利空加上盤中法人調節壓力，易呈現「開低走低」黑K格局。請嚴格執行策略 B 的停損/出場線紀律，空手者維持觀望不急於摸底。"
 
-    # 若該交易日已收盤，直接在主持人結語展示真實收盤對帳
+    if master_top == "開高走高":
+        action_guide = "早盤跳空開高且盤中續攻機率高，00631L 可依策略 B 突破 5MA 乘數順勢做多。"
+    elif master_top == "開高走低":
+        action_guide = "⚠️ 提防「隔夜利多跳空開高、盤中逢高出貨（收黑K）」！09:00~09:15 切勿盲目追高 00631L。"
+    elif master_top == "開低走高":
+        action_guide = "早盤開低但盤中低接翻紅機率高（易拉下影線紅K），持有部位勿在開盤恐慌殺低，可留意盤中轉強訊號。"
+    else:
+        action_guide = "⚠️ 跳空開低且盤中走低風險高，請嚴格執行策略 B 出場線與停損紀律，空手建議觀望。"
+
     actual_st = row["ActualState"]
     act_gap = float(row["ActualGapPct"])
     act_intra = float(row["ActualIntraPct"])
     act_day = float(row["ActualDayPct"])
-    if is_historical_verified:
-        is_hit = (actual_st == master_top)
-        hit_badge = (
-            f"<span style='background:rgba(34,197,94,.22);color:#4ade80;border:1px solid #4ade80;padding:2px 10px;border-radius:99px;font-weight:800'>✅ 盤後驗證：預測完全命中！</span>"
-            if is_hit else
-            f"<span style='background:rgba(245,158,11,.22);color:#fbbf24;border:1px solid #fbbf24;padding:2px 10px;border-radius:99px;font-weight:800'>🔸 盤後驗證：該日實際為「{actual_st}」</span>"
-        )
-        verify_box = (
-            f"<div style='margin-top:12px;padding:11px 15px;background:rgba(0,0,0,.35);border:1px solid #453a5c;border-radius:10px'>"
-            f"🏁 <b>【{target_d:%m/%d} 13:30 收盤真實結果對帳】</b> {hit_badge}<br>"
-            f"‧ 08:30 盤前預測決議：<b style='color:{win_meta['col']}'>{master_top}（機率 {master_probs[master_top]}%）</b> ｜ "
-            f"13:30 實際收盤狀態：<b style='color:{STATE_META[actual_st]['col']}'>{actual_st}</b><br>"
-            f"‧ 實際開盤跳空：<b>{act_gap:+.2f}%</b> ｜ 實際盤中實體 (收vs開)：<b>{act_intra:+.2f}%</b> ｜ 全天漲跌：<b>{act_day:+.2f}%</b>"
-            f"</div>"
-        )
-    else:
-        verify_box = ""
+    is_hit = (actual_st == master_top)
+    hit_badge = (
+        "<span style='background:rgba(34,197,94,.22);color:#4ade80;border:1px solid #4ade80;padding:2px 10px;border-radius:99px;font-weight:800'>✅ Walk-Forward 命中實際狀態</span>"
+        if is_hit else
+        f"<span style='background:rgba(245,158,11,.22);color:#fbbf24;border:1px solid #fbbf24;padding:2px 10px;border-radius:99px;font-weight:800'>🔸 實際狀態為「{actual_st}」</span>"
+    )
 
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
 body{{margin:0;background:transparent;color:#e8e6ee;font-family:-apple-system,"Noto Sans TC","Microsoft JhengHei",sans-serif}}
-.chat-room{{display:flex;flex-direction:column;gap:18px;padding:6px 6px 18px 6px}}
+.chat-room{{display:flex;flex-direction:column;gap:20px;padding:6px 6px 18px 6px}}
 .msg-row{{display:flex;gap:14px;align-items:flex-start}}
 .msg-row.host{{background:linear-gradient(90deg,rgba(255,200,61,.14),rgba(30,25,39,.95));border:1px solid rgba(255,200,61,.4);border-radius:16px;padding:16px 20px}}
-.avatar{{width:48px;height:48px;border-radius:13px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:1.12rem;flex-shrink:0;color:#fff;box-shadow:0 4px 12px rgba(0,0,0,.35)}}
-.bubble{{background:#1e1927;border:1px solid #322a44;border-radius:0 16px 16px 16px;padding:15px 19px;flex:1;line-height:1.68;font-size:.98rem}}
-.b-head{{display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap}}
-.b-name{{font-weight:800;color:#fff;font-size:1.14rem}}
-.b-role{{font-size:.82rem;color:#b0adc0;background:#2a2436;padding:3px 9px;border-radius:6px}}
-.eng-tag{{font-size:.78rem;color:#c4b5fd;background:rgba(139,92,246,.16);border:1px solid rgba(139,92,246,.4);padding:2px 8px;border-radius:6px}}
-.b-time{{font-size:.82rem;color:#8a8699;margin-left:auto}}
-.v-badge{{padding:3px 12px;border-radius:99px;font-weight:800;font-size:.88rem}}
-.prob-box{{background:rgba(0,0,0,.28);border:1px solid #312942;border-radius:10px;padding:9px 13px;margin-bottom:12px;font-size:.88rem}}
-.mini-bar{{display:flex;height:10px;border-radius:5px;overflow:hidden;background:#2a2433;margin-top:5px}}
-.sec-title{{font-size:.95rem;color:#d0cce0;font-weight:700;margin:6px 0 9px 0}}
-.ev-wrap{{display:flex;flex-direction:column;gap:9px;margin-bottom:13px}}
-.ev-card{{background:rgba(0,0,0,.26);border:1px solid #312942;border-radius:11px;padding:10px 14px}}
-.ev-head{{display:flex;align-items:baseline;gap:9px;margin-bottom:6px}}
-.ev-num{{background:#3b3154;color:#ffc83d;font-weight:800;font-size:.82rem;padding:1px 8px;border-radius:6px;flex-shrink:0}}
-.ev-link{{color:#fff;font-weight:700;font-size:1rem;text-decoration:none;border-bottom:1px dashed rgba(255,200,61,.55);padding-bottom:1px}}
+.avatar{{width:48px;height:48px;border-radius:13px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:1.15rem;flex-shrink:0;color:#fff;box-shadow:0 4px 12px rgba(0,0,0,.35)}}
+.bubble{{background:#1e1927;border:1px solid #322a44;border-radius:0 16px 16px 16px;padding:16px 20px;flex:1;line-height:1.7;font-size:1rem}}
+.b-head{{display:flex;align-items:center;gap:12px;margin-bottom:10px;flex-wrap:wrap}}
+.b-name{{font-weight:800;color:#fff;font-size:1.16rem}}
+.b-role{{font-size:.86rem;color:#b0adc0;background:#2a2436;padding:3px 10px;border-radius:6px}}
+.eng-tag{{font-size:.8rem;color:#c4b5fd;background:rgba(139,92,246,.16);border:1px solid rgba(139,92,246,.4);padding:2px 9px;border-radius:6px}}
+.b-time{{font-size:.84rem;color:#8a8699;margin-left:auto}}
+.v-badge{{padding:4px 13px;border-radius:99px;font-weight:800;font-size:.92rem;letter-spacing:.03em}}
+.prob-box{{background:rgba(0,0,0,.28);border:1px solid #312942;border-radius:10px;padding:10px 14px;margin-bottom:12px;font-size:.92rem;line-height:1.65}}
+.mini-bar{{display:flex;height:10px;border-radius:5px;overflow:hidden;background:#2a2433;margin-top:6px}}
+.sec-title{{font-size:.98rem;color:#d0cce0;font-weight:700;margin:6px 0 10px 0}}
+.ev-wrap{{display:flex;flex-direction:column;gap:10px;margin-bottom:14px}}
+.ev-card{{background:rgba(0,0,0,.26);border:1px solid #312942;border-radius:11px;padding:11px 14px}}
+.ev-head{{display:flex;align-items:baseline;gap:9px;margin-bottom:7px}}
+.ev-num{{background:#3b3154;color:#ffc83d;font-weight:800;font-size:.85rem;padding:1px 8px;border-radius:6px;flex-shrink:0}}
+.ev-link{{color:#fff;font-weight:700;font-size:1.04rem;text-decoration:none;border-bottom:1px dashed rgba(255,200,61,.55);padding-bottom:1px;transition:all .18s ease}}
 .ev-link:hover{{color:#FFC83D;border-bottom:1px solid #FFC83D}}
-.ext-ico{{font-size:.78rem;color:#a78bfa;margin-left:8px;font-weight:500}}
-.ev-detail{{display:flex;flex-direction:column;gap:5px;padding-left:4px;font-size:.93rem;color:#ddd9e8;line-height:1.6}}
+.ext-ico{{font-size:.8rem;color:#a78bfa;margin-left:8px;font-weight:500}}
+.ev-link:hover .ext-ico{{color:#FFC83D}}
+.ev-detail{{display:flex;flex-direction:column;gap:5px;padding-left:4px;font-size:.96rem;color:#ddd9e8;line-height:1.65}}
 .ev-row{{display:flex;align-items:flex-start;gap:8px}}
-.tag-dev{{background:rgba(59,130,246,.18);color:#93c5fd;border:1px solid rgba(59,130,246,.4);font-size:.78rem;font-weight:700;padding:1px 7px;border-radius:5px;white-space:nowrap;margin-top:2px}}
-.tag-imp{{background:rgba(244,114,182,.18);color:#f9a8d4;border:1px solid rgba(244,114,182,.4);font-size:.78rem;font-weight:700;padding:1px 7px;border-radius:5px;white-space:nowrap;margin-top:2px}}
-.think-grid{{display:grid;grid-template-columns:1fr 1fr;gap:11px;margin-bottom:11px}}
+.tag-dev{{background:rgba(59,130,246,.18);color:#93c5fd;border:1px solid rgba(59,130,246,.4);font-size:.8rem;font-weight:700;padding:1px 7px;border-radius:5px;white-space:nowrap;margin-top:3px}}
+.tag-imp{{background:rgba(244,114,182,.18);color:#f9a8d4;border:1px solid rgba(244,114,182,.4);font-size:.8rem;font-weight:700;padding:1px 7px;border-radius:5px;white-space:nowrap;margin-top:3px}}
+.think-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}}
 @media(max-width:768px){{.think-grid{{grid-template-columns:1fr}}}}
-.think-box{{background:rgba(255,255,255,.04);border:1px solid #352e47;border-radius:10px;padding:10px 13px;font-size:.92rem;color:#ddd9e8;line-height:1.6}}
-.think-box b{{color:#fff}}
-.reason-box{{background:rgba(124,92,255,.15);border-left:4px solid #8b5cf6;padding:11px 15px;border-radius:8px;font-size:.98rem;color:#fff;line-height:1.65}}
-.tally-bar{{display:flex;height:15px;border-radius:8px;overflow:hidden;background:#2a2433;margin:9px 0}}
+.think-box{{background:rgba(255,255,255,.045);border:1px solid #352e47;border-radius:10px;padding:11px 14px;font-size:.96rem;color:#ddd9e8;line-height:1.65}}
+.think-box b{{color:#fff;font-size:.98rem}}
+.reason-box{{background:rgba(124,92,255,.15);border-left:4px solid #8b5cf6;padding:12px 16px;border-radius:8px;font-size:1.03rem;color:#fff;line-height:1.68}}
+.tally-bar{{display:flex;height:16px;border-radius:8px;overflow:hidden;background:#2a2433;margin:10px 0}}
 </style></head><body>
 <div class="chat-room">
-
-  <!-- 主持人開場泡泡 -->
   <div class="msg-row host">
     <div class="avatar" style="background:linear-gradient(135deg,#FFC83D,#d97706);color:#000">主</div>
     <div style="flex:1">
       <div class="b-head">
-        <span class="b-name" style="color:#FFC83D">網站主持人（量化中控台）</span>
-        <span class="b-role">08:30 盤前數據餵價與四態議程主持</span>
+        <span class="b-name" style="color:#FFC83D">網站主持人（無洩漏 Walk-Forward 量化中控台）</span>
+        <span class="b-role">盤前數據餵價與議程主持（嚴格僅用 T 日前已實現樣本訓練）</span>
         <span class="b-time">{target_d:%m/%d} 08:30:00</span>
       </div>
-      <div style="font-size:.96rem;line-height:1.72">
-        各位 AI 投研委員早安，現在是台北時間 <b>{target_d:%Y/%m/%d} 08:30</b>，開始今日台股盤前「日內四態（開高走高／開高走低／開低走高／開低走低）」決策會議。<br>
-        📊 <b>前一交易日台股盤勢</b>：加權指數收 <b>{tw_close:,.2f}</b> 點（<b style="color:{_col(tw_pct)}">{tw_pct:+.2f}%</b>），5MA 位於 <b>{tw_ma5:,.2f}</b>（乖離 <b>{bias5:+.2f}%</b>）。<br>
-        💰 <b>三大法人籌碼（昨 / 5日累積 / 10日累積）</b>：外資 <b style="color:{_col(flow_info['f1'])}">{flow_info['f1']:+.1f}億</b> ({flow_info['f5']:+.0f}億 / {flow_info['f10']:+.0f}億) ｜
-        投信 <b style="color:{_col(flow_info['t1'])}">{flow_info['t1']:+.1f}億</b> ({flow_info['t5']:+.0f}億 / {flow_info['t10']:+.0f}億) ｜
-        自營商 <b style="color:{_col(flow_info['z1'])}">{flow_info['z1']:+.1f}億</b>。<br>
-        🌎 <b>隔夜國際關鍵指標</b>：費半 <b style="color:{_col(sox_pct)}">{sox_pct:+.2f}%</b> ｜ 台積電ADR <b style="color:{_col(tsm_pct)}">{tsm_pct:+.2f}%</b>（溢價率 <b>{adr_prem:+.2f}%</b>）｜
-        NVDA <b style="color:{_col(nvda_pct)}">{nvda_pct:+.2f}%</b> ｜ S&P 500 <b style="color:{_col(sp_pct)}">{sp_pct:+.2f}%</b> ｜ VIX <b>{vix_close:.2f}</b> ｜ 台幣 <b>{fx_close:.2f}</b>。<br>
-        請四位委員依據各自專屬模型維度，報告 3 大關鍵事件傳導路徑並投下今日四態選票！
+      <div style="font-size:1rem;line-height:1.75">
+        各位 AI 投研委員早安，現在是台北時間 <b>{target_d:%m/%d} 08:30</b>，開始今日台股開盤前決策會議。<br>
+        📊 <b>前一交易日（{prev_d:%m/%d}）台股盤勢</b>：加權指數收 <b>{tw_close:,.2f}</b> 點
+        （<b style="color:{_col(tw_pct)}">{tw_pct:+.2f}%</b>，高低震幅 {tw_hl:,.0f} 點），5MA 位於 <b>{tw_ma5:,.2f}</b>（乖離 <b>{bias5:+.2f}%</b>）。<br>
+        💰 <b>三大法人買賣超（昨 / 5日累積 / 10日累積）</b>：外資 <b style="color:{_col(f_net)}">{f_net:+,.1f}億</b> ({flow_info['f5']:+.0f}億 / {flow_info['f10']:+.0f}億) ｜
+        投信 <b style="color:{_col(t_net)}">{t_net:+,.1f}億</b> ({flow_info['t5']:+.0f}億 / {flow_info['t10']:+.0f}億) ｜
+        自營商 <b style="color:{_col(z_net)}">{z_net:+,.1f}億</b>（單日合計 <b style="color:{_col(tot_net)}">{tot_net:+,.1f}億</b>）。<br>
+        🌎 <b>隔夜美股關鍵指標</b>：{us_summary}。<br>
+        請四位模型依序報告距離上次開會（{prev_d:%m/%d} 08:30）後<b>最影響台股的 3 件國際大事（含事件發展與台股影響傳導路徑）</b>，並以 Walk-Forward 引擎投下今日「開高走高／開高走低／開低走高／開低走低」四態選票！
       </div>
     </div>
   </div>
-
-  <!-- 四位 AI 委員發言泡泡 -->
   {cards_html}
-
-  <!-- 主持人總結與計票泡泡 -->
   <div class="msg-row host">
     <div class="avatar" style="background:linear-gradient(135deg,#FFC83D,#d97706);color:#000">結</div>
     <div style="flex:1">
       <div class="b-head">
-        <span class="b-name" style="color:#FFC83D">網站主持人（計票中心與 00631L 操作決議）</span>
-        <span class="b-role">08:31 盤前會議最終統計</span>
+        <span class="b-name" style="color:#FFC83D">網站主持人（計票中心與進場前總結）</span>
+        <span class="b-role">近 60 日樣本外命中 {eval_60['hit']}/{eval_60['n']} vs 基準 {eval_60['base']}/{eval_60['n']} (二項檢定 p={eval_60['p']:.3f})</span>
         <span class="b-time">{target_d:%m/%d} 08:31:00</span>
       </div>
-      <div style="font-size:.98rem;line-height:1.72">
-        感謝四位委員完成獨立推演！今日（{fmt_d(target_d)}）盤前四態投票與量化條件機率統計：<br>
+      <div style="font-size:1.02rem;line-height:1.75">
+        感謝四位委員完整推演！今日（{fmt_d(target_d)}）盤前四態投票與三階段條件機率分解：<br>
+        🧩 <b>主模型分解：P(跳空向上) = {pg_m*100:.1f}% ｜ P(收≥開 | 跳空向上) = {pu_m*100:.1f}% ｜ P(收≥開 | 跳空向下) = {pd_m*100:.1f}%</b><br>
         {tally_str}
         <div class="tally-bar">{tally_bar}</div>
-        📢 <b>今日早會最終決議：<span style="color:{win_meta['col']};font-size:1.1rem">{win_meta['icon']} {master_top}（綜合條件機率 {master_probs[master_top]}%）</span></b><br>
-        🎯 <b>00631L 日內實戰應對劇本</b>：{action_guide}
-        {verify_box}
+        📢 <b>今日早會最終決議：<span style="color:{win_meta['col']}">{win_meta['icon']} {master_top}（主模型機率 {master_probs[master_top]}% ｜ 訓練期常態基準：{base_st_name}）</span></b><br>
+        🎯 <b>00631L 操作應對建議</b>：{action_guide}
+        <div style="margin-top:10px;padding:10px 14px;background:rgba(0,0,0,.35);border:1px solid #453a5c;border-radius:10px;font-size:.95rem">
+          🏁 <b>【{target_d:%m/%d} 13:30 收盤真實結果對帳】</b> {hit_badge}<br>
+          ‧ 實際開盤跳空：<b>{act_gap:+.2f}%</b> ｜ 實際盤中實體 (收vs開)：<b>{act_intra:+.2f}%</b> ｜ 全天漲跌：<b>{act_day:+.2f}%</b> ｜ 實際狀態：<b style="color:{STATE_META[actual_st]['col']}">{actual_st}</b>
+        </div>
       </div>
     </div>
   </div>
-
 </div>
 </body></html>"""
 
-def _build_week_verification_df(engine, indices):
-    """建立指定 5 日區間的逐日預測與實際對帳 DataFrame"""
-    df = engine["df"]
+def _eval_to_df(df, eval_res):
     rows = []
-    correct_cnt = 0
-    for r_idx in indices:
-        row = df.iloc[r_idx]
-        pred = predict_row_4state(engine, r_idx)
-        p_top = pred["master_top"]
-        p_prob = pred["master_probs"][p_top]
-        act_st = row["ActualState"]
-        is_ok = (p_top == act_st)
-        if is_ok:
-            correct_cnt += 1
-        ag_votes = " / ".join(f"{ag['short']}:{pred['agent_preds'][ag['id']]['vote_state'][:2]}" for ag in AI_AGENTS)
+    for r in eval_res["rows"]:
+        t = r["t"]
+        row = df.iloc[t]
+        p_top = FOUR_STATES[r["top"]]
+        act_st = FOUR_STATES[r["actual"]]
+        base_st = FOUR_STATES[r["base_st"]]
         rows.append({
             "日期": fmt_d(row["date"]),
-            "前日台股": f"{row['tw_prev_pct']:+.2f}%",
-            "5MA乖離": f"{row['bias5']:+.2f}%",
             "隔夜費半/TSM": f"{row['sox_pct']:+.2f}% / {row['tsm_pct']:+.2f}%",
-            "四委員投票(簡稱)": ag_votes,
-            "08:30 預測四態": f"{p_top} ({p_prob:.1f}%)",
-            "實際開盤跳空": f"{row['ActualGapPct']:+.2f}%",
-            "實際盤中實體": f"{row['ActualIntraPct']:+.2f}%",
-            "13:30 實際四態": act_st,
-            "驗證結果": "✅ 準確" if is_ok else "❌ 出入"
+            "P(跳空向上)": f"{r['pg']*100:.1f}%",
+            "P(收≥開|開高)": f"{r['pu']*100:.1f}%",
+            "P(收≥開|開低)": f"{r['pd']*100:.1f}%",
+            "Walk-Forward預測": f"{p_top} ({r['probs'][r['top']]*100:.1f}%)",
+            "訓練期最常見基準": base_st,
+            "實際跳空/盤中": f"{row['ActualGapPct']:+.2f}% / {row['ActualIntraPct']:+.2f}%",
+            "實際四態": act_st,
+            "命中": "✅" if r["top"] == r["actual"] else "❌"
         })
-    return pd.DataFrame(rows), correct_cnt, len(indices)
+    return pd.DataFrame(rows)
 
 def vote_page():
-    with st.spinner("啟動四態量化校準引擎、載入雙週 10 日驗證數據與召開 AI 早會聊天室…"):
-        engine = fit_calibrated_4state_engine()
+    with st.spinner("召開 08:30 AI 投研早會，執行無洩漏 Walk-Forward 四態引擎與彙整國際新聞…"):
+        wf_sys = run_walk_forward_system()
         days_flow = last_15_flows()
         headlines = fetch_rss_news()
 
-    if not engine or engine["df"].empty:
-        st.error("無法取得足夠的大盤與美股歷史資料，請稍後再試。")
+    if not wf_sys:
+        st.error("歷史樣本不足 150 筆，無法啟動無洩漏 Walk-Forward 引擎。")
         return
 
-    df = engine["df"]
-    w2_indices = engine["w2_indices"]  # 11/9 ~ 11/13
-    w1_indices = engine["w1_indices"]  # 11/2 ~ 11/6
-
-    # 計算兩週驗證成績
-    df_w2, c_w2, n_w2 = _build_week_verification_df(engine, w2_indices)
-    df_w1, c_w1, n_w1 = _build_week_verification_df(engine, w1_indices)
+    df = wf_sys["df"]
+    X, gap, intra, sidx = wf_sys["X"], wf_sys["gap"], wf_sys["intra"], wf_sys["sidx"]
+    cols_all = wf_sys["cols_all"]
+    lam, hl = wf_sys["master_lam"], wf_sys["master_hl"]
+    w1_indices, w2_indices = wf_sys["w1_indices"], wf_sys["w2_indices"]
+    eval_60, eval_w1, eval_w2 = wf_sys["eval_60"], wf_sys["eval_w1"], wf_sys["eval_w2"]
 
     with st.container(key="vote_card"):
         st.markdown(
-            "<div class='fl-h'>🤖 AI 盤前投研早會聊天室 ＆ 日內四態量化驗證中心"
-            "<small>開高走高 · 開高走低 · 開低走高 · 開低走低（內建 Walk-Forward 校準引擎，免填 API Key 即可完整開會）</small></div>",
+            f"<div class='fl-h'>🤖 AI 盤前投研早會聊天室 ＆ 無洩漏（Walk-Forward）四態量化中心"
+            f"<small>事前 Log-Loss 選參：(λ={lam:g}, 半衰期={hl:g}日) · 僅用 T 日前已實現樣本 [lo, t) 訓練</small></div>",
             unsafe_allow_html=True
         )
 
-        # 選填 API Key 與早會場次時光機切換列
-        c_sel, c_cfg = st.columns([3, 2], vertical_alignment="center")
         all_eval_indices = (w1_indices + w2_indices)[::-1]
         if not all_eval_indices:
             all_eval_indices = [len(df) - 1]
         opt_map = {f"{fmt_d(df.iloc[idx]['date'])} 08:30 早會場次": idx for idx in all_eval_indices}
-        opt_labels = list(opt_map.keys())
-
-        with c_sel:
-            chosen_label = st.selectbox("📅 選擇檢視早會場次（預設為最新一場，可切換回放 11/2~11/13 任一日早會與對帳）", opt_labels, index=0)
+        chosen_label = st.selectbox("📅 切換檢視早會場次（預設為最新交易日，可回放 11/02～11/13 任一日早會對話與對帳）", list(opt_map.keys()), index=0)
         sel_idx = opt_map[chosen_label]
 
-        custom_keys = {}
-        with c_cfg:
-            with st.expander("⚙️ 選填外部 LLM API Key（未填時預設啟用內建量化引擎）"):
-                custom_keys["OPENAI_API_KEY"] = st.text_input("OpenAI API Key", type="password")
-                custom_keys["DEEPSEEK_API_KEY"] = st.text_input("DeepSeek API Key", type="password")
-                custom_keys["GEMINI_API_KEY"] = st.text_input("Gemini API Key", type="password")
-                custom_keys["ANTHROPIC_API_KEY"] = st.text_input("Anthropic API Key", type="password")
-
-        # 計算所選場次之預測與聊天室資料
         sel_row = df.iloc[sel_idx]
         target_d = sel_row["date"]
         prev_d = df.iloc[sel_idx - 1]["date"] if sel_idx > 0 else (target_d - timedelta(days=1))
-        pred_info = predict_row_4state(engine, sel_idx)
-        mp = pred_info["master_probs"]
 
-        # 對齊所選場次前一日之三大法人買賣超
-        sub_flows = [x for x in days_flow if x.get("dt") and x["dt"] < target_d]
-        if not sub_flows:
-            sub_flows = days_flow
+        p_arr, (pg_m, pu_m, pd_m), _ = predict_state(X, gap, intra, sel_idx, cols_all, lam, hl)
+        master_probs = {FOUR_STATES[i]: round(float(p_arr[i]) * 100.0, 1) for i in range(4)}
+        master_top = FOUR_STATES[int(p_arr.argmax())]
+        base_st_name = FOUR_STATES[baseline_state(sidx, sel_idx)]
+
+        sub_flows = [x for x in days_flow if x.get("dt") and x["dt"] < target_d] or days_flow
         if sub_flows:
             f_list = [x["外資"] / 1e8 for x in sub_flows]
             t_list = [x["投信"] / 1e8 for x in sub_flows]
@@ -1469,32 +1476,37 @@ def vote_page():
         else:
             flow_info = {k: 0.0 for k in ("f1", "f5", "f10", "t1", "t5", "t10", "z1", "z5", "z10")}
 
-        # 頂部指標卡：顯示所選場次四態機率 + 兩週實證達標率
         m = st.columns(6)
-        m[0].metric("🔴 開高走高", f"{mp['開高走高']:.1f}%", f"跳空 {pred_info['detail_stats']['開高走高']['avg_gap']:+.2f}%")
-        m[1].metric("🟠 開高走低", f"{mp['開高走低']:.1f}%", f"盤中 {pred_info['detail_stats']['開高走低']['avg_intra']:+.2f}%", delta_color="inverse")
-        m[2].metric("🔵 開低走高", f"{mp['開低走高']:.1f}%", f"盤中 {pred_info['detail_stats']['開低走高']['avg_intra']:+.2f}%")
-        m[3].metric("🟢 開低走低", f"{mp['開低走低']:.1f}%", f"跳空 {pred_info['detail_stats']['開低走低']['avg_gap']:+.2f}%", delta_color="inverse")
-        m[4].metric("✅ 11/9~11/13 驗證", f"{c_w2} / {n_w2} 準確", f"準確率 {c_w2/max(1,n_w2)*100:.0f}% (及格)")
-        m[5].metric("✅ 11/2~11/6 驗證", f"{c_w1} / {n_w1} 準確", f"準確率 {c_w1/max(1,n_w1)*100:.0f}% (及格)")
+        m[0].metric("🔴 開高走高", f"{master_probs['開高走高']:.1f}%", f"P(開高)={pg_m*100:.0f}%×P(走高|高)={pu_m*100:.0f}%")
+        m[1].metric("🟠 開高走低", f"{master_probs['開高走低']:.1f}%", f"P(開高)={pg_m*100:.0f}%×P(走低|高)={(1-pu_m)*100:.0f}%", delta_color="inverse")
+        m[2].metric("🔵 開低走高", f"{master_probs['開低走高']:.1f}%", f"P(開低)={(1-pg_m)*100:.0f}%×P(走高|低)={pd_m*100:.0f}%")
+        m[3].metric("🟢 開低走低", f"{master_probs['開低走低']:.1f}%", f"P(開低)={(1-pg_m)*100:.0f}%×P(走低|低)={(1-pd_m)*100:.0f}%", delta_color="inverse")
+        m[4].metric("📐 近60日樣本外命中", f"{eval_60['hit']}/{eval_60['n']} ({eval_60['hit']/max(1,eval_60['n'])*100:.1f}%)", f"基準 {eval_60['base']}/{eval_60['n']} ｜ p={eval_60['p']:.3f}")
+        m[5].metric("🎯 跳空 / 盤中方向準確率", f"{eval_60['gap']/max(1,eval_60['n'])*100:.0f}% / {eval_60['intra']/max(1,eval_60['n'])*100:.0f}%", f"11/9~13: {eval_w2['hit']}/{eval_w2['n']} ｜ 11/2~6: {eval_w1['hit']}/{eval_w1['n']}")
 
-        # 雙週 10 日實證對帳表（預設展開讓使用者一目了然）
-        with st.expander("📊 點擊收合／展開：【11/09~11/13】與【11/02~11/06】雙週 10 日四態預測 vs 實際結果逐日驗證表", expanded=True):
-            t1_col, t2_col = st.columns(2)
-            with t1_col:
-                st.markdown(f"**🔹 第一階段驗證（11/09 ～ 11/13）：{c_w2}/{n_w2} 天正確（{c_w2/max(1,n_w2)*100:.0f}%）— 符合 ≥4/5 標準**")
-                st.dataframe(df_w2, hide_index=True, use_container_width=True)
-            with t2_col:
-                st.markdown(f"**🔸 第二階段跨週驗證（11/02 ～ 11/06）：{c_w1}/{n_w1} 天正確（{c_w1/max(1,n_w1)*100:.0f}%）— 符合僅 1 天出入標準**")
-                st.dataframe(df_w1, hide_index=True, use_container_width=True)
+        with st.expander("📊 展開檢視：無洩漏 Walk-Forward 雙週（11/02~11/06 ＆ 11/09~11/13）與基準比較驗證表", expanded=False):
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown(
+                    f"**🔹 11/09～11/13 Walk-Forward 成績：命中 `{eval_w2['hit']}/{eval_w2['n']}` "
+                    f"｜ 基準 `{eval_w2['base']}/{eval_w2['n']}` ｜ 跳空 `{eval_w2['gap']}/{eval_w2['n']}` "
+                    f"｜ 盤中 `{eval_w2['intra']}/{eval_w2['n']}` ｜ 二項檢定 `p={eval_w2['p']:.3f}`**"
+                )
+                st.dataframe(_eval_to_df(df, eval_w2), hide_index=True, use_container_width=True)
+            with c2:
+                st.markdown(
+                    f"**🔸 11/02～11/06 Walk-Forward 成績：命中 `{eval_w1['hit']}/{eval_w1['n']}` "
+                    f"｜ 基準 `{eval_w1['base']}/{eval_w1['n']}` ｜ 跳空 `{eval_w1['gap']}/{eval_w1['n']}` "
+                    f"｜ 盤中 `{eval_w1['intra']}/{eval_w1['n']}` ｜ 二項檢定 `p={eval_w1['p']:.3f}`**"
+                )
+                st.dataframe(_eval_to_df(df, eval_w1), hide_index=True, use_container_width=True)
 
-        # 生成並渲染完整的 AI 早會聊天室
-        speeches = build_agent_meeting_speeches(sel_row, pred_info, flow_info, headlines, custom_keys)
+        speeches = build_walk_forward_speeches(wf_sys, sel_idx, flow_info, headlines)
         html_doc = build_chatroom_html(
             target_d, prev_d, sel_row, flow_info, speeches,
-            mp, pred_info["master_top"], is_historical_verified=True
+            master_probs, (pg_m, pu_m, pd_m), master_top, base_st_name, eval_60
         )
-        components.html(html_doc, height=1420, scrolling=True)
+        components.html(html_doc, height=1500, scrolling=True)
 
 # ───────────────────────── 組版 ─────────────────────────
 with st.container(key="nav"):
