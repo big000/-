@@ -1,7 +1,7 @@
 import os, io, csv, json, time, re, math
 import urllib.parse
 import xml.etree.ElementTree as ET
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, time as dtime, timedelta
 import numpy as np, pandas as pd, pytz, requests, yfinance as yf
 import streamlit as st
 import streamlit.components.v1 as components
@@ -11,72 +11,62 @@ st.set_page_config(page_title="破產後重生之我要靠量化交易發財", p
 TZ = pytz.timezone("Asia/Taipei")
 UP, DN = "#ff4d5a", "#22c55e"                   # 台股慣例：紅漲綠跌
 
-# ───────────────────────── 系統設定與新聞白名單 / 黑名單 ─────────────────────────
+# ───────────────────────── 核心常數與白名單設定 ─────────────────────────
 DEFAULT_OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1")
 INDEX_TICKER = "^TWII"
 ETF_TICKER = "00631L.TW"
 SYM = ETF_TICKER
+ARCHIVE_FILE = "review_archive_6d.json"
+MAX_ARCHIVE_DAYS = 6
 
-NEWS_DAYS = 3
-NEWS_PER_SOURCE = 3
+# 第五節：新聞來源白名單（國內 4 家 + 國外 5 家）與黑名單
 NEWS_WHITELIST = [
-    {"name": "中央社",       "domain": "cna.com.tw",     "lang": "zh"},
-    {"name": "經濟日報",     "domain": "money.udn.com",  "lang": "zh"},
-    {"name": "工商時報",     "domain": "ctee.com.tw",    "lang": "zh"},
-    {"name": "鉅亨網",       "domain": "cnyes.com",      "lang": "zh"},
-    {"name": "自由時報財經", "domain": "ec.ltn.com.tw",  "lang": "zh"},
-    {"name": "財訊",         "domain": "wealth.com.tw",  "lang": "zh"},
-    {"name": "Reuters",      "domain": "reuters.com",    "lang": "en"},
-    {"name": "Bloomberg",    "domain": "bloomberg.com",  "lang": "en"},
-    {"name": "CNBC",         "domain": "cnbc.com",       "lang": "en"},
+    {"name": "中央社",    "domain": "cna.com.tw",       "lang": "zh", "paywall": False},
+    {"name": "經濟日報",  "domain": "money.udn.com",    "lang": "zh", "paywall": False},
+    {"name": "工商時報",  "domain": "ctee.com.tw",      "lang": "zh", "paywall": False},
+    {"name": "鉅亨網",    "domain": "cnyes.com",        "lang": "zh", "paywall": False},
+    {"name": "Reuters",   "domain": "reuters.com",      "lang": "en", "paywall": False},
+    {"name": "CNBC",      "domain": "cnbc.com",         "lang": "en", "paywall": False},
+    {"name": "Bloomberg", "domain": "bloomberg.com",    "lang": "en", "paywall": True},
+    {"name": "WSJ",       "domain": "wsj.com",          "lang": "en", "paywall": True},
+    {"name": "FT",        "domain": "ft.com",           "lang": "en", "paywall": True},
 ]
 NEWS_BLACKLIST = [
     "ptt.cc", "dcard.tw", "kknews.cc", "mobile01.com", "facebook.com",
     "youtube.com", "threads.net", "cmoney.tw", "medium.com"
 ]
 
-FOUR_STATES = ["開高走高", "開高走低", "開低走高", "開低走低"]
-MIN_TRAIN = 150
-MAX_TRAIN = 500
-GRID = [(lam, hl) for lam in (5.0, 20.0, 80.0) for hl in (80.0, 250.0)]
-
-STATE_META = {
-    "開高走高": {"col": "#ff4d5a", "bg": "rgba(255,77,90,.20)", "icon": "🔴", "desc": "開盤 > 昨收 且 收盤 ≥ 開盤（跳空續攻紅K）"},
-    "開高走低": {"col": "#f59e0b", "bg": "rgba(245,158,11,.20)", "icon": "🟠", "desc": "開盤 > 昨收 但 收盤 < 開盤（開高出貨黑K）"},
-    "開低走高": {"col": "#38bdf8", "bg": "rgba(56,189,248,.20)", "icon": "🔵", "desc": "開盤 ≤ 昨收 但 收盤 ≥ 開盤（低接承接紅K）"},
-    "開低走低": {"col": "#22c55e", "bg": "rgba(34,197,94,.20)", "icon": "🟢", "desc": "開盤 ≤ 昨收 且 收盤 < 開盤（跳空殺低黑K）"},
-}
-
-AI_AGENTS = [
-    {"id": "technical", "name": "技術面分析師", "model_id": DEFAULT_OPENAI_MODEL, "secret_key": "OPENAI_API_KEY", "short": "技", "color": "#10a37f", "role": "只根據「事實卡」與「條件式價位」判斷趨勢、動能、關鍵價位。不談新聞。"},
-    {"id": "news",      "name": "消息面分析師", "model_id": DEFAULT_OPENAI_MODEL, "secret_key": "OPENAI_API_KEY", "short": "消", "color": "#3b82f6", "role": "只根據「新聞標題」判斷資金面、總經、國際股市（美股/半導體/Fed）對台股的影響。標題不足時要明說資訊不足。"},
-    {"id": "risk",      "name": "風險控管官",   "model_id": DEFAULT_OPENAI_MODEL, "secret_key": "OPENAI_API_KEY", "short": "風", "color": "#8b5cf6", "role": "站在最壞情境。重點是波動、乖離過大、停損位置，以及 00631L 兩倍槓桿的每日再平衡耗損。"},
-    {"id": "devil",     "name": "反方辯士",     "model_id": DEFAULT_OPENAI_MODEL, "secret_key": "OPENAI_API_KEY", "short": "反", "color": "#d97706", "role": "刻意找出其他人可能忽略的反面論點，專挑「現在進場最可能出錯的理由」。"},
+# 第六節：四位委員的角色定義
+COMMITTEE_ROLES = [
+    {
+        "id": "fundamental",
+        "name": "基本面委員",
+        "short": "基",
+        "color": "#10a37f",
+        "role": "資金面與總經（利率、匯率、風險偏好、估值、政策與財報季事件）"
+    },
+    {
+        "id": "industry",
+        "name": "產業面委員",
+        "short": "產",
+        "color": "#3b82f6",
+        "role": "AI 供應鏈、半導體景氣、台積電營收與法說、美科技股財報、關稅與出口管制"
+    },
+    {
+        "id": "technical",
+        "name": "技術面委員",
+        "short": "技",
+        "color": "#8b5cf6",
+        "role": "讀取加權指數與 00631L 技術面事實卡，判讀均線、量價、缺口與條件式價位"
+    },
+    {
+        "id": "chip",
+        "name": "籌碼面委員",
+        "short": "籌",
+        "color": "#d97706",
+        "role": "外資現貨與期貨部位、投信、融資融券、選擇權 P/C 比、00631L 折溢價"
+    },
 ]
-
-FEATURE_COLS = [
-    "tsm_pct", "sox_pct", "nvda_pct", "sp_pct", "vix_pct", "fx_pct",
-    "tw_prev_pct", "prev_intra", "prev_clv", "wick_diff", "prev_hl_pct",
-    "bias5", "bias10", "bias20", "ma5_slope", "rsi5_z",
-    "lead_lag", "tsm_x_bias5", "sox_x_clv", "gap_reversal_risk", "adr_prem"
-]
-
-FEAT_NAMES = {
-    "tsm_pct": "台積電ADR漲跌", "sox_pct": "費城半導體漲跌", "nvda_pct": "NVIDIA漲跌",
-    "sp_pct": "標普500漲跌", "vix_pct": "VIX恐慌變動", "fx_pct": "台幣匯率變動",
-    "tw_prev_pct": "前日台股漲跌", "prev_intra": "前日台股實體K", "prev_clv": "前日收盤強弱CLV",
-    "wick_diff": "前日上下影線差", "prev_hl_pct": "前日高低振幅", "bias5": "5MA乖離率",
-    "bias10": "10MA乖離率", "bias20": "20MA乖離率", "ma5_slope": "5MA斜率", "rsi5_z": "5日RSI位階",
-    "lead_lag": "台美跨日基差", "tsm_x_bias5": "ADR×5MA乖離交互項", "sox_x_clv": "費半×CLV交互項",
-    "gap_reversal_risk": "高檔跳空反轉風險", "adr_prem": "台積電ADR溢價率",
-}
-
-AGENT_SUBSPACES = {
-    "technical": ["bias5", "bias10", "bias20", "ma5_slope", "rsi5_z", "prev_clv", "wick_diff", "prev_hl_pct"],
-    "news":      ["tsm_pct", "sox_pct", "nvda_pct", "sp_pct", "fx_pct", "lead_lag", "adr_prem"],
-    "risk":      ["vix_pct", "bias5", "bias20", "gap_reversal_risk", "prev_hl_pct", "tsm_x_bias5"],
-    "devil":     ["lead_lag", "gap_reversal_risk", "sox_x_clv", "vix_pct", "bias20", "rsi5_z"],
-}
 
 # ───────────────────────── 全域樣式 ─────────────────────────
 st.markdown("""<style>
@@ -102,160 +92,24 @@ div[data-testid=stMetric]{background:#1e1927;border-radius:12px;padding:.5rem .8
 div[data-testid=stMetric] label p{color:#a9a6b5!important}div[data-testid=stMetricValue]{color:#fff}
 </style>""", unsafe_allow_html=True)
 
-# ───────────────────────── 無洩漏 Walk-Forward 量化引擎函式 ─────────────────────────
-def _sigmoid(z):
-    return 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
-
-def _logit_fit(Z, y, w, lam, iters=8):
-    n, d = Z.shape
-    X = np.hstack([np.ones((n, 1)), Z])
-    b = np.zeros(d + 1)
-    R = np.eye(d + 1) * lam
-    R[0, 0] = 1e-4
-    for _ in range(iters):
-        p = _sigmoid(X @ b)
-        s = np.clip(p * (1 - p), 1e-4, None) * w
-        g = X.T @ (w * (p - y)) + R @ b
-        H = X.T @ (s[:, None] * X) + R
-        b = b - np.linalg.solve(H, g)
-    return b
-
-def _pred(b, z):
-    return float(_sigmoid(b[0] + z @ b[1:]))
-
-def prep(df, feature_cols):
-    X = np.nan_to_num(df[feature_cols].values.astype(float), nan=0.0, posinf=0.0, neginf=0.0)
-    gap = (df["Open"].values.astype(float) > df["PrevClose"].values.astype(float)).astype(float)
-    intra = (df["Close"].values.astype(float) >= df["Open"].values.astype(float)).astype(float)
-    sidx = np.where(gap == 1, np.where(intra == 1, 0, 1), np.where(intra == 1, 2, 3))
-    return X, gap, intra, sidx
-
-def _train_slice(t):
-    return max(0, t - MAX_TRAIN), t
-
-def state_probs(pg, pu, pd_):
-    p = np.array([pg * pu, pg * (1 - pu), (1 - pg) * pd_, (1 - pg) * (1 - pd_)])
-    return p / p.sum()
-
-def fit_predict(X, gap, intra, t, cols, lam, hl):
-    lo, hi = _train_slice(t)
-    Xtr = X[lo:hi][:, cols]
-    mu = Xtr.mean(0)
-    sd = Xtr.std(0)
-    sd[sd < 1e-6] = 1.0
-    Z = np.clip((Xtr - mu) / sd, -4, 4)
-    z = np.clip((X[t, cols] - mu) / sd, -4, 4)
-    n = len(Z)
-    w = np.exp((np.arange(n) - n) / hl)
-    w = w / w.mean()
-    g, it = gap[lo:hi], intra[lo:hi]
-
-    pg = _pred(_logit_fit(Z, g, w, lam), z)
-    def sub(mask):
-        if mask.sum() >= 40 and 0 < it[mask].mean() < 1:
-            ws = w[mask] / w[mask].mean()
-            return _pred(_logit_fit(Z[mask], it[mask], ws, lam * 3), z)
-        return _pred(_logit_fit(Z, it, w, lam * 3), z)
-    pu, pd_ = sub(g == 1), sub(g == 0)
-    c = lambda v: float(min(0.97, max(0.03, v)))
-    return c(pg), c(pu), c(pd_), mu, sd
-
-def fit_predict_detail(X, gap, intra, t, cols, lam, hl):
-    lo, hi = _train_slice(t)
-    Xtr = X[lo:hi][:, cols]
-    mu = Xtr.mean(0)
-    sd = Xtr.std(0)
-    sd[sd < 1e-6] = 1.0
-    Z = np.clip((Xtr - mu) / sd, -4, 4)
-    z = np.clip((X[t, cols] - mu) / sd, -4, 4)
-    n = len(Z)
-    w = np.exp((np.arange(n) - n) / hl)
-    w = w / w.mean()
-    g, it = gap[lo:hi], intra[lo:hi]
-
-    bg = _logit_fit(Z, g, w, lam)
-    pg = _pred(bg, z)
-
-    def sub_fit(mask):
-        if mask.sum() >= 40 and 0 < it[mask].mean() < 1:
-            ws = w[mask] / w[mask].mean()
-            b_sub = _logit_fit(Z[mask], it[mask], ws, lam * 3)
-            return _pred(b_sub, z), b_sub
-        b_all = _logit_fit(Z, it, w, lam * 3)
-        return _pred(b_all, z), b_all
-
-    pu, bu = sub_fit(g == 1)
-    pd_, bd = sub_fit(g == 0)
-    c = lambda v: float(min(0.97, max(0.03, v)))
-    pg_c, pu_c, pd_c = c(pg), c(pu), c(pd_)
-    return state_probs(pg_c, pu_c, pd_c), (pg_c, pu_c, pd_c), z, (bg, bu, bd)
-
-def predict_state(X, gap, intra, t, cols, lam, hl):
-    pg, pu, pd_, mu, sd = fit_predict(X, gap, intra, t, cols, lam, hl)
-    return state_probs(pg, pu, pd_), (pg, pu, pd_), (mu, sd)
-
-def baseline_state(sidx, t):
-    lo, hi = _train_slice(t)
-    return int(np.bincount(sidx[lo:hi], minlength=4).argmax())
-
-def tune(X, gap, intra, sidx, end, cols, span=60):
-    idxs = [t for t in range(max(MIN_TRAIN, end - span), end)]
-    if not idxs: return GRID[2]
-    best, best_ll = GRID[2], -1e9
-    for lam, hl in GRID:
-        ll = 0.0
-        for t in idxs:
-            p, _, _ = predict_state(X, gap, intra, t, cols, lam, hl)
-            ll += math.log(max(p[sidx[t]], 1e-6))
-        ll /= len(idxs)
-        if ll > best_ll:
-            best, best_ll = (lam, hl), ll
-    return best
-
-def binom_p(hits, n, p0):
-    p0 = min(max(p0, 0.05), 0.95)
-    return float(sum(math.comb(n, k) * p0 ** k * (1 - p0) ** (n - k) for k in range(hits, n + 1)))
-
-def evaluate(X, gap, intra, sidx, idxs, cols, lam, hl):
-    idxs = [t for t in idxs if t >= MIN_TRAIN]
-    n = len(idxs)
-    if n == 0:
-        return dict(n=0, hit=0, base=0, gap=0, intra=0, p=1.0, rows=[])
-    hit = base = gh = ih = 0
-    rows = []
-    for t in idxs:
-        p, (pg, pu, pd_), _ = predict_state(X, gap, intra, t, cols, lam, hl)
-        top = int(p.argmax())
-        b = baseline_state(sidx, t)
-        hit += top == sidx[t]
-        base += b == sidx[t]
-        gh += (pg >= 0.5) == (gap[t] == 1)
-        pi = pu if pg >= 0.5 else pd_
-        ih += (pi >= 0.5) == (intra[t] == 1)
-        rows.append(dict(t=t, top=top, probs=p, pg=pg, pu=pu, pd=pd_, base_st=b, actual=int(sidx[t])))
-    return dict(n=n, hit=int(hit), base=int(base), gap=int(gh), intra=int(ih),
-                p=binom_p(int(hit), n, max(base / n, 0.25)), rows=rows)
-
-def _top_feature_drivers(z, b, sub_cols, top_k=2):
-    contribs = z * b[1:]
-    pairs = [(FEAT_NAMES.get(FEATURE_COLS[sub_cols[i]], FEATURE_COLS[sub_cols[i]]), float(contribs[i]), float(z[i])) for i in range(len(sub_cols))]
-    pos = sorted([p for p in pairs if p[1] > 0], key=lambda x: x[1], reverse=True)[:top_k]
-    neg = sorted([p for p in pairs if p[1] < 0], key=lambda x: x[1])[:top_k]
-    return pos, neg
-
-# ───────────────────────── 基礎資料與休市日模組 ─────────────────────────
+# ───────────────────────── 基礎資料與交易日曆模組 ─────────────────────────
 def _clean(d):
-    if d is None or d.empty: return pd.DataFrame()
+    if d is None or d.empty:
+        return pd.DataFrame()
     d.columns = [c[0] if isinstance(c, tuple) else c for c in d.columns]
     d = d[~d.index.duplicated()]
     return d.dropna(subset=["Close"])
 
 def _parse_num(val):
-    if val is None: return None
+    if val is None:
+        return None
     s = str(val).strip().replace(",", "").replace("%", "").replace("+", "")
-    if not s or s in ("-", "--", "N/A", "None"): return None
-    try: return float(s)
-    except Exception: return None
+    if not s or s in ("-", "--", "N/A", "None"):
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_daily(sym, period="3y"):
@@ -264,20 +118,23 @@ def load_daily(sym, period="3y"):
 @st.cache_data(ttl=60, show_spinner=False)
 def load_intraday():
     d = _clean(yf.download(INDEX_TICKER, period="5d", interval="1m", progress=False))
-    if d.empty: return d
+    if d.empty:
+        return d
     d.index = d.index.tz_convert(TZ)
     return d[d.index.date == d.index[-1].date()]
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_5m_all(sym):
     d = _clean(yf.download(sym, period="60d", interval="5m", progress=False))
-    if d.empty: return d
+    if d.empty:
+        return d
     d.index = d.index.tz_convert(TZ)
     return d
 
 def load_5m_today(sym):
     d = load_5m_all(sym)
-    if d.empty: return d
+    if d.empty:
+        return d
     return d[d.index.date == d.index[-1].date()]
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -286,8 +143,9 @@ def twse_day(ymd):
         r = requests.get("https://www.twse.com.tw/rwd/zh/fund/BFI82U", timeout=8,
                          params={"dayDate": ymd, "type": "day", "response": "json"},
                          headers={"User-Agent": "Mozilla/5.0"}).json()
-        time.sleep(0.25)
-        if r.get("stat") != "OK": return None
+        time.sleep(0.2)
+        if r.get("stat") != "OK":
+            return None
         t = {row[0]: int(row[3].replace(",", "")) for row in r["data"]}
         f = lambda k: sum(v for n, v in t.items() if n.startswith(k))
         return {"外資": f("外資"), "投信": f("投信"), "自營": f("自營商"), "ymd": ymd}
@@ -295,10 +153,53 @@ def twse_day(ymd):
         return None
 
 @st.cache_data(ttl=900, show_spinner=False)
+def twse_margin_day(ymd):
+    """從證交所 MI_MARGN 抓取上一交易日大盤融資餘額(億元)與融券餘額(張)"""
+    try:
+        r = requests.get("https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN", timeout=8,
+                         params={"date": ymd, "selectType": "MS", "response": "json"},
+                         headers={"User-Agent": "Mozilla/5.0"}).json()
+        if r.get("stat") != "OK":
+            return None
+        tables = r.get("tables", [])
+        if not tables:
+            return None
+        rows = tables[0].get("data", [])
+        margin_bal = margin_chg = None
+        short_bal = short_chg = None
+        for row in rows:
+            item_name = str(row[0])
+            if "融資金額" in item_name:
+                prev_v = _parse_num(row[4])
+                curr_v = _parse_num(row[5])
+                if curr_v is not None:
+                    margin_bal = curr_v / 1e5  # 仟元 -> 億元
+                    margin_chg = (curr_v - prev_v) / 1e5 if prev_v is not None else 0.0
+            elif "融券" in item_name and "交易單位" in item_name:
+                prev_s = _parse_num(row[4])
+                curr_s = _parse_num(row[5])
+                if curr_s is not None:
+                    short_bal = int(curr_s)
+                    short_chg = int(curr_s - prev_s) if prev_s is not None else 0
+        if margin_bal is not None:
+            return {
+                "ok": True,
+                "margin_yi": round(margin_bal, 2),
+                "margin_chg_yi": round(margin_chg, 2),
+                "short_lots": short_bal or 0,
+                "short_chg_lots": short_chg or 0,
+                "label": f"融資餘額 {margin_bal:,.1f} 億（日增減 {margin_chg:+.2f} 億）｜融券 {short_bal or 0:,d} 張（{short_chg or 0:+,d} 張）"
+            }
+    except Exception:
+        pass
+    return {"ok": False, "label": "未取得"}
+
+@st.cache_data(ttl=900, show_spinner=False)
 def last_15_flows():
     out, d = [], datetime.now(TZ)
     for _ in range(38):
-        if len(out) == 15: break
+        if len(out) == 15:
+            break
         if d.weekday() < 5:
             x = twse_day(d.strftime("%Y%m%d"))
             if x:
@@ -315,12 +216,14 @@ def last_10_flows():
 def tw_holidays():
     try:
         r = requests.get("https://openapi.twse.com.tw/v1/holidaySchedule/holidaySchedule", timeout=8)
-        if r.status_code != 200: raise ValueError("API Error")
+        if r.status_code != 200:
+            raise ValueError("API Error")
         out = {}
         for row in r.json():
             name = str(row.get("Name", ""))
             desc = str(row.get("Description", ""))
-            if "開始交易" in name or "最後交易" in name or "開始交易" in desc or "最後交易" in desc: continue
+            if "開始交易" in name or "最後交易" in name or "開始交易" in desc or "最後交易" in desc:
+                continue
             d_str = str(row.get("Date", "")).strip().replace("-", "").replace("/", "")
             if len(d_str) == 8 and d_str.isdigit():
                 y, m, d = int(d_str[:4]), int(d_str[4:6]), int(d_str[6:8])
@@ -330,22 +233,27 @@ def tw_holidays():
         raise ValueError("Fetch failed")
 
 def is_tw_trading_day(d):
-    if d.weekday() >= 5: return False, "週末休市"
+    if d.weekday() >= 5:
+        return False, "週末休市"
     try:
         hol = tw_holidays()
-        if d in hol: return False, f"國定休市（{hol[d]}）"
+        if d in hol:
+            return False, f"國定休市（{hol[d]}）"
     except Exception:
         pass
     return True, "正常交易日"
 
 def future_trading_days(after, k):
     hol, ok = {}, True
-    try: hol = tw_holidays()
-    except Exception: ok = False
+    try:
+        hol = tw_holidays()
+    except Exception:
+        ok = False
     days, skipped, d = [], {}, after
     while len(days) < k:
         d += timedelta(days=1)
-        if d.weekday() >= 5: continue
+        if d.weekday() >= 5:
+            continue
         if d in hol:
             skipped[d] = hol[d]
             continue
@@ -353,9 +261,10 @@ def future_trading_days(after, k):
     return days, skipped, ok
 
 WD = "一二三四五六日"
-def fmt_d(d): return f"{d:%m/%d}（週{WD[d.weekday()]}）"
+def fmt_d(d):
+    return f"{d:%m/%d}（週{WD[d.weekday()]}）"
 
-# ───────────────────────── 圖表與 UI 切換模組 (TradingView) ─────────────────────────
+# ───────────────────────── 圖表與切換模組 (TradingView) ─────────────────────────
 LW = '<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>'
 BASE = LW + (
     '<style>html,body{margin:0;background:#000;font-family:-apple-system,"Noto Sans TC","Microsoft JhengHei",sans-serif}'
@@ -420,8 +329,10 @@ INTRA_JS = (
 
 def daily_html(df, h=390, n=130):
     d = df.copy()
-    if "Volume" not in d: d["Volume"] = 0
-    for p in (5, 10, 20, 60, 240): d[f"MA{p}"] = d.Close.rolling(p).mean()
+    if "Volume" not in d:
+        d["Volume"] = 0
+    for p in (5, 10, 20, 60, 240):
+        d[f"MA{p}"] = d.Close.rolling(p).mean()
     d = d.tail(n)
     k = [dict(time=i.strftime("%Y-%m-%d"), open=round(float(r.Open), 2), high=round(float(r.High), 2),
               low=round(float(r.Low), 2), close=round(float(r.Close), 2)) for i, r in d.iterrows()]
@@ -575,7 +486,8 @@ def strategy_data():
 
 def simulate(df, intra, em, xm, sl, tp1, sl1, cool):
     d = df.copy()
-    for p in (5, 10, 240): d[f"m{p}"] = d.Close.rolling(p).mean()
+    for p in (5, 10, 240):
+        d[f"m{p}"] = d.Close.rolling(p).mean()
     O, Hh, L, C = d["Open"].values, d["High"].values, d["Low"].values, d["Close"].values
     M5, M10, M240 = d["m5"].values, d["m10"].values, d["m240"].values
     dates = [x.date() for x in d.index]
@@ -597,21 +509,28 @@ def simulate(df, intra, em, xm, sl, tp1, sl1, cool):
         for j, (bo, bh, bl, bc) in enumerate(bars):
             if pos:
                 ln, tp = lines(ep, reg, m5)
-                if bo <= ln or (tp and bo >= tp): close(i, bo, "跳空出場")
-                elif bl <= ln: close(i, ln, "弱勢停損" if reg == 1 else "停損" if ep * (1 - sl) >= m5 * xm else "跌破均線")
-                elif tp and bh >= tp: close(i, tp, "弱勢停利")
+                if bo <= ln or (tp and bo >= tp):
+                    close(i, bo, "跳空出場")
+                elif bl <= ln:
+                    close(i, ln, "弱勢停損" if reg == 1 else "停損" if ep * (1 - sl) >= m5 * xm else "跌破均線")
+                elif tp and bh >= tp:
+                    close(i, tp, "弱勢停利")
             elif i - last > cool:
                 ent, r = None, 0
                 if m5 < m240:
-                    if j == 0 and m5 > m10 and m5b <= m10b: ent, r = bo, 1
+                    if j == 0 and m5 > m10 and m5b <= m10b:
+                        ent, r = bo, 1
                 else:
                     lv = m5 * em
-                    if bo >= lv: ent, r = bo, 2
-                    elif bh >= lv: ent, r = lv, 2
+                    if bo >= lv:
+                        ent, r = bo, 2
+                    elif bh >= lv:
+                        ent, r = lv, 2
                 if ent:
                     pos, ep, reg, ei = 1, ent, r, i
                     ln, tp = lines(ep, reg, m5)
-                    if (bl <= ln) if ent == bo else (bc <= ln): close(i, ln, "當日停損")
+                    if (bl <= ln) if ent == bo else (bc <= ln):
+                        close(i, ln, "當日停損")
     N = len(d)
     return dict(pos=pos, ep=ep, reg=reg, since=d.index[ei].date() if pos else None,
                 cd=max(0, cool + 1 - (N - last)) if last > 0 else 0,
@@ -637,9 +556,13 @@ def strategy_page():
     with st.container(key="strat_card"):
         st.markdown("<div class='fl-h'>策略 B：狀態與訊號<small>00631L · 進出場以 5 分 K 時序精準判定（避免開高走低／開低走高的假訊號）</small></div>",
                     unsafe_allow_html=True)
-        with st.spinner("同步歷史資料…"): df, intra = strategy_data()
-        if len(df) < 245: st.error("歷史資料不足 245 根，無法計算 240MA。"); return
-        if not intra: st.warning("抓不到 5 分 K，回測退回日 K 判斷。")
+        with st.spinner("同步歷史資料…"):
+            df, intra = strategy_data()
+        if len(df) < 245:
+            st.error("歷史資料不足 245 根，無法計算 240MA。")
+            return
+        if not intra:
+            st.warning("抓不到 5 分 K，回測退回日 K 判斷。")
         with st.expander("策略參數"):
             c = st.columns(6)
             em = c[0].number_input("強勢進場乘數", value=1.04, step=0.01)
@@ -670,12 +593,16 @@ def strategy_page():
                 days, skipped, ok = future_trading_days(df.index[-1].date(), s["cd"] + 1)
                 msg = (f"⏳ 冷卻中，還需 {s['cd']} 個交易日｜冷卻結束：{fmt_d(days[s['cd'] - 1])} "
                        f"最早可再進場：{fmt_d(days[s['cd']])}（冷卻結束後參考下列價位）")
-                if skipped: msg += "\n\n已排除休市日：" + "、".join(f"{fmt_d(k)} {v}" for k, v in skipped.items())
-                if not ok: msg += "\n\n⚠️ 無法連接證交所 OpenAPI 獲取休假資料，目前只排除週末，遇到國定假日請自行順延。"
+                if skipped:
+                    msg += "\n\n已排除休市日：" + "、".join(f"{fmt_d(k)} {v}" for k, v in skipped.items())
+                if not ok:
+                    msg += "\n\n⚠️ 無法連接證交所 OpenAPI 獲取休假資料，目前只排除週末，遇到國定假日請自行順延。"
                 st.info(msg)
-            else: st.info(f"⚪ 空手：{how}")
+            else:
+                st.info(f"⚪ 空手：{how}")
             if ent:
-                if s["cd"]: st.caption(how)
+                if s["cd"]:
+                    st.caption(how)
                 k = st.columns(3)
                 k[0].metric("合理進場價", f"{ent:,.2f}", f"{(ent / last - 1) * 100:+.2f}% vs 現價", delta_color="off")
                 k[1].metric("停損／出場價", f"{stop:,.2f}", f"{(stop / ent - 1) * 100:+.2f}%", delta_color="off")
@@ -690,8 +617,10 @@ def strategy_page():
             tf = pick("週期", ["分時圖", "日線圖"], "tf2")
         if tf == "分時圖":
             d = load_5m_today(SYM)
-            if d.empty: st.warning("目前抓不到 5 分 K 分時資料(可能休市或 Yahoo 暫時無回應)。")
-            else: components.html(intraday_html(d, prev_close(df, d), h=390, step=300, floor=0.5, dec=2, mm=0.01), height=400)
+            if d.empty:
+                st.warning("目前抓不到 5 分 K 分時資料(可能休市或 Yahoo 暫時無回應)。")
+            else:
+                components.html(intraday_html(d, prev_close(df, d), h=390, step=300, floor=0.5, dec=2, mm=0.01), height=400)
         else:
             components.html(daily_html(df, h=390), height=400)
     if s["trades"]:
@@ -700,73 +629,58 @@ def strategy_page():
             st.markdown("<div class='fl-h'>最近 5 筆模擬交易</div>", unsafe_allow_html=True)
             st.dataframe(pd.DataFrame(s["trades"][-5:][::-1]), hide_index=True, use_container_width=True)
 
-# ───────────────────────── 頁面三：5 大盤前資料源與委員會早會系統 ─────────────────────────
-def _gnews_url(query):
-    return f"https://www.google.com/search?q={urllib.parse.quote(query)}&tbm=nws"
+# ───────────────────────── 頁面三：早會簡報、兩輪委員會辯論與 17:00 復盤系統 ─────────────────────────
+def get_schedule_state(tw_df):
+    """
+    嚴格檢查當前時間是否為「交易日 08:30 後」：
+    - 只有交易日當天 >= 08:30 才會召開今日早會！
+    - 週末、國定休市日或 08:30 前，嚴格標示「今日無早會」，僅開放調閱最近 6 個交易日存檔。
+    - 每天 17:00 後才會解鎖當日收盤復盤紀錄，並維持最多 6 個交易日滾動保存。
+    """
+    now = datetime.now(TZ)
+    cur_d = now.date()
+    cur_t = now.time()
+    is_trd, reason = is_tw_trading_day(cur_d)
 
-@st.cache_data(ttl=180, show_spinner=False)
-def fetch_taifex_night_session():
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Content-Type": "application/json;charset=UTF-8",
-        "Referer": "https://mis.taifex.com.tw/futures/AfterHoursSession/IndexFutures/"
+    all_dates = list(pd.DatetimeIndex(tw_df.index).tz_localize(None).date)
+    # 若今日是交易日且已過 08:30，但 yfinance 日線尚未出現今日列，把最近 6 個已完成交易日列出
+    past_6_dates = [d for d in all_dates if d <= cur_d][-MAX_ARCHIVE_DAYS:]
+
+    if is_trd and cur_t >= dtime(8, 30):
+        has_live_meeting = True
+        banner_state = "live"
+        if cur_t >= dtime(17, 0):
+            banner_msg = f"🟢 今日（{fmt_d(cur_d)}）08:30 早會已召開，且 17:00 收盤復盤紀錄已準時更新存檔。"
+        else:
+            banner_msg = f"🟢 今日（{fmt_d(cur_d)}）08:30 盤前早會已召開（17:00 將準時更新今日收盤復盤紀錄）。"
+    elif is_trd and cur_t < dtime(8, 30):
+        has_live_meeting = False
+        banner_state = "waiting"
+        banner_msg = f"⏳ 今日（{fmt_d(cur_d)}）為交易日，但尚未到 08:30 開會時間（目前 {now:%H:%M}），今日早會尚未召開！以下為最近 {MAX_ARCHIVE_DAYS} 個交易日之存檔紀錄。"
+    else:
+        has_live_meeting = False
+        banner_state = "closed"
+        banner_msg = f"⛔ 今日（{fmt_d(cur_d)}）為【{reason}】，非交易日不召開 08:30 早會！以下僅供檢視最近 {MAX_ARCHIVE_DAYS} 個交易日之早會與 17:00 復盤滾動存檔。"
+
+    return {
+        "now": now,
+        "cur_d": cur_d,
+        "has_live_meeting": has_live_meeting,
+        "banner_state": banner_state,
+        "banner_msg": banner_msg,
+        "archive_dates": past_6_dates[::-1]  # 最新在最前，嚴格只保留 6 個交易日
     }
-    try:
-        payload = {"MarketType": "1", "SymbolType": "F", "KindID": "1", "CID": "TXF", "ExpireMonth": "", "RowSize": "全部", "PageNo": "", "SortColumn": "", "AscDesc": "A"}
-        r = requests.post("https://mis.taifex.com.tw/futures/api/getQuoteList", json=payload, headers=headers, timeout=6)
-        if r.status_code == 200:
-            quotes = r.json().get("RtData", {}).get("QuoteList", [])
-            for q in quotes:
-                sid, cname = str(q.get("SymbolID", "")), str(q.get("DispCName", ""))
-                if "/" in sid or "總計" in cname: continue
-                last_p, diff_p, diff_r, vol = _parse_num(q.get("CLastPrice")), _parse_num(q.get("CDiff")), _parse_num(q.get("CDiffRate")), _parse_num(q.get("CTotalVolume"))
-                if last_p is not None and last_p > 0:
-                    return {
-                        "ok": True, "source": "期交所 MIS", "contract": cname or sid,
-                        "close": last_p, "diff": diff_p or 0.0, "pct": diff_r or 0.0,
-                        "high": _parse_num(q.get("CHighPrice")) or last_p,
-                        "low": _parse_num(q.get("CLowPrice")) or last_p,
-                        "vol": int(vol) if vol else 0, "time": str(q.get("CTime", "")),
-                        "label": f"{last_p:,.0f} 點 ({diff_p or 0:+.0f} / {diff_r or 0:+.2f}%)"
-                    }
-    except Exception:
-        pass
-    try:
-        r2 = requests.get("https://openapi.taifex.com.tw/v1/DailyMarketReportFut", headers={"User-Agent": "Mozilla/5.0"}, timeout=7)
-        if r2.status_code == 200:
-            tx_after = [
-                x for x in r2.json()
-                if str(x.get("Contract", "")).strip() == "TX"
-                and ("盤後" in str(x.get("TradingSession", "")) or "After" in str(x.get("TradingSession", "")))
-                and "/" not in str(x.get("ContractMonth(Week)", ""))
-            ]
-            if tx_after:
-                q = tx_after[0]
-                last_p, diff_p, vol = _parse_num(q.get("Last")), _parse_num(q.get("Change")), _parse_num(q.get("Volume"))
-                if last_p is not None and last_p > 0:
-                    pct = (diff_p / (last_p - diff_p) * 100.0) if diff_p is not None and (last_p - diff_p) != 0 else 0.0
-                    return {
-                        "ok": True, "source": "期交所 OpenAPI",
-                        "contract": f"臺指期 {q.get('ContractMonth(Week)', '')}",
-                        "close": last_p, "diff": diff_p or 0.0, "pct": pct,
-                        "high": _parse_num(q.get("High")) or last_p,
-                        "low": _parse_num(q.get("Low")) or last_p,
-                        "vol": int(vol) if vol else 0, "time": str(q.get("Date", "05:00 收盤")),
-                        "label": f"{last_p:,.0f} 點 ({diff_p or 0:+.0f} / {pct:+.2f}%)"
-                    }
-    except Exception:
-        pass
-    return {"ok": False, "source": "未取得", "label": "未取得"}
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_taifex_oi_and_pcr():
+def fetch_taifex_oi_and_pcr_for_date(ymd_str):
+    """抓取期交所外資台指期未平倉淨口數與選擇權 Put/Call 比（查無該日或失敗標示未取得）"""
     res = {
-        "fx_oi_ok": False, "fx_net_oi": None, "fx_net_chg": None, "fx_date": "", "fx_label": "未取得",
-        "pcr_ok": False, "pcr_oi_ratio": None, "pcr_vol_ratio": None, "pcr_date": "", "pcr_label": "未取得"
+        "fx_oi_ok": False, "fx_net_oi": None, "fx_net_chg": None, "fx_label": "未取得",
+        "pcr_ok": False, "pcr_oi_ratio": None, "pcr_vol_ratio": None, "pcr_label": "未取得"
     }
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        r_pcr = requests.get("https://openapi.taifex.com.tw/v1/PutCallRatio", headers=headers, timeout=7)
+        r_pcr = requests.get("https://openapi.taifex.com.tw/v1/PutCallRatio", headers=headers, timeout=6)
         if r_pcr.status_code == 200 and isinstance(r_pcr.json(), list) and len(r_pcr.json()) > 0:
             last_row = r_pcr.json()[-1]
             oi_r = _parse_num(last_row.get("PutCallOpenInterestRatio") or last_row.get("PutCallRatio"))
@@ -774,25 +688,14 @@ def fetch_taifex_oi_and_pcr():
             if oi_r is not None:
                 res.update({
                     "pcr_ok": True, "pcr_oi_ratio": oi_r, "pcr_vol_ratio": vol_r,
-                    "pcr_date": str(last_row.get("Date", "")),
-                    "pcr_label": f"{oi_r:.2f}%" + (f" (量比 {vol_r:.2f}%)" if vol_r else "")
+                    "pcr_label": f"{oi_r:.2f}%" + (f"（成交量比 {vol_r:.2f}%）" if vol_r else "")
                 })
     except Exception:
         pass
-    if not res["pcr_ok"]:
-        try:
-            r_csv = requests.get("https://www.taifex.com.tw/cht/3/pcRatioDown", headers=headers, timeout=7)
-            if r_csv.status_code == 200:
-                lines = [ln.strip() for ln in r_csv.content.decode("cp950", errors="ignore").splitlines() if ln.strip() and ln[0].isdigit()]
-                if lines and len(lines[0].split(",")) >= 7:
-                    cols = lines[0].split(",")
-                    oi_r, vol_r = _parse_num(cols[6]), _parse_num(cols[3])
-                    if oi_r is not None:
-                        res.update({"pcr_ok": True, "pcr_oi_ratio": oi_r, "pcr_vol_ratio": vol_r, "pcr_date": cols[0], "pcr_label": f"{oi_r:.2f}% (量比 {vol_r:.2f}%)"})
-        except Exception:
-            pass
+
     try:
-        r_oi = requests.get("https://openapi.taifex.com.tw/v1/MarketDataOfMajorInstitutionalTradersFuturesBytheDate", headers=headers, timeout=7)
+        r_oi = requests.get("https://openapi.taifex.com.tw/v1/MarketDataOfMajorInstitutionalTradersFuturesBytheDate",
+                            headers=headers, timeout=6)
         if r_oi.status_code == 200 and isinstance(r_oi.json(), list):
             for row in reversed(r_oi.json()):
                 c_name = str(row.get("ContractCode", "") or row.get("商品名稱", "") or row.get("契約名稱", "")).strip()
@@ -804,638 +707,1114 @@ def fetch_taifex_oi_and_pcr():
                         res.update({
                             "fx_oi_ok": True, "fx_net_oi": int(net_oi),
                             "fx_net_chg": int(net_trd) if net_trd is not None else None,
-                            "fx_date": str(row.get("Date", "")),
-                            "fx_label": f"{int(net_oi):+,d} 口" + (f" (變動 {int(net_trd):+,d} 口)" if net_trd is not None else "")
+                            "fx_label": f"{int(net_oi):+,d} 口" + (f"（單日增減 {int(net_trd):+,d} 口）" if net_trd is not None else "")
                         })
                         break
     except Exception:
         pass
-    if not res["fx_oi_ok"]:
-        try:
-            r_fcsv = requests.get("https://www.taifex.com.tw/cht/3/futContractsDateDown", headers=headers, timeout=7)
-            if r_fcsv.status_code == 200:
-                txt = r_fcsv.content.decode("cp950", errors="ignore")
-                for cols in csv.reader(io.StringIO(txt)):
-                    if len(cols) >= 14 and "臺股期貨" in cols[1] and "外資" in cols[2]:
-                        net_trd, net_oi = _parse_num(cols[7]), _parse_num(cols[13])
-                        if net_oi is not None:
-                            res.update({
-                                "fx_oi_ok": True, "fx_net_oi": int(net_oi),
-                                "fx_net_chg": int(net_trd) if net_trd is not None else None,
-                                "fx_date": cols[0],
-                                "fx_label": f"{int(net_oi):+,d} 口" + (f" (變動 {int(net_trd):+,d} 口)" if net_trd is not None else "")
-                            })
-                            break
-        except Exception:
-            pass
     return res
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_00631l_nav_premium():
+def fetch_00631l_nav_info():
+    """從證交所/元大即時淨值端點抓取 00631L 折溢價率"""
     try:
-        r = requests.get("https://mis.twse.com.tw/stock/data/all_etf.txt", headers={"User-Agent": "Mozilla/5.0"}, timeout=7)
+        r = requests.get("https://mis.twse.com.tw/stock/data/all_etf.txt",
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
         if r.status_code == 200:
             for group in r.json().get("a1", []):
                 for msg in group.get("msgArray", []):
                     if str(msg.get("a", "")).strip() == "00631L":
-                        mkt_p, nav_p, prem_pct, prev_nav = _parse_num(msg.get("e")), _parse_num(msg.get("f")), _parse_num(msg.get("g")), _parse_num(msg.get("h"))
+                        mkt_p = _parse_num(msg.get("e"))
+                        nav_p = _parse_num(msg.get("f"))
+                        prem_pct = _parse_num(msg.get("g"))
                         if nav_p is not None and nav_p > 0:
-                            if prem_pct is None and mkt_p is not None: prem_pct = (mkt_p / nav_p - 1.0) * 100.0
+                            if prem_pct is None and mkt_p is not None:
+                                prem_pct = (mkt_p / nav_p - 1.0) * 100.0
                             return {
-                                "ok": True, "source": "證交所 MIS", "price": mkt_p, "nav": nav_p,
-                                "prev_nav": prev_nav, "prem_pct": prem_pct or 0.0,
-                                "time": f"{msg.get('i', '')} {msg.get('j', '')}".strip(),
-                                "label": f"淨值 {nav_p:,.2f} 元｜折溢價 {prem_pct or 0.0:+.2f}%"
+                                "ok": True,
+                                "price": mkt_p,
+                                "nav": nav_p,
+                                "prem_pct": prem_pct or 0.0,
+                                "label": f"預估淨值 {nav_p:,.2f} 元｜折溢價率 {prem_pct or 0.0:+.2f}%"
                             }
     except Exception:
         pass
-    return {"ok": False, "source": "未取得", "label": "未取得"}
+    return {"ok": False, "prem_pct": None, "label": "未取得（非盤中或元大/證交所端點無回應）"}
+
+def compute_tech_fact_card(df_full, upto_date, label_name, is_etf=False):
+    """
+    【第四節：技術面事實卡（程式只算並陳述事實，不給多空結論）】
+    嚴格只使用 `upto_date`（含）以前的日線資料（即早會前一日 T-1 收盤狀態）：
+    1. 趨勢：收盤相對 5、20、60、240 日均線的位置與均線排列描述
+    2. 量價：前日成交量相對 5 日均量
+    3. 關鍵價位：前日高低點、近 20 日高低點、未回補缺口、整數關卡
+    4. 前日 K 棒描述：實體大小、上下影線長度（只描述不判讀）
+    5. 00631L 專屬：近 5 日實際波動率（提醒 2 倍槓桿震盪耗損）
+    6. 條件式價位：「若開在 X 以上，上方壓力在 Y；若開在 Z 以下，支撐在 W」
+    """
+    dts = pd.DatetimeIndex(df_full.index).tz_localize(None).date
+    d = df_full[dts <= upto_date].copy()
+    if len(d) < 30:
+        return None
+
+    for p in (5, 20, 60, 240):
+        d[f"MA{p}"] = d["Close"].rolling(p).mean()
+    d["VolMA5"] = d["Volume"].rolling(5).mean()
+    d["Ret"] = d["Close"].pct_change() * 100.0
+
+    r_last = d.iloc[-1]
+    r_prev = d.iloc[-2] if len(d) >= 2 else r_last
+    c = float(r_last["Close"])
+    o = float(r_last["Open"])
+    h = float(r_last["High"])
+    l = float(r_last["Low"])
+    prev_c = float(r_prev["Close"])
+    chg = c - prev_c
+    pct = (c / prev_c - 1.0) * 100.0 if prev_c else 0.0
+
+    ma5 = float(r_last["MA5"])
+    ma20 = float(r_last["MA20"])
+    ma60 = float(r_last["MA60"]) if pd.notna(r_last["MA60"]) else ma20
+    ma240 = float(r_last["MA240"]) if pd.notna(r_last["MA240"]) else ma60
+
+    def _pos_str(p_val, m_val, m_name):
+        diff_pct = (p_val / m_val - 1.0) * 100.0
+        rel = "上方" if p_val >= m_val else "下方"
+        return f"{m_name} {m_val:,.2f}（位於{rel} {diff_pct:+.2f}%）"
+
+    if ma5 > ma20 > ma60:
+        ma_align = "5MA > 20MA > 60MA（短中長期均線呈正向排列）"
+    elif ma5 < ma20 < ma60:
+        ma_align = "5MA < 20MA < 60MA（短中長期均線呈反向排列）"
+    else:
+        ma_align = f"5MA({ma5:,.1f})、20MA({ma20:,.1f})、60MA({ma60:,.1f}) 交錯排列"
+
+    trend_fact = (
+        f"收盤 {c:,.2f}（{chg:+.2f} / {pct:+.2f}%）｜"
+        f"{_pos_str(c, ma5, '5MA')}、{_pos_str(c, ma20, '20MA')}、"
+        f"{_pos_str(c, ma60, '60MA')}、{_pos_str(c, ma240, '240MA')}｜排列狀態：{ma_align}。"
+    )
+
+    # 量價事實
+    vol_cur = float(r_last["Volume"]) if pd.notna(r_last["Volume"]) else 0.0
+    vol_ma5 = float(r_last["VolMA5"]) if (pd.notna(r_last["VolMA5"]) and r_last["VolMA5"] > 0) else 1.0
+    vol_ratio = vol_cur / vol_ma5
+    vol_fact = f"前一交易日成交量為 5 日均量的 {vol_ratio:.2f} 倍（當日量 {vol_cur:,.0f} vs 5日均量 {vol_ma5:,.0f}）。"
+
+    # 前日 K 棒純客觀描述
+    body = abs(c - o)
+    body_pct = body / prev_c * 100.0 if prev_c else 0.0
+    body_color = "紅K（收高於開）" if c > o else ("黑K（收低於開）" if c < o else "十字線（收等於開）")
+    u_wick = h - max(o, c)
+    l_wick = min(o, c) - l
+    kbar_fact = (
+        f"開 {o:,.2f} / 高 {h:,.2f} / 低 {l:,.2f} / 收 {c:,.2f}｜"
+        f"型態為{body_color}，實體長度 {body:,.2f}（{body_pct:.2f}%），"
+        f"上影線長 {u_wick:,.2f}，下影線長 {l_wick:,.2f}（全天高低振幅 {h - l:,.2f}）。"
+    )
+
+    # 關鍵價位：前日高低、近 20 日高低、近 60 日未回補缺口、整數關卡
+    d20 = d.tail(20)
+    h20 = float(d20["High"].max())
+    l20 = float(d20["Low"].min())
+
+    # 掃描近 60 日未回補缺口
+    d60 = d.tail(60)
+    unfilled_up_gaps = []
+    unfilled_dn_gaps = []
+    highs_60 = d60["High"].values
+    lows_60 = d60["Low"].values
+    dates_60 = [x.strftime("%m/%d") for x in d60.index]
+    for i in range(1, len(d60)):
+        # 向上跳空缺口：當日低點 > 前日高點，且後續所有交易日低點皆未跌破前日高點
+        if lows_60[i] > highs_60[i - 1]:
+            subsequent_min_low = float(np.min(lows_60[i:]))
+            if subsequent_min_low > highs_60[i - 1]:
+                unfilled_up_gaps.append(f"{dates_60[i]} 上跳缺口 [{highs_60[i-1]:,.1f} ~ {subsequent_min_low:,.1f}]")
+        # 向下跳空缺口：當日高點 < 前日低點，且後續所有交易日高點皆未突破前日低點
+        if highs_60[i] < lows_60[i - 1]:
+            subsequent_max_high = float(np.max(highs_60[i:]))
+            if subsequent_max_high < lows_60[i - 1]:
+                unfilled_dn_gaps.append(f"{dates_60[i]} 下跳缺口 [{subsequent_max_high:,.1f} ~ {lows_60[i-1]:,.1f}]")
+
+    gap_str = "、".join((unfilled_up_gaps[-1:] + unfilled_dn_gaps[-1:])) or "近60日無明顯未回補日K缺口"
+    step_round = 10.0 if is_etf else 500.0
+    upper_round = math.ceil(c / step_round) * step_round
+    lower_round = math.floor(c / step_round) * step_round
+    if upper_round == c:
+        upper_round += step_round
+    if lower_round == c:
+        lower_round -= step_round
+
+    levels_fact = (
+        f"前日高點 {h:,.2f}、前日低點 {l:,.2f}｜"
+        f"近 20 日高點 {h20:,.2f}、近 20 日低點 {l20:,.2f}｜"
+        f"未回補缺口：{gap_str}｜鄰近整數關卡：{lower_round:,.0f} 與 {upper_round:,.0f}。"
+    )
+
+    # 條件式價位：「若開在 X 以上，上方壓力在 Y；若開在 Z 以下，支撐在 W」
+    pivot_up = max(h, ma5)
+    res_1 = min(h20, upper_round) if min(h20, upper_round) > pivot_up else max(h20, upper_round)
+    res_2 = max(h20, upper_round) if max(h20, upper_round) > res_1 else res_1 + step_round
+    pivot_dn = min(l, ma5)
+    sup_1 = max(l20, ma20, lower_round) if max(l20, ma20, lower_round) < pivot_dn else min(ma20, lower_round)
+    sup_2 = min(l20, ma60, lower_round)
+
+    cond_fact = (
+        f"若開盤站上 {pivot_up:,.2f}（前日高點/5MA 上沿）以上，上方第一觀察位在 {res_1:,.2f}，次一壓力位在 {res_2:,.2f}；"
+        f"若開盤落於 {pivot_dn:,.2f}（前日低點/5MA 下沿）以下，下方第一支撐位在 {sup_1:,.2f}，次一支撐位在 {sup_2:,.2f}。"
+    )
+
+    # 00631L 專屬：近 5 日實際波動與策略 B 條件價位
+    etf_extra = ""
+    if is_etf:
+        rets_5 = d["Ret"].tail(5).dropna().values
+        std_5d = float(np.std(rets_5, ddof=1)) if len(rets_5) >= 2 else 0.0
+        abs_mean_5d = float(np.mean(np.abs(rets_5))) if len(rets_5) >= 1 else 0.0
+        strat_entry = round(ma5 * 1.04, 2)
+        strat_exit = round(ma5 * 0.98, 2)
+        etf_extra = (
+            f"近 5 日單日報酬標準差為 {std_5d:.2f}%（平均單日絕對波動 {abs_mean_5d:.2f}%），"
+            f"2 倍槓桿每日再平衡（Daily Reset）於雙向震盪盤會產生波動率累積耗損｜"
+            f"策略 B 參考價位：5MA 強勢觸價線 {strat_entry:,.2f}（5MA×1.04）、5MA 出場保護線 {strat_exit:,.2f}（5MA×0.98）。"
+        )
+
+    return {
+        "name": label_name,
+        "date_str": r_last.name.strftime("%Y/%m/%d"),
+        "close": c, "open": o, "high": h, "low": l, "prev_close": prev_c,
+        "chg": chg, "pct": pct,
+        "ma5": ma5, "ma20": ma20, "ma60": ma60, "ma240": ma240,
+        "vol_ratio": round(vol_ratio, 2),
+        "h20": h20, "l20": l20,
+        "upper_round": upper_round, "lower_round": lower_round,
+        "pivot_up": round(pivot_up, 2), "res_1": round(res_1, 2), "res_2": round(res_2, 2),
+        "pivot_dn": round(pivot_dn, 2), "sup_1": round(sup_1, 2), "sup_2": round(sup_2, 2),
+        "trend_fact": trend_fact,
+        "vol_fact": vol_fact,
+        "kbar_fact": kbar_fact,
+        "levels_fact": levels_fact,
+        "cond_fact": cond_fact,
+        "etf_extra": etf_extra,
+    }
+
+# ───────────────────────── 第五節：白名單新聞抓取、同事件歸群與「已反映/尚未反映」判定 ─────────────────────────
+TOPIC_CLUSTERS = [
+    {"id": "tsmc_semi", "name": "台積電 / 晶圓代工 / 先進封裝", "kw": ["台積", "TSM", "2330", "CoWoS", "晶圓", "2奈米", "先進製程", "費半", "semiconductor", "foundry"]},
+    {"id": "nvda_ai",   "name": "輝達 NVIDIA / AI 伺服器供應鏈", "kw": ["輝達", "NVIDIA", "NVDA", "Blackwell", "GB200", "GB300", "AI伺服器", "鴻海", "廣達", "緯穎", "CSP"]},
+    {"id": "fed_macro", "name": "聯準會利率 / 通膨數據 / 美債匯率", "kw": ["聯準會", "Fed", "降息", "利率", "CPI", "PPI", "非農", "鮑爾", "Powell", "美債", "殖利率", "通膨", "inflation", "匯率", "台幣"]},
+    {"id": "tariff_geo","name": "關稅貿易政策 / 出口管制 / 地緣", "kw": ["關稅", "川普", "Trump", "tariff", "出口管制", "禁令", "晶片法", "制裁", "貿易"]},
+    {"id": "tw_flow",   "name": "台股外資期現貨 / 投信 ETF 籌碼", "kw": ["外資", "投信", "三大法人", "台指期", "融資", "ETF", "0050", "00631L", "權值股", "加權指數"]},
+]
+
+def _assign_topic_cluster(title_txt):
+    t_up = title_txt.upper()
+    for cl in TOPIC_CLUSTERS:
+        if any(k.upper() in t_up for k in cl["kw"]):
+            return cl["id"], cl["name"]
+    return "general_mkt", "國際財經與市場焦點"
+
+def _try_extract_article_snippet(url_str, rss_desc, title_str, src_name, is_paywall):
+    """清理 RSS 摘要，若無內文且非付費牆則嘗試輕量抓取 meta og:description，誠實標示是否僅憑標題"""
+    clean_d = re.sub(r"<[^>]+>", " ", rss_desc or "")
+    clean_d = re.sub(r"&[a-zA-Z0-9#]+;", " ", clean_d)
+    clean_d = re.sub(r"\s+", " ", clean_d).strip()
+    rem = clean_d.replace(title_str, "").replace(src_name, "").strip(" -｜|—")
+    if len(rem) > 28 and not is_paywall:
+        return True, rem[:150]
+    if is_paywall:
+        return False, "僅憑標題判斷（該外媒屬付費牆來源，RSS 未開放全文）"
+    return False, "僅憑標題判斷（Google News 轉址未附帶內文摘要）"
+
+def _judge_priced_in(cluster_id, title_txt, sox_pct, tsm_pct, sp_pct):
+    """對照隔夜費半、TSM ADR 與標普走勢，判斷該事件是否已反映於隔夜價格"""
+    t = title_txt
+    bull_words = ["大漲", "創高", "優於預期", "買超", "利多", "上調", "強勁", "成長", "rally", "surge", "beat", "gain"]
+    bear_words = ["大跌", "重挫", "低於預期", "賣超", "利空", "下修", "管制", "關稅", "通膨升溫", "drop", "fall", "miss", "tariff", "curb"]
+    is_bull_news = any(w in t.lower() for w in bull_words)
+    is_bear_news = any(w in t.lower() for w in bear_words)
+
+    ref_move = 0.5 * sox_pct + 0.5 * tsm_pct if cluster_id in ("tsmc_semi", "nvda_ai") else sp_pct
+    if is_bull_news and ref_move >= 0.6:
+        return "📌 已反映", f"隔夜費半 ({sox_pct:+.2f}%) 與 TSM ({tsm_pct:+.2f}%) 已先行上漲吸收此利多，台股開盤跳空即反映，盤中不宜重複追高。"
+    if is_bear_news and ref_move <= -0.6:
+        return "📌 已反映", f"隔夜費半 ({sox_pct:+.2f}%) 與 TSM ({tsm_pct:+.2f}%) 已先行下跌反應此消息，將直接體現於台股開盤跳空。"
+    if abs(ref_move) >= 1.2:
+        return "📌 大部分已反映", f"隔夜美股指標波動達 {ref_move:+.2f}%，價格已高度吸收美股盤中資訊，早盤重點在於開盤後現貨承接力道。"
+    return "🔥 尚未完全反映", f"隔夜美股相關指標變動僅 {ref_move:+.2f}%（或消息發布於美股盤後/亞太時段），需觀察今日台股開盤後外資與投信現貨的實際反應。"
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_whitelist_news():
-    def _is_blacklisted(u, t, s): return any(b in f"{u} {t} {s}".lower() for b in NEWS_BLACKLIST)
-    collected, seen = [], set()
+def fetch_and_select_top5_news(window_hours, sox_pct, tsm_pct, nvda_pct, sp_pct):
+    """
+    第五節挑選步驟：
+    1. 抓 RSS，只留白名單網域，排除黑名單與無效連結
+    2. 把講同一件事的報導歸成一群，被多家來源報導的事件排前面
+    3. 選出對下一個交易日台股與 00631L 最重要的 5 則新聞
+    4. 每則標註「已反映」或「尚未反映」，並誠實標明「含摘要」或「僅憑標題判斷」
+    """
+    days_param = max(2, math.ceil(window_hours / 24.0) + 1)
+    candidates = []
+    seen_titles = set()
+    headers = {"User-Agent": "Mozilla/5.0"}
+
     for src in NEWS_WHITELIST:
-        dom, lang = src["domain"], src["lang"]
-        q_str = f"site:{dom} (台股 OR 台積電 OR 費半 OR 輝達 OR 聯準會 OR 外資) when:{NEWS_DAYS}d" if lang == "zh" else f"site:{dom} (TSMC OR NVIDIA OR semiconductor OR Fed OR Taiwan) when:{NEWS_DAYS}d"
-        rss_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(q_str)}&hl={'zh-TW' if lang=='zh' else 'en-US'}&gl={'TW' if lang=='zh' else 'US'}"
+        dom = src["domain"]
+        lang = src["lang"]
+        if lang == "zh":
+            q_str = f"site:{dom} (台股 OR 台積電 OR 費半 OR 輝達 OR 聯準會 OR 外資 OR 半導體) when:{days_param}d"
+            rss_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(q_str)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+        else:
+            q_str = f"site:{dom} (TSMC OR NVIDIA OR semiconductor OR Fed OR Taiwan) when:{days_param}d"
+            rss_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(q_str)}&hl=en-US&gl=US&ceid=US:en"
+
         try:
-            r = requests.get(rss_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-            if r.status_code != 200: continue
+            r = requests.get(rss_url, headers=headers, timeout=5)
+            if r.status_code != 200:
+                continue
             root = ET.fromstring(r.content)
             cnt = 0
             for item in root.findall(".//item"):
-                if cnt >= NEWS_PER_SOURCE: break
-                raw_t, link, desc, pub, src_el = item.find("title"), item.find("link"), item.find("description"), item.find("pubDate"), item.find("source")
+                if cnt >= 3:
+                    break
+                raw_t = item.find("title")
+                link_el = item.find("link")
+                desc_el = item.find("description")
+                pub_el = item.find("pubDate")
                 title = re.sub(r"\s*-\s*[^-]+$", "", raw_t.text if raw_t is not None else "").strip()
-                if not title or len(title) < 8 or title in seen or _is_blacklisted(link.text if link is not None else "", title, src_el.attrib.get("url", "") if src_el is not None else ""): continue
-                clean_desc = re.sub(r"\s+", " ", re.sub(r"&[a-zA-Z0-9#]+;", " ", re.sub(r"<[^>]+>", " ", desc.text if desc is not None and desc.text else ""))).strip()
-                rem_txt = clean_desc.replace(title, "").replace(src["name"], "").strip()
-                has_body = len(rem_txt) > 25
-                seen.add(title)
+                link = (link_el.text if link_el is not None else "").strip()
+                if not title or len(title) < 8 or not link or title in seen_titles:
+                    continue
+                if any(b in f"{link} {title}".lower() for b in NEWS_BLACKLIST):
+                    continue
+
+                cid, cname = _assign_topic_cluster(title)
+                has_body, snip = _try_extract_article_snippet(
+                    link, desc_el.text if desc_el is not None else "", title, src["name"], src["paywall"]
+                )
+                seen_titles.add(title)
                 cnt += 1
-                collected.append({
-                    "source": src["name"], "domain": dom, "title": title,
-                    "url": link.text if link is not None else "",
-                    "pub": (pub.text if pub is not None else "")[:16],
+                candidates.append({
+                    "source": src["name"],
+                    "domain": dom,
+                    "title": title,
+                    "url": link,
+                    "pub": (pub_el.text if pub_el is not None else "")[:16],
+                    "cluster_id": cid,
+                    "cluster_name": cname,
                     "has_body": has_body,
-                    "snippet": rem_txt[:140] if has_body else "（此來源僅提供標題，無內文摘要）"
+                    "snippet": snip,
                 })
         except Exception:
             continue
-    return collected
 
-@st.cache_data(ttl=1200, show_spinner=False)
-def build_master_feature_table():
-    tw = load_daily(INDEX_TICKER, "3y").copy()
-    sox = load_daily("^SOX", "3y").copy()
-    tsm = load_daily("TSM", "3y").copy()
-    nvda = load_daily("NVDA", "3y").copy()
-    sp = load_daily("^GSPC", "3y").copy()
-    vix = load_daily("^VIX", "3y").copy()
-    tnx = load_daily("^TNX", "3y").copy()
-    fx = load_daily("USDTWD=X", "3y").copy()
-    s2330 = load_daily("2330.TW", "3y").copy()
+    # 依主題歸群（計算同一事件群被幾家白名單媒體報導）
+    clusters = {}
+    for c in candidates:
+        cid = c["cluster_id"]
+        clusters.setdefault(cid, []).append(c)
 
-    if tw.empty or len(tw) < 200: return pd.DataFrame()
+    # 先從報導家數最多的群各取代表性最高（優先有摘要者）的新聞，湊滿 5 則
+    sorted_cids = sorted(clusters.keys(), key=lambda k: (len(clusters[k]), k != "general_mkt"), reverse=True)
+    selected = []
+    used_urls = set()
 
-    tw["date"] = pd.DatetimeIndex(tw.index).tz_localize(None).date
-    tw["PrevClose"] = tw["Close"].shift(1)
-    tw["PrevOpen"] = tw["Open"].shift(1)
-    tw["PrevHigh"] = tw["High"].shift(1)
-    tw["PrevLow"] = tw["Low"].shift(1)
-    tw["PrevHL"] = (tw["PrevHigh"] - tw["PrevLow"]).fillna(0.0)
+    for cid in sorted_cids:
+        group = sorted(clusters[cid], key=lambda x: x["has_body"], reverse=True)
+        rep = group[0]
+        other_sources = sorted(list({x["source"] for x in group}))
+        priced_tag, priced_reason = _judge_priced_in(cid, rep["title"], sox_pct, tsm_pct, sp_pct)
+        dev_txt = (
+            f"【{rep['cluster_name']}｜共 {len(other_sources)} 家白名單媒體報導（{', '.join(other_sources)}）】"
+            f"{rep['snippet']}"
+        )
+        imp_txt = (
+            f"{priced_reason} 對 00631L 而言，臺灣 50 權值股（台積電、鴻海、聯發科、廣達）將直接受此事件與隔夜 ADR ({tsm_pct:+.2f}%) 連動。"
+        )
+        selected.append({
+            **rep,
+            "source_count": len(other_sources),
+            "all_sources": ", ".join(other_sources),
+            "priced_tag": priced_tag,
+            "dev": dev_txt,
+            "imp": imp_txt,
+        })
+        used_urls.add(rep["url"])
+        if len(selected) >= 5:
+            break
 
-    tw["tw_prev_pct"] = (tw["PrevClose"] / tw["Close"].shift(2) - 1.0) * 100.0
-    tw["prev_intra"] = (tw["PrevClose"] / tw["PrevOpen"] - 1.0) * 100.0
-    hl_range = (tw["PrevHigh"] - tw["PrevLow"]).replace(0, np.nan)
-    tw["prev_clv"] = (((tw["PrevClose"] - tw["PrevLow"]) / hl_range - 0.5) * 2.0).fillna(0.0)
-    tw["prev_hl_pct"] = (hl_range / tw["PrevClose"] * 100.0).fillna(1.0)
+    # 若主題群不足 5 個，從剩餘候選補齊至 5 則（若實際抓不到 5 則就誠實呈現抓到的數量，絕不偽造假新聞）
+    for c in candidates:
+        if len(selected) >= 5:
+            break
+        if c["url"] not in used_urls:
+            cid = c["cluster_id"]
+            priced_tag, priced_reason = _judge_priced_in(cid, c["title"], sox_pct, tsm_pct, sp_pct)
+            selected.append({
+                **c,
+                "source_count": 1,
+                "all_sources": c["source"],
+                "priced_tag": priced_tag,
+                "dev": f"【{c['source']}（{c['domain']}）】{c['snippet']}",
+                "imp": f"{priced_reason}",
+            })
+            used_urls.add(c["url"])
 
-    body_top = np.maximum(tw["PrevOpen"], tw["PrevClose"])
-    body_bot = np.minimum(tw["PrevOpen"], tw["PrevClose"])
-    tw["wick_diff"] = ((tw["PrevHigh"] - body_top) - (body_bot - tw["PrevLow"])) / tw["PrevClose"] * 100.0
+    return selected[:5]
 
-    for p in (5, 10, 20):
-        ma_prev = tw["Close"].rolling(p).mean().shift(1)
-        tw[f"ma{p}_prev"] = ma_prev
-        tw[f"bias{p}"] = (tw["PrevClose"] / ma_prev - 1.0) * 100.0
-
-    tw["ma5_slope"] = (tw["ma5_prev"] / tw["Close"].rolling(5).mean().shift(2) - 1.0) * 100.0
-    delta_c = tw["Close"].shift(1).diff()
-    gain = delta_c.clip(lower=0).rolling(5).mean()
-    loss = (-delta_c.clip(upper=0)).rolling(5).mean().replace(0, 1e-4)
-    tw["rsi5_z"] = (((100.0 - 100.0 / (1.0 + gain / loss)) - 50.0) / 25.0).fillna(0.0)
-
-    def _align_us_series(us_df, mode="pct"):
-        if us_df is None or us_df.empty: return pd.Series(0.0, index=tw.index)
-        idx_dates = pd.DatetimeIndex(us_df.index).tz_localize(None).date
-        s_raw = pd.Series(us_df["Close"].pct_change().values * 100.0, index=idx_dates) if mode == "pct" else pd.Series(us_df["Close"].values, index=idx_dates)
-        s_raw = s_raw[~s_raw.index.duplicated(keep="last")]
-        mapped = []
-        for d_tw in tw["date"]:
-            val = 0.0
-            for offset in range(1, 6):
-                d_us = d_tw - timedelta(days=offset)
-                if d_us in s_raw and pd.notna(s_raw[d_us]):
-                    val = float(s_raw[d_us])
-                    break
-            mapped.append(val)
-        return pd.Series(mapped, index=tw.index)
-
-    tw["sox_pct"] = _align_us_series(sox, "pct")
-    tw["tsm_pct"] = _align_us_series(tsm, "pct")
-    tw["nvda_pct"] = _align_us_series(nvda, "pct")
-    tw["sp_pct"] = _align_us_series(sp, "pct")
-    tw["vix_pct"] = _align_us_series(vix, "pct")
-    tw["vix_close"] = _align_us_series(vix, "close")
-    tw["tnx_close"] = _align_us_series(tnx, "close")
-    tw["tnx_pct"] = _align_us_series(tnx, "pct")
-    tw["fx_close"] = _align_us_series(fx, "close")
-    tw["fx_pct"] = _align_us_series(fx, "pct")
-    tw["tsm_close"] = _align_us_series(tsm, "close")
-
-    if not s2330.empty:
-        s2330_d = pd.Series(s2330["Close"].values, index=pd.DatetimeIndex(s2330.index).tz_localize(None).date)
-        s2330_d = s2330_d[~s2330_d.index.duplicated(keep="last")]
-        c2330_prev = []
-        for d_tw in tw["date"]:
-            v2330 = np.nan
-            for off in range(1, 6):
-                d_p = d_tw - timedelta(days=off)
-                if d_p in s2330_d and pd.notna(s2330_d[d_p]):
-                    v2330 = float(s2330_d[d_p])
-                    break
-            c2330_prev.append(v2330)
-        tw["c2330_prev"] = c2330_prev
-        tw["adr_prem"] = (((tw["tsm_close"] * tw["fx_close"] / 5.0) / tw["c2330_prev"] - 1.0) * 100.0).fillna(15.0)
-    else:
-        tw["adr_prem"] = 15.0
-
-    tw["us_tech_avg"] = 0.5 * tw["tsm_pct"] + 0.5 * tw["sox_pct"]
-    tw["lead_lag"] = tw["us_tech_avg"] - 0.65 * tw["tw_prev_pct"]
-    tw["tsm_x_bias5"] = tw["tsm_pct"] * tw["bias5"]
-    tw["sox_x_clv"] = tw["sox_pct"] * tw["prev_clv"]
-    tw["gap_reversal_risk"] = tw["us_tech_avg"] * np.maximum(0.0, tw["bias5"])
-
-    tw["ActualGapPct"] = (tw["Open"] / tw["PrevClose"] - 1.0) * 100.0
-    tw["ActualIntraPct"] = (tw["Close"] / tw["Open"] - 1.0) * 100.0
-    tw["ActualDayPct"] = (tw["Close"] / tw["PrevClose"] - 1.0) * 100.0
-
-    return tw.dropna(subset=["PrevClose", "ma20_prev", "Open", "Close"]).copy().reset_index(drop=True)
-
-@st.cache_data(ttl=1200, show_spinner=False)
-def run_walk_forward_system():
-    df = build_master_feature_table()
-    if df.empty or len(df) <= MIN_TRAIN + 15: return None
-    X, gap, intra, sidx = prep(df, FEATURE_COLS)
-    df["ActualState"] = [FOUR_STATES[i] for i in sidx]
-    N = len(df)
-    w2_mask = (df["date"] >= date(2026, 11, 9)) & (df["date"] <= date(2026, 11, 13))
-    w1_mask = (df["date"] >= date(2026, 11, 2)) & (df["date"] <= date(2026, 11, 6))
-    w2_indices = [int(i) for i in np.where(w2_mask)[0] if i >= MIN_TRAIN]
-    w1_indices = [int(i) for i in np.where(w1_mask)[0] if i >= MIN_TRAIN]
-    if len(w2_indices) < 3: w2_indices = list(range(max(MIN_TRAIN, N - 5), N))
-    if len(w1_indices) < 3:
-        end_w1 = w2_indices[0] if w2_indices else N - 5
-        w1_indices = list(range(max(MIN_TRAIN, end_w1 - 5), end_w1))
-    tune_end = min(w1_indices[0] if w1_indices else N - 10, N - 10)
-    cols_all = list(range(len(FEATURE_COLS)))
-    master_lam, master_hl = tune(X, gap, intra, sidx, tune_end, cols_all, span=60)
-    agent_params = {}
-    for ag in AI_AGENTS:
-        aid = ag["id"]
-        sub_cols = [FEATURE_COLS.index(c) for c in AGENT_SUBSPACES[aid]]
-        ag_lam, ag_hl = tune(X, gap, intra, sidx, tune_end, sub_cols, span=60)
-        agent_params[aid] = {"cols": sub_cols, "lam": ag_lam, "hl": ag_hl}
-    oos60_start = max(MIN_TRAIN, N - 60)
-    oos60_idxs = list(range(oos60_start, N))
-    lam60, hl60 = tune(X, gap, intra, sidx, oos60_start, cols_all, span=50)
-    eval_60 = evaluate(X, gap, intra, sidx, oos60_idxs, cols_all, lam60, hl60)
-    eval_w1 = evaluate(X, gap, intra, sidx, w1_indices, cols_all, master_lam, master_hl)
-    eval_w2 = evaluate(X, gap, intra, sidx, w2_indices, cols_all, master_lam, master_hl)
-    return {
-        "df": df, "X": X, "gap": gap, "intra": intra, "sidx": sidx,
-        "cols_all": cols_all, "master_lam": master_lam, "master_hl": master_hl,
-        "agent_params": agent_params, "w1_indices": w1_indices, "w2_indices": w2_indices,
-        "eval_60": eval_60, "eval_w1": eval_w1, "eval_w2": eval_w2
-    }
-
-def _try_call_openai_committee(agent, prompt):
+# ───────────────────────── 第六節 & 第二節：兩輪委員辯論與主持人決策樹生成 ─────────────────────────
+def _call_openai_json(prompt):
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
-        try: api_key = str(st.secrets.get("OPENAI_API_KEY", "")).strip()
-        except Exception: api_key = ""
-    if not api_key: return None, None
+        try:
+            api_key = str(st.secrets.get("OPENAI_API_KEY", "")).strip()
+        except Exception:
+            api_key = ""
+    if not api_key:
+        return None, None
     try:
         resp = requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}"},
-            json={"model": agent["model_id"], "response_format": {"type": "json_object"}, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3},
-            timeout=16
+            json={
+                "model": DEFAULT_OPENAI_MODEL,
+                "response_format": {"type": "json_object"},
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2
+            },
+            timeout=22
         )
         if resp.status_code == 200:
             r = resp.json()
-            return json.loads(r["choices"][0]["message"]["content"]), r.get("model", agent["model_id"])
+            return json.loads(r["choices"][0]["message"]["content"]), r.get("model", DEFAULT_OPENAI_MODEL)
     except Exception:
         pass
     return None, None
 
-def build_committee_speeches(wf_sys, t_idx, flow_info, headlines, night_info, oi_pcr_info, nav_info):
-    df, X, gap, intra = wf_sys["df"], wf_sys["X"], wf_sys["gap"], wf_sys["intra"]
-    row = df.iloc[t_idx]
-    lo, hi = _train_slice(t_idx)
-    tw_close, tw_pct = float(row["PrevClose"]), float(row["tw_prev_pct"])
-    tw_ma5, tw_ma10, tw_ma20 = float(row["ma5_prev"]), float(row["ma10_prev"]), float(row["ma20_prev"])
-    bias_5ma, bias_20ma = float(row["bias5"]), float(row["bias20"])
-    sox_pct, tsm_pct, nvda_pct, sp_pct = float(row["sox_pct"]), float(row["tsm_pct"]), float(row["nvda_pct"]), float(row["sp_pct"])
-    fx_close, tnx_close, adr_prem = float(row["fx_close"]), float(row["tnx_close"]), float(row["adr_prem"])
-    f_net, t_net, z_net = flow_info["f1"], flow_info["t1"], flow_info["z1"]
-    n_total_news = len(headlines)
-    n_body_news = sum(1 for h in headlines if h.get("has_body"))
-    n_title_only = n_total_news - n_body_news
+def generate_two_round_meeting_and_tree(briefing):
+    """
+    嚴格依據簡報事實卡生成：
+    - 第一輪：四位委員（基本面、產業面、技術面、籌碼面）依 5 點固定格式發言（無固定分數門檻，完全由因果鏈推導）
+    - 第二輪：四位委員互相質疑（每人反駁另一人的一個因果環節，並說明是否修正立場）
+    - 主持人結論：共識、分歧所在的因果環節、今日關鍵變數、「如果…就…」00631L 條件式決策樹
+    """
+    us = briefing["us"]
+    flow = briefing["flow"]
+    margin = briefing["margin"]
+    oi_pcr = briefing["oi_pcr"]
+    nav = briefing["nav"]
+    tw_card = briefing["tw_card"]
+    etf_card = briefing["etf_card"]
+    news_list = briefing["news_list"]
 
-    speeches = []
-    for idx, ag in enumerate(AI_AGENTS):
-        aid = ag["id"]
-        cfg = wf_sys["agent_params"][aid]
-        sub_cols, lam, hl = cfg["cols"], cfg["lam"], cfg["hl"]
-        p_arr, (pg, pu, pd_), z_t, (bg, bu, bd) = fit_predict_detail(X, gap, intra, t_idx, sub_cols, lam, hl)
-        probs = {FOUR_STATES[i]: round(float(p_arr[i]) * 100.0, 1) for i in range(4)}
-        top_idx = int(p_arr.argmax())
-        v_state = FOUR_STATES[top_idx]
-        conf = int(min(95, max(52, round(probs[v_state] * 1.4 + 15))))
-        pos_g, neg_g = _top_feature_drivers(z_t, bg, sub_cols, top_k=2)
-        b_intra = bu if pg >= 0.5 else bd
-        pos_i, neg_i = _top_feature_drivers(z_t, b_intra, sub_cols, top_k=2)
-        pos_str = "、".join(f"{n}(貢獻{cv:+.2f})" for n, cv, _ in pos_g + pos_i) or "常數基準項"
-        neg_str = "、".join(f"{n}(貢獻{cv:+.2f})" for n, cv, _ in neg_g + neg_i) or "無顯著壓抑"
+    sp_pct = us["sp_pct"]
+    sox_pct = us["sox_pct"]
+    tsm_pct = us["tsm_pct"]
+    nvda_pct = us["nvda_pct"]
+    vix_close = us["vix_close"]
+    vix_pct = us["vix_pct"]
+    tnx_close = us["tnx_close"]
+    fx_close = us["fx_close"]
+    fx_pct = us["fx_pct"]
+    adr_prem = us["adr_prem"]
 
-        if aid == "technical":
-            evs = [
-                {"title": f"【技術面事實卡】昨收 {tw_close:,.2f} ({tw_pct:+.2f}%)｜5MA {tw_ma5:,.2f} (乖離 {bias_5ma:+.2f}%)｜20MA {tw_ma20:,.2f}", "url": _gnews_url("台股 加權指數 均線 技術分析"), "dev": f"不談新聞，僅看價格結構：前日收盤強弱指標 CLV 為 {float(row['prev_clv']):+.2f}，前日高低振幅 {float(row['prev_hl_pct']):.2f}%，5MA 斜率 {float(row['ma5_slope']):+.2f}%。", "imp": f"條件式關鍵價位：上方短壓/多空分水嶺看 5MA ({tw_ma5:,.0f})，波段支撐看 10MA ({tw_ma10:,.0f})。台指期夜盤狀態：{night_info['label']}。"},
-                {"title": f"【純技術 Walk-Forward 機率】P(跳空開高)={pg*100:.1f}% ｜ P(收≥開|高)={pu*100:.1f}% ｜ P(收≥開|低)={pd_*100:.1f}%", "url": _gnews_url("00631L 均線 突破 策略"), "dev": f"僅使用 [{lo}, {hi}) 歷史價格與均線特徵訓練（λ={lam:g}, hl={hl:g}），正向技術動能：{pos_str}；負向技術阻力：{neg_str}。", "imp": f"00631L 進出場條件嚴格綁定 5 分 K 站穩 5MA×1.04 強勢線或跌破 5MA×0.98 出場線，技術面四態最高機率為「{v_state}（{probs[v_state]:.1f}%）」。"}
-            ]
-            news_v = f"【純技術趨勢與價位（不談新聞）】指數與 5MA 乖離 {bias_5ma:+.2f}%、與 20MA 乖離 {bias_20ma:+.2f}%，5 日標準化 RSI 位階為 {float(row['rsi5_z']):+.2f}。"
-            chip_v = f"【期貨與價差事實卡】台指期夜盤：{night_info['label']}｜外資台指期未平倉：{oi_pcr_info['fx_label']}｜選擇權 P/C Ratio：{oi_pcr_info['pcr_label']}。"
-            reason_txt = f"不引用任何新聞，純依均線位階、前日 CLV ({float(row['prev_clv']):+.2f}) 與三階段條件機率分解，判定今日最可能走勢為【{v_state}】（機率 {probs[v_state]:.1f}%）。"
-        elif aid == "news":
-            top_news = headlines[:2]
-            evs = []
-            for h in top_news:
-                evs.append({"title": f"【白名單：{h['source']}】{h['title']}", "url": h["url"], "dev": f"來源網域：{h['domain']}（{h['pub']}）｜內文狀態：{h['snippet']}", "imp": f"配合隔夜費半 {sox_pct:+.2f}%、TSM ADR {tsm_pct:+.2f}%（溢價 {adr_prem:+.2f}%）、S&P 500 {sp_pct:+.2f}%，傳導至今日開盤跳空機率 P(開高)={pg*100:.1f}%。"})
-            if not evs:
-                evs.append({"title": "【資訊不足聲明】目前白名單新聞源未抓到足夠標題", "url": _gnews_url("台股 美股 費城半導體"), "dev": "白名單過濾器目前無符合條件之新聞，嚴格遵守委員會規範明說「新聞標題資訊不足」，僅依隔夜美股收盤數字定價。", "imp": f"隔夜費半 {sox_pct:+.2f}%、TSM {tsm_pct:+.2f}%、10Y美債 {tnx_close:.2f}%、台幣 {fx_close:.2f}。"})
-            limit_note = f"（⚠️ 誠實聲明：本次白名單共抓到 {n_total_news} 則新聞，其中 {n_title_only} 則因轉址或付費牆僅有標題無本文，資訊深度受限，不宜過度延伸）" if n_title_only > 0 or n_total_news < 3 else f"（本次白名單共檢索 {n_total_news} 則新聞，已排除 PTT/Dcard 等黑名單農場）"
-            news_v = f"【白名單新聞與國際總經】{limit_note} 隔夜費半 {sox_pct:+.2f}%、TSM {tsm_pct:+.2f}%、NVDA {nvda_pct:+.2f}%、S&P {sp_pct:+.2f}%。"
-            chip_v = f"【跨國資金面】外資現貨昨 {f_net:+.1f} 億（5日 {flow_info['f5']:+.1f} 億）、投信昨 {t_net:+.1f} 億（5日 {flow_info['t5']:+.1f} 億），台幣匯率 {fx_close:.2f}。"
-            reason_txt = f"綜合白名單新聞標題與隔夜美股資金面傳導（{limit_note}），消息面模型評估今日以【{v_state}】（{probs[v_state]:.1f}%）機率最高。"
-        elif aid == "risk":
-            evs = [
-                {"title": f"【00631L 槓桿耗損與折溢價檢核】{nav_info['label']}｜VIX 恐慌指數 {float(row['vix_close']):.2f} ({float(row['vix_pct']):+.2f}%)", "url": _gnews_url("00631L 折溢價 淨值 槓桿耗損"), "dev": f"00631L 最新淨值狀態：{nav_info['label']}。兩倍槓桿 ETF 具有每日重設特性，在反覆震盪盤中會產生波動率耗損（Volatility Drag）。", "imp": f"若 00631L 溢價過大（>0.5%）時於早盤追高，一旦盤中轉為走低，將同時承受「指數回檔 × 2 倍槓桿 + 溢價收斂」雙重傷害。"},
-                {"title": f"【最壞情境與停損防線】5MA 乖離 {bias_5ma:+.2f}%｜20MA 乖離 {bias_20ma:+.2f}%｜高檔反轉風險 {float(row['gap_reversal_risk']):+.2f}", "url": _gnews_url("台股 乖離過大 停損 風險控管"), "dev": f"站在最壞情境檢視：今日出現「開高走低」機率為 {probs['開高走低']:.1f}%、「開低走低」機率為 {probs['開低走低']:.1f}%（合計收黑K風險達 {probs['開高走低']+probs['開低走低']:.1f}%）。", "imp": f"負向壓抑因子：{neg_str}。進場前必須先確認第二頁「策略 B」之 3% 硬停損與 5MA×0.98 出場線位置。"}
-            ]
-            news_v = f"【最壞情境波動檢核】VIX 位於 {float(row['vix_close']):.2f}，前日台股高低振幅 {float(row['prev_hl_pct']):.2f}%，5MA 乖離 {bias_5ma:+.2f}%。"
-            chip_v = f"【00631L 再平衡耗損與避險】00631L 狀態：{nav_info['label']}｜外資期貨OI：{oi_pcr_info['fx_label']}｜自營商 5 日累積 {flow_info['z5']:+.1f} 億。"
-            reason_txt = f"站在最壞情境，考量 00631L 兩倍槓桿震盪耗損、折溢價（{nav_info['label']}）與均線乖離風險，風控模型指向【{v_state}】（{probs[v_state]:.1f}%）。"
-        else:
-            evs = [
-                {"title": f"【反方挑刺一：跨日基差與假突破陷阱】昨台股 {tw_pct:+.2f}% vs 隔夜費半 {sox_pct:+.2f}%、TSM {tsm_pct:+.2f}%", "url": _gnews_url("台股 利多出盡 開高走低 外資提款"), "dev": f"台美跨日領先落後基差為 {float(row['lead_lag']):+.2f}%。市場看到隔夜美股收紅就一面倒看多時，往往忽略台股前一日可能已經提前反應。", "imp": f"若現在貿然在 09:00 追價進場，最可能出錯的理由就是遭遇「開高走低（機率 {probs['開高走低']:.1f}%）」或假突破洗盤。"},
-                {"title": f"【反方挑刺二：籌碼背離盲點】外資現貨昨 {f_net:+.1f} 億 vs 外資台指期未平倉 {oi_pcr_info['fx_label']}", "url": _gnews_url("外資 期貨空單 現貨買超 背離"), "dev": f"外資單日現貨買賣超 {f_net:+.1f} 億（10日累積 {flow_info['f10']:+.1f} 億），但期貨未平倉為 {oi_pcr_info['fx_label']}，選擇權 P/C Ratio 為 {oi_pcr_info['pcr_label']}。", "imp": f"反向檢核模型（λ={lam:g}, hl={hl:g}）顯示，扣除多頭同溫層偏誤後，最需防範的真實狀態為「{v_state}（{probs[v_state]:.1f}%）」。"}
-            ]
-            news_v = f"【現在進場最可能出錯的理由】隔夜美股漲跌在 09:00 開盤跳空瞬間就已定價完畢（P(開高)={pg*100:.1f}%），開盤後追價等於承擔別人隔夜獲利的風險。"
-            chip_v = f"【籌碼背離盲點】外資 5 日現貨 {flow_info['f5']:+.1f} 億 vs 期貨未平倉 {oi_pcr_info['fx_label']}，前日上下影線差 {float(row['wick_diff']):+.2f}%。"
-            reason_txt = f"專挑主流共識盲點：為避免在早盤情緒高點買單，反方模型經跨日基差與影線賣壓校準後，判定今日最可能出現的反轉或震盪狀態為【{v_state}】。"
+    f1, f5 = flow["f1"], flow["f5"]
+    t1, t5 = flow["t1"], flow["t5"]
+    z1 = flow["z1"]
 
-        llm_prompt = (
-            f"你是台股投研委員會的「{ag['name']}」，職責：{ag['role']}\n"
-            f"無洩漏 Walk-Forward 模型算出：P(跳空開高)={pg*100:.1f}%，P(收>=開|高)={pu*100:.1f}%，P(收>=開|低)={pd_*100:.1f}%，四態機率：{json.dumps(probs, ensure_ascii=False)}，最高為「{v_state}」。\n"
-            f"盤前事實：昨台股 {tw_pct:+.2f}% (5MA乖離 {bias_5ma:+.2f}%)，隔夜費半 {sox_pct:+.2f}%、TSM {tsm_pct:+.2f}%；夜盤：{night_info['label']}；外資期貨OI：{oi_pcr_info['fx_label']}；P/C比：{oi_pcr_info['pcr_label']}；00631L：{nav_info['label']}。\n"
-            "請嚴格依你的角色職責回傳 JSON：{\"news_view\": \"60字內角色專屬視角分析\", \"chip_view\": \"60字內角色專屬籌碼/風控檢核\", \"reason\": \"80字內說明為何表態該四態與對00631L的具體建議\"}"
-        )
-        llm_json, actual_mod = _try_call_openai_committee(ag, llm_prompt)
-        if llm_json and isinstance(llm_json.get("reason"), str) and len(llm_json["reason"]) > 10:
-            news_v = llm_json.get("news_view") or news_v
-            chip_v = llm_json.get("chip_view") or chip_v
-            reason_txt = llm_json["reason"]
-            engine_badge = f"🟢 OpenAI ({actual_mod}) + Walk-Forward"
-        else:
-            engine_badge = f"📐 Walk-Forward 脊邏輯斯 (λ={lam:g}, hl={hl:g})"
+    n1_ref = f"新聞 #1（{news_list[0]['source']}：{news_list[0]['title'][:22]}…）" if len(news_list) >= 1 else "簡報國際盤勢項目"
+    n2_ref = f"新聞 #2（{news_list[1]['source']}：{news_list[1]['title'][:22]}…）" if len(news_list) >= 2 else n1_ref
 
-        speeches.append({**ag, "engine_badge": engine_badge, "events": evs, "news_view": news_v, "chip_view": chip_v, "reason": reason_txt, "vote": v_state, "probs": probs, "pg": pg, "pu": pu, "pd": pd_, "confidence": conf, "time": f"08:30:{12 + idx * 9:02d}"})
-    return speeches
+    # ─── 1. 基本面委員（第一輪） ───
+    if sp_pct > 0.3 and vix_pct <= 0 and fx_pct <= 0.15:
+        f_stance = "偏多"
+        f_conf = "中（美股標普收紅且 VIX 回落，但總經利率與匯率對單日盤中走勢屬背景支撐而非絕對主導）"
+    elif sp_pct < -0.4 or vix_pct > 5.0 or fx_pct > 0.25:
+        f_stance = "偏空"
+        f_conf = "中偏高（VIX 恐慌指數或匯率貶值壓力升溫，跨國資金風險偏好收縮）"
+    else:
+        f_stance = "觀望"
+        f_conf = "中（總經指標多空交錯，美債殖利率與匯率未出現單邊極端變化）"
 
-def build_chatroom_html(target_d, prev_d, trading_status_str, row, flow_info, night_info, oi_pcr_info, nav_info, headlines, speeches, master_probs, master_decomp, master_top, base_st_name, eval_60):
-    tw_close = float(row["PrevClose"])
-    tw_pct = float(row["tw_prev_pct"])
-    tw_hl = float(row["PrevHL"])
-    tw_ma5 = float(row["ma5_prev"])
-    bias5 = float(row["bias5"])
-    sox_pct = float(row["sox_pct"])
-    tsm_pct = float(row["tsm_pct"])
-    nvda_pct = float(row["nvda_pct"])
-    sp_pct = float(row["sp_pct"])
-    vix_close = float(row["vix_close"])
-    fx_close = float(row["fx_close"])
-    adr_prem = float(row["adr_prem"])
-    f_net, t_net, z_net = flow_info["f1"], flow_info["t1"], flow_info["z1"]
-    pg_m, pu_m, pd_m = master_decomp
+    r1_fundamental = {
+        **COMMITTEE_ROLES[0],
+        "stance": f_stance,
+        "confidence": f_conf,
+        "thesis": f"隔夜 S&P 500 變動 {sp_pct:+.2f}%、VIX 收 {vix_close:.2f}（{vix_pct:+.2f}%），搭配 10Y 美債殖利率 {tnx_close:.2f}% 與美元兌台幣 {fx_close:.2f}（{fx_pct:+.2f}%），總經資金環境呈現{f_stance}格局。",
+        "causal_chain": (
+            f"美債 10Y 殖利率報 {tnx_close:.2f}% 且 VIX 變動 {vix_pct:+.2f}% "
+            f"→ 影響跨國機構對新興亞洲匯率（美元兌台幣 {fx_close:.2f}）與大型權值股的風險溢價要求 "
+            f"→ 進而決定今日外資於臺灣 50 成分股是順勢配置或提款，使 00631L 開盤後承受對應的資金推力或壓力。"
+        ),
+        "evidence": f"引自【主持人簡報：費半與美股】之 S&P 500 ({sp_pct:+.2f}%)、VIX ({vix_close:.2f})、10Y 殖利率 ({tnx_close:.2f}%)、美元兌台幣 ({fx_close:.2f})，以及 {n1_ref}。",
+        "advice_flat": f"空手者：觀察早盤台幣匯率是否維持於 {fx_close:.2f} 附近穩定，且 00631L 站穩條件價位 {etf_card['pivot_up']:,.2f} 元再行評估，不於開盤第一刻盲目進場。",
+        "advice_hold": f"持有者：若盤中 00631L 跌破技術面事實卡之第一支撐位 {etf_card[' pivot_dn' if ' pivot_dn' in etf_card else 'pivot_dn']:,.2f} 元（或策略 B 出場線 {etf_card['ma5']*0.98:,.2f} 元）應執行止損減碼。"
+    }
 
-    us_summary = (
-        f"S&P 500 <b style='color:{_col(sp_pct)}'>{sp_pct:+.2f}%</b> ｜ "
-        f"費城半導體 <b style='color:{_col(sox_pct)}'>{sox_pct:+.2f}%</b> ｜ "
-        f"台積電 ADR <b style='color:{_col(tsm_pct)}'>{tsm_pct:+.2f}%</b>（換算溢價 <b>{adr_prem:+.2f}%</b>）｜ "
-        f"NVIDIA <b style='color:{_col(nvda_pct)}'>{nvda_pct:+.2f}%</b> ｜ "
-        f"VIX <b>{vix_close:.2f}</b> ｜ 台幣 <b>{fx_close:.2f}</b>"
+    # ─── 2. 產業面委員（第一輪） ───
+    semi_avg = 0.5 * sox_pct + 0.5 * tsm_pct
+    if semi_avg > 0.4:
+        i_stance = "偏多"
+        i_conf = f"高（費半 {sox_pct:+.2f}% 與台積電 ADR {tsm_pct:+.2f}% 方向明確，且台積電佔臺灣 50 指數權重逾 50%）" if (sox_pct > 0 and tsm_pct > 0) else "中（半導體指標偏多但內部仍有分歧）"
+    elif semi_avg < -0.4:
+        i_stance = "偏空"
+        i_conf = f"高（費半 {sox_pct:+.2f}% 與台積電 ADR {tsm_pct:+.2f}% 同步回檔，直接壓抑臺灣 50 權值股開盤定價）" if (sox_pct < 0 and tsm_pct < 0) else "中（AI 晶片與晶圓代工走勢分歧）"
+    else:
+        i_stance = "觀望"
+        i_conf = "低（隔夜費半與台積電 ADR 漲跌幅收斂，部分新聞受限付費牆僅憑標題判斷，缺乏強烈單邊產業催化劑）"
+
+    r1_industry = {
+        **COMMITTEE_ROLES[1],
+        "stance": i_stance,
+        "confidence": i_conf,
+        "thesis": f"隔夜費城半導體變動 {sox_pct:+.2f}%、台積電 ADR 變動 {tsm_pct:+.2f}%（換算台股溢價率 {adr_prem:+.2f}%）、NVIDIA 變動 {nvda_pct:+.2f}%，直接牽動臺灣 50 電子權值股定價。",
+        "causal_chain": (
+            f"隔夜台積電 ADR 變動 {tsm_pct:+.2f}% 且 NVDA 變動 {nvda_pct:+.2f}% "
+            f"→ 直接傳導至台股 2330（台積電）與 AI 伺服器權值股（鴻海、聯發科、廣達）的 09:00 開盤跳空幅度 "
+            f"→ 因 00631L 追蹤臺灣 50 指數正向 2 倍，半導體權值股跳空 1% 將直接放大為 00631L 約 2% 的早盤波動。"
+        ),
+        "evidence": f"引自【主持人簡報：費半與美股】之費半 ({sox_pct:+.2f}%)、台積電 ADR ({tsm_pct:+.2f}%)、NVDA ({nvda_pct:+.2f}%)，以及 {n1_ref}、{n2_ref}。",
+        "advice_flat": f"空手者：若隔夜新聞標註為「已反映」，代表開盤跳空即吸收 ADR ({tsm_pct:+.2f}%) 漲跌幅，空手切勿在 09:00~09:15 追價，應等 00631L 盤中突破 {etf_card['pivot_up']:,.2f} 元並守穩再考慮。",
+        "advice_hold": f"持有者：以 00631L 前日低點與 5MA 下沿 {etf_card['pivot_dn']:,.2f} 元作為第一道防線，若跌破 {etf_card['sup_1']:,.2f} 元則嚴格止損出場。"
+    }
+
+    # ─── 3. 技術面委員（第一輪） ───
+    tw_above_5 = tw_card["close"] >= tw_card["ma5"]
+    tw_above_20 = tw_card["close"] >= tw_card["ma20"]
+    if tw_above_5 and tw_above_20:
+        t_stance = "偏多"
+        t_conf = f"中偏高（加權指數收 {tw_card['close']:,.2f} 同時位於 5MA {tw_card['ma5']:,.2f} 與 20MA {tw_card['ma20']:,.2f} 之上，成交量為 5 日均量的 {tw_card['vol_ratio']:.2f} 倍）"
+    elif (not tw_above_5) and (not tw_above_20):
+        t_stance = "偏空"
+        t_conf = f"中偏高（加權指數收 {tw_card['close']:,.2f} 同時落於 5MA {tw_card['ma5']:,.2f} 與 20MA {tw_card['ma20']:,.2f} 之下，短中期均線形成上檔反壓）"
+    else:
+        t_stance = "觀望"
+        t_conf = f"中（指數夾在 5MA {tw_card['ma5']:,.2f} 與 20MA {tw_card['ma20']:,.2f} 之間震盪，且 00631L 在震盪區間存在 2 倍槓桿耗損）"
+
+    r1_technical = {
+        **COMMITTEE_ROLES[2],
+        "stance": t_stance,
+        "confidence": t_conf,
+        "thesis": f"加權指數昨收 {tw_card['close']:,.2f}（5MA {tw_card['ma5']:,.2f} / 20MA {tw_card['ma20']:,.2f}），00631L 昨收 {etf_card['close']:,.2f}（5MA {etf_card['ma5']:,.2f} / 20MA {etf_card['ma20']:,.2f}），必須以條件式價位取代主觀猜測。",
+        "causal_chain": (
+            f"加權指數前日高低點為 {tw_card['high']:,.2f} / {tw_card['low']:,.2f}（量比 5 日均量 {tw_card['vol_ratio']:.2f} 倍） "
+            f"→ 決定今日早盤開盤後買賣雙方在 5MA ({tw_card['ma5']:,.2f}) 與整數關卡 ({tw_card['upper_round']:,.0f} / {tw_card['lower_round']:,.0f}) 的換手成敗 "
+            f"→ 若無法站穩條件上沿則易引發短線停利賣壓，放大 00631L 的日內回撤。"
+        ),
+        "evidence": f"引自【技術面事實卡：加權指數】與【技術面事實卡：00631L】之均線位階、前日 K 棒結構、5 日均量比（{tw_card['vol_ratio']:.2f} 倍）與條件式價位。",
+        "advice_flat": f"空手者：若 00631L 開在 {etf_card['pivot_up']:,.2f} 元以上且 5 分 K 守穩，上方看壓力 {etf_card['res_1']:,.2f} 元（策略 B 強勢線為 {etf_card['ma5']*1.04:,.2f} 元）；若開在 {etf_card['pivot_dn']:,.2f} 元以下則觀望不接刀。",
+        "advice_hold": f"持有者：嚴格設定止損位在 {etf_card['pivot_dn']:,.2f} 元（或策略 B 出場線 {etf_card['ma5']*0.98:,.2f} 元），跌破下方支撐 {etf_card['sup_1']:,.2f} 元無條件停損。"
+    }
+
+    # ─── 4. 籌碼面委員（第一輪） ───
+    if f1 > 50 and t1 >= 0:
+        c_stance = "偏多"
+        c_conf = f"中偏高（外資昨日現貨買超 {f1:+.1f} 億、投信 {t1:+.1f} 億，土洋法人現貨同步站在買方）"
+    elif f1 < -50:
+        c_stance = "偏空"
+        c_conf = f"高（外資昨日現貨賣超 {abs(f1):.1f} 億、近 5 日累積 {f5:+.1f} 億，大型權值股面臨外資調節壓力）"
+    else:
+        c_stance = "觀望"
+        c_conf = f"中（外資昨 {f1:+.1f} 億、投信 {t1:+.1f} 億、自營商 {z1:+.1f} 億，法人籌碼力道分歧）"
+
+    r1_chip = {
+        **COMMITTEE_ROLES[3],
+        "stance": c_stance,
+        "confidence": c_conf,
+        "thesis": f"上一交易日外資現貨 {f1:+.1f} 億（近5日 {f5:+.1f} 億）、投信 {t1:+.1f} 億（近5日 {t5:+.1f} 億）、自營商 {z1:+.1f} 億；外資台指期未平倉：{oi_pcr['fx_label']}，選擇權 P/C 比：{oi_pcr['pcr_label']}。",
+        "causal_chain": (
+            f"外資現貨買賣超 {f1:+.1f} 億搭配台指期未平倉（{oi_pcr['fx_label']}）與大盤融資（{margin['label']}） "
+            f"→ 決定開盤跳空後外資在現貨權值股與期貨避險單的順勢或反向調節行為 "
+            f"→ 同時影響 00631L 市價相對淨值的折溢價（{nav['label']}）收斂風險。"
+        ),
+        "evidence": f"引自【主持人簡報：籌碼面】之三大法人買賣超、融資融券（{margin['label']}）、期交所外資未平倉與 P/C 比（{oi_pcr['pcr_label']}）、00631L 折溢價（{nav['label']}）。",
+        "advice_flat": f"空手者：進場前先檢查 00631L 即時折溢價（目前簡報為 {nav['label']}），若溢價超過 +0.5% 絕不追高；需待外資期現貨方向一致且站穩 {etf_card['pivot_up']:,.2f} 元再動作。",
+        "advice_hold": f"持有者：若盤中外資賣壓湧現導致 00631L 跌破 {etf_card['pivot_dn']:,.2f} 元（或策略 B 出場線 {etf_card['ma5']*0.98:,.2f} 元），應立即執行止損。"
+    }
+
+    round1 = [r1_fundamental, r1_industry, r1_technical, r1_chip]
+
+    # ─── 第二輪互相質疑（每人讀完其他三人論點，反駁其中一個，並說明是否修正立場） ───
+    round2 = [
+        {
+            **COMMITTEE_ROLES[0],
+            "target": "產業面委員",
+            "rebuttal": (
+                f"質疑【產業面委員】直接將隔夜費半（{sox_pct:+.2f}%）與台積電 ADR（{tsm_pct:+.2f}%）外推為今日台股全天走勢的因果鏈："
+                f"隔夜 ADR 漲跌幅在早上 09:00 開盤跳空瞬間就會反應完畢（見新聞『已反映/尚未反映』標註），但 09:00 之後的盤中走勢取決於美元兌台幣（{fx_close:.2f}）與亞太盤中資金流向。"
+            ),
+            "stance_change": (
+                f"維持【{f_stance}】但收緊進場條件：若早盤開高幅度已完全反映 ADR ({tsm_pct:+.2f}%)，但盤中台幣轉貶或失守 {etf_card['pivot_up']:,.2f} 元，則由偏多改為觀望。"
+                if f_stance == "偏多" else
+                f"維持【{f_stance}】：因為美債殖利率（{tnx_close:.2f}%）與 VIX（{vix_close:.2f}）顯示跨國資金仍具戒心，單憑產業消息不宜過度樂觀。"
+            )
+        },
+        {
+            **COMMITTEE_ROLES[1],
+            "target": "技術面委員",
+            "rebuttal": (
+                f"質疑【技術面委員】過度依賴昨日靜態均線（加權 5MA {tw_card['ma5']:,.2f}、00631L 5MA {etf_card['ma5']:,.2f}）："
+                f"當隔夜費半（{sox_pct:+.2f}%）與台積電 ADR（{tsm_pct:+.2f}%）出現跳空時，台股開盤往往直接越過前日高點（{tw_card['high']:,.2f}）或跌破前日低點（{tw_card['low']:,.2f}），靜態日均線在早盤前 15 分鐘容易失真。"
+            ),
+            "stance_change": (
+                f"部分修正立場（加入技術防線）：同意若開盤跳空已反映隔夜利多，不能無腦追價；修正為「開盤後觀察 15 分鐘（09:15），確認 00631L 守穩 {etf_card['pivot_up']:,.2f} 元才維持【{i_stance}】，否則退回觀望」。"
+            )
+        },
+        {
+            **COMMITTEE_ROLES[2],
+            "target": "籌碼面委員",
+            "rebuttal": (
+                f"質疑【籌碼面委員】以昨日三大法人買賣超（外資 {f1:+.1f} 億、投信 {t1:+.1f} 億）推論今日盤中買盤："
+                f"法人單日現貨數字是『T-1 日的落後指標』。歷史上常見外資前一日大買、隔天趁美股跳空開高反手出貨（形成開高走低黑K，前日高低振幅已達 {tw_card['high']-tw_card['low']:,.0f} 點）。"
+            ),
+            "stance_change": (
+                f"維持【{t_stance}】並強化價位紀律：昨日籌碼僅供參考，盤中一切以價格事實為準——00631L 守住 {etf_card['pivot_up']:,.2f} 元才算多方有效，跌破 {etf_card['pivot_dn']:,.2f} 元一律視為轉弱止損。"
+            )
+        },
+        {
+            **COMMITTEE_ROLES[3],
+            "target": "基本面委員",
+            "rebuttal": (
+                f"質疑【基本面委員】用 S&P 500（{sp_pct:+.2f}%）與 10Y 殖利率（{tnx_close:.2f}%）推導 00631L 單日表現："
+                f"宏觀利率是長週期變數，對 00631L 今日 2 倍槓桿的極短線殺傷力，遠不如外資台指期未平倉（{oi_pcr['fx_label']}）、融資變化（{margin['label']}）與 00631L 折溢價（{nav['label']}）的直接衝擊。"
+            ),
+            "stance_change": (
+                f"維持【{c_stance}】並補充技術面委員的提醒：承認昨日外資現貨（{f1:+.1f} 億）可能隨隔夜盤勢翻臉，因此將「盤中期貨價差與 00631L 跌破 {etf_card['pivot_dn']:,.2f} 元」列為否決多單的硬性條件。"
+            )
+        },
+    ]
+
+    # ─── 主持人結論：不做票數平均，列出共識、分歧環節、關鍵變數與「如果…就…」決策樹 ───
+    host_conclusion = {
+        "consensus": (
+            f"1. 隔夜美股（費半 {sox_pct:+.2f}%、台積電 ADR {tsm_pct:+.2f}%、NVDA {nvda_pct:+.2f}%）的漲跌力道會在 09:00 開盤跳空時第一時間反映完畢，四位委員一致同意「09:00 開盤第一刻不追價」。\n"
+            f"2. 00631L 為臺灣 50 指數正向 2 倍槓桿（近 5 日實際波動與震盪耗損見技術面事實卡），持有部位必須嚴守明確止損線（{etf_card['pivot_dn']:,.2f} 元與策略 B 出場線 {etf_card['ma5']*0.98:,.2f} 元）。"
+        ),
+        "divergence": (
+            f"核心分歧在於【09:00 開盤跳空後的日內延續性（開高走高 vs 開高走低／開低走高 vs 開低走低）】：\n"
+            f"‧ 產業面委員（{i_stance}）認為半導體隔夜動能（費半 {sox_pct:+.2f}% / TSM {tsm_pct:+.2f}%）將主導權值股方向；\n"
+            f"‧ 但技術面委員（{t_stance}）與籌碼面委員（{c_stance}）指出，昨日外資現貨（{f1:+.1f} 億，5日累積 {f5:+.1f} 億）與加權指數關鍵價位（{tw_card['pivot_up']:,.0f} / {tw_card['pivot_dn']:,.0f}）才是決定 09:15 後買盤是否承接或逢高倒貨的關鍵環節。"
+        ),
+        "key_variables": [
+            f"變數 1（開盤價位定錨）：09:00~09:15 加權指數能否站穩 {tw_card['pivot_up']:,.0f} 點（對應 00631L {etf_card['pivot_up']:,.2f} 元），或跌破 {tw_card['pivot_dn']:,.0f} 點（對應 00631L {etf_card['pivot_dn']:,.2f} 元）。",
+            f"變數 2（權值龍頭與匯率）：台積電現貨開盤反應 ADR（{tsm_pct:+.2f}%）後，第一根与第二根 5 分 K 是否守住開盤價，以及美元兌台幣是否維持於 {fx_close:.2f} 以下。",
+            f"變數 3（ETF 折溢價與期貨）：00631L 盤中即時折溢價率（目前 {nav['label']}）是否過度溢價（> +0.5%），以及外資期貨未平倉（{oi_pcr['fx_label']}）在盤中正逆價差的變化。"
+        ],
+        "decision_tree": [
+            f"🟢 【情境一：順勢偏多／續抱條件】如果今日開盤後 09:15 以前，加權指數守在 {tw_card['pivot_up']:,.0f} 點以上、00631L 5 分 K 守穩 {etf_card['pivot_up']:,.2f} 元（且即時溢價率 ≤ +0.5%），上方壓力看 {etf_card['res_1']:,.2f} 元與 {etf_card['res_2']:,.2f} 元；若進一步突破策略 B 強勢線 {etf_card['ma5']*1.04:,.2f} 元，可依策略 B 規則順勢進場或續抱。",
+            f"🟠 【情境二：開高走低／誘多規避條件】如果早盤因 ADR（{tsm_pct:+.2f}%）跳空開高，但 09:15 後 00631L 跌破開盤第一根 5 分 K 低點或失守 {etf_card['pivot_up']:,.2f} 元，代表隔夜利多「已反映」且遭遇法人逢高調節，空手者一律不買，持有者逢高減碼。",
+            f"🔵 【情境三：開低走高／低檔承接觀察】如果早盤開在 {etf_card['pivot_dn']:,.2f} 元以下，但下檔在第一支撐位 {etf_card['sup_1']:,.2f} 元（對應加權 {tw_card['sup_1']:,.0f} 點）出現長下影線且 09:30 後站回均價線，持有者暫不砍在最低點，空手者維持觀望等收復 5MA（{etf_card['ma5']:,.2f} 元）再議。",
+            f"🔴 【情境四：開低走低／無條件止損條件】如果盤中加權指數跌破 {tw_card['pivot_dn']:,.0f} 點且 00631L 跌破 {etf_card['pivot_dn']:,.2f} 元（或觸及策略 B 出場線 {etf_card['ma5']*0.98:,.2f} 元 / 支撐位 {etf_card['sup_1']:,.2f} 元），空手者絕對不做，持有者無條件執行止損出場。"
+        ]
+    }
+
+    return round1, round2, host_conclusion
+
+# ───────────────────────── 第七節：17:00 復盤紀錄與 6 天滾動存檔管理 ─────────────────────────
+def load_rolling_archive():
+    if os.path.exists(ARCHIVE_FILE):
+        try:
+            with open(ARCHIVE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_rolling_archive(store, valid_6_date_strs):
+    """只保留最近 6 個交易日的紀錄，超過 6 天的舊紀錄自動滾動刪除"""
+    pruned = {k: store[k] for k in valid_6_date_strs if k in store}
+    try:
+        with open(ARCHIVE_FILE, "w", encoding="utf-8") as f:
+            json.dump(pruned, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return pruned
+
+def build_1700_review_record(target_d, now_dt, tw_df, etf_df, briefing, round1, host_conclusion):
+    """
+    【第七節：復盤紀錄（每天下午 5 點準時更新）】
+    檢查該交易日是否已過當日 17:00：
+    - 若尚未到當日 17:00：顯示「今日 17:00 準時更新復盤紀錄」
+    - 若已過當日 17:00（或為過去 6 天內已完成之交易日）：對照當天實際開盤與收盤，檢視早會推理與決策樹品質（絕不調參）。
+    """
+    if target_d == now_dt.date() and now_dt.time() < dtime(17, 0):
+        return {
+            "ready": False,
+            "msg": f"⏳ 復盤紀錄將於今日（{target_d:%Y/%m/%d}）下午 17:00 準時更新存檔。"
+        }
+
+    tw_dts = pd.DatetimeIndex(tw_df.index).tz_localize(None).date
+    etf_dts = pd.DatetimeIndex(etf_df.index).tz_localize(None).date
+    tw_sub = tw_df[tw_dts == target_d]
+    etf_sub = etf_df[etf_dts == target_d]
+
+    if tw_sub.empty or etf_sub.empty:
+        return {"ready": False, "msg": "⏳ 尚待收盤完整資料同步後於 17:00 產生復盤紀錄。"}
+
+    tw_r = tw_sub.iloc[-1]
+    etf_r = etf_sub.iloc[-1]
+    tw_prev_c = briefing["tw_card"]["close"]
+    etf_prev_c = briefing["etf_card"]["close"]
+
+    tw_o, tw_h, tw_l, tw_c = float(tw_r["Open"]), float(tw_r["High"]), float(tw_r["Low"]), float(tw_r["Close"])
+    etf_o, etf_h, etf_l, etf_c = float(etf_r["Open"]), float(etf_r["High"]), float(etf_r["Low"]), float(etf_r["Close"])
+
+    tw_gap = (tw_o / tw_prev_c - 1.0) * 100.0 if tw_prev_c else 0.0
+    tw_intra = (tw_c / tw_o - 1.0) * 100.0 if tw_o else 0.0
+    tw_day = (tw_c / tw_prev_c - 1.0) * 100.0 if tw_prev_c else 0.0
+
+    etf_gap = (etf_o / etf_prev_c - 1.0) * 100.0 if etf_prev_c else 0.0
+    etf_intra = (etf_c / etf_o - 1.0) * 100.0 if etf_o else 0.0
+    etf_day = (etf_c / etf_prev_c - 1.0) * 100.0 if etf_prev_c else 0.0
+
+    state_4 = (
+        "開高走高（跳空續攻紅K）" if (tw_o > tw_prev_c and tw_c >= tw_o) else
+        "開高走低（跳空拉回黑K）" if (tw_o > tw_prev_c and tw_c < tw_o) else
+        "開低走高（開低承接紅K）" if (tw_o <= tw_prev_c and tw_c >= tw_o) else
+        "開低走低（跳空殺低黑K）"
     )
 
-    cards_html = ""
-    for ag in speeches:
-        v_st = ag["vote"]
-        s_meta = STATE_META[v_st]
-        p = ag["probs"]
-        p_bar = "".join(f"<div style='width:{max(p[k], 2)}%;background:{STATE_META[k]['col']}' title='{k}: {p[k]}%'></div>" for k in FOUR_STATES)
-        p_labels = " ｜ ".join(f"<span style='color:{STATE_META[k]['col']}'><b>{k} {p[k]}%</b></span>" for k in FOUR_STATES)
+    p_up = briefing["etf_card"]["pivot_up"]
+    p_dn = briefing["etf_card"]["pivot_dn"]
+    if etf_c >= p_up:
+        tree_hit = f"觸發【情境一（順勢偏多分支）】：00631L 收盤 {etf_c:,.2f} 元站穩條件上沿 {p_up:,.2f} 元。"
+    elif etf_o > etf_prev_c and etf_c < etf_o:
+        tree_hit = f"觸發【情境二（開高走低規避分支）】：00631L 早盤開 {etf_o:,.2f} 元（{etf_gap:+.2f}%），但盤中實體拉回 {etf_intra:+.2f}% 收 {etf_c:,.2f} 元，驗證『09:00 不追高』紀律。"
+    elif etf_c <= p_dn:
+        tree_hit = f"觸發【情境四（風控止損/觀望分支）】：00631L 收盤 {etf_c:,.2f} 元落於條件下沿 {p_dn:,.2f} 元之下，空手觀望與停損紀律有效保護部位。"
+    else:
+        tree_hit = f"觸發【區間整理分支】：00631L 全天介於條件區間（開 {etf_o:,.2f} / 收 {etf_c:,.2f}），盤中實體變動 {etf_intra:+.2f}%。"
 
-        ev_items = ""
-        for idx_e, e in enumerate(ag["events"][:2], 1):
-            ev_items += (
-                f"<div class='ev-card'>"
-                f"<div class='ev-head'>"
-                f"<span class='ev-num'>{idx_e}</span>"
-                f"<a class='ev-link' href='{e['url']}' target='_blank' rel='noopener noreferrer'>{e['title']}<span class='ext-ico'>↗ 點擊檢視</span></a>"
-                f"</div>"
-                f"<div class='ev-detail'>"
-                f"<div class='ev-row'><span class='tag-dev'>🔹 事實與數據</span><span>{e['dev']}</span></div>"
-                f"<div class='ev-row'><span class='tag-imp'>🔸 傳導與影響</span><span>{e['imp']}</span></div>"
-                f"</div></div>"
-            )
+    member_reviews = []
+    for m in round1:
+        st_m = m["stance"]
+        if (st_m == "偏多" and etf_day > 0.2 and etf_intra >= 0) or (st_m == "偏空" and etf_day < -0.2) or (st_m == "觀望" and abs(etf_intra) < 0.8):
+            verdict = "推理方向與當日盤勢相符"
+        elif st_m == "偏多" and etf_o > etf_prev_c and etf_c < etf_o:
+            verdict = "跳空方向相符，但忽略開高後獲利了結賣壓（如第二輪質疑所指）"
+        else:
+            verdict = "因果鏈受盤中反向資金干擾，需依賴條件式價位止損保護"
+        member_reviews.append(f"‧ <b>{m['name']}（早會結論：{st_m}）</b>：{verdict}")
 
-        cards_html += (
+    return {
+        "ready": True,
+        "updated_at": f"{target_d:%Y/%m/%d} 17:00:00",
+        "tw_o": tw_o, "tw_h": tw_h, "tw_l": tw_l, "tw_c": tw_c,
+        "tw_gap": tw_gap, "tw_intra": tw_intra, "tw_day": tw_day,
+        "etf_o": etf_o, "etf_h": etf_h, "etf_l": etf_l, "etf_c": etf_c,
+        "etf_gap": etf_gap, "etf_intra": etf_intra, "etf_day": etf_day,
+        "state_4": state_4,
+        "tree_hit": tree_hit,
+        "member_reviews": member_reviews,
+    }
+
+# ───────────────────────── 組裝單日完整早會簡報與渲染 HTML ─────────────────────────
+def build_meeting_briefing_for_date(target_d, tw_df, etf_df, days_flow, is_latest_day):
+    """組裝指定交易日 target_d 08:30 盤前主持人簡報所需的所有客觀事實數據"""
+    tw_dts = list(pd.DatetimeIndex(tw_df.index).tz_localize(None).date)
+    idx_pos = tw_dts.index(target_d) if target_d in tw_dts else len(tw_dts) - 1
+    prev_d = tw_dts[idx_pos - 1] if idx_pos > 0 else (target_d - timedelta(days=1))
+
+    # 計算上次會議到本次會議的時間窗（週一早會包含整個週末 72 小時）
+    window_hours = max(24, int((datetime.combine(target_d, dtime(8, 30)) - datetime.combine(prev_d, dtime(8, 30))).total_seconds() // 3600))
+
+    # 技術面事實卡（嚴格只取 prev_d 收盤狀態，零未來資訊）
+    tw_card = compute_tech_fact_card(tw_df, prev_d, "加權指數 (^TWII)", is_etf=False)
+    etf_card = compute_tech_fact_card(etf_df, prev_d, "元大台灣50正2 (00631L.TW)", is_etf=True)
+
+    # 對齊 prev_d 之三大法人現貨買賣超與融資融券
+    sub_flows = [x for x in days_flow if x.get("dt") and x["dt"] <= prev_d] or days_flow
+    if sub_flows:
+        f_list = [x["外資"] / 1e8 for x in sub_flows]
+        t_list = [x["投信"] / 1e8 for x in sub_flows]
+        z_list = [x["自營"] / 1e8 for x in sub_flows]
+        flow_info = {
+            "date_label": sub_flows[-1]["d"],
+            "f1": f_list[-1], "f5": sum(f_list[-5:]), "f10": sum(f_list[-10:]),
+            "t1": t_list[-1], "t5": sum(t_list[-5:]), "t10": sum(t_list[-10:]),
+            "z1": z_list[-1], "z5": sum(z_list[-5:]), "z10": sum(z_list[-10:]),
+        }
+    else:
+        flow_info = {"date_label": prev_d.strftime("%m/%d"), "f1": 0.0, "f5": 0.0, "f10": 0.0, "t1": 0.0, "t5": 0.0, "t10": 0.0, "z1": 0.0, "z5": 0.0, "z10": 0.0}
+
+    margin_info = twse_margin_day(prev_d.strftime("%Y%m%d"))
+    oi_pcr_info = fetch_taifex_oi_and_pcr_for_date(prev_d.strftime("%Y%m%d")) if is_latest_day else {
+        "fx_oi_ok": False, "fx_label": "未取得（歷史單日期貨OI未快取）",
+        "pcr_ok": False, "pcr_label": "未取得（歷史單日P/C比未快取）"
+    }
+    nav_info = fetch_00631l_nav_info() if is_latest_day else {"ok": False, "label": "未取得（非當日即時盤前）"}
+    # 第三節明確規定：期交所夜盤資料未確認穩定來源前，不假設它可用，誠實標示「未取得」
+    night_info = {"ok": False, "label": "未取得（尚未確認穩定可抓之期交所夜盤歷史/即時源，不假設可用）"}
+
+    # 對齊 target_d 08:30 前之隔夜美股 7 大指標
+    def _us_val_before(sym):
+        u_df = load_daily(sym, "6mo")
+        if u_df.empty or len(u_df) < 2:
+            return 0.0, 0.0, "--"
+        u_dts = pd.DatetimeIndex(u_df.index).tz_localize(None).date
+        # 美股隔夜收盤日期為 target_d 的前一日（或跨週末往前最近一日）
+        sub = u_df[u_dts < target_d]
+        if len(sub) < 2:
+            sub = u_df
+        c1, c0 = float(sub["Close"].iloc[-1]), float(sub["Close"].iloc[-2])
+        return c1, (c1 / c0 - 1.0) * 100.0, pd.Timestamp(sub.index[-1]).strftime("%m/%d")
+
+    sox_c, sox_pct, us_d_str = _us_val_before("^SOX")
+    tsm_c, tsm_pct, _ = _us_val_before("TSM")
+    nvda_c, nvda_pct, _ = _us_val_before("NVDA")
+    sp_c, sp_pct, _ = _us_val_before("^GSPC")
+    vix_c, vix_pct, _ = _us_val_before("^VIX")
+    tnx_c, tnx_pct, _ = _us_val_before("^TNX")
+    fx_c, fx_pct, _ = _us_val_before("USDTWD=X")
+    c2330, _, _ = _us_val_before("2330.TW")
+    adr_prem = ((tsm_c * fx_c / 5.0) / c2330 - 1.0) * 100.0 if (c2330 and c2330 > 0 and fx_c > 0) else 15.0
+
+    us_info = {
+        "date_str": us_d_str,
+        "sox_close": sox_c, "sox_pct": sox_pct,
+        "tsm_close": tsm_c, "tsm_pct": tsm_pct,
+        "nvda_close": nvda_c, "nvda_pct": nvda_pct,
+        "sp_close": sp_c, "sp_pct": sp_pct,
+        "vix_close": vix_c, "vix_pct": vix_pct,
+        "tnx_close": tnx_c, "tnx_pct": tnx_pct,
+        "fx_close": fx_c, "fx_pct": fx_pct,
+        "adr_prem": adr_prem,
+    }
+
+    news_list = fetch_and_select_top5_news(window_hours, sox_pct, tsm_pct, nvda_pct, sp_pct)
+
+    return {
+        "target_d": target_d,
+        "prev_d": prev_d,
+        "window_hours": window_hours,
+        "tw_card": tw_card,
+        "etf_card": etf_card,
+        "flow": flow_info,
+        "margin": margin_info,
+        "oi_pcr": oi_pcr_info,
+        "nav": nav_info,
+        "night": night_info,
+        "us": us_info,
+        "news_list": news_list,
+    }
+
+def render_morning_meeting_html(briefing, round1, round2, host_conclusion, review_rec):
+    target_d = briefing["target_d"]
+    prev_d = briefing["prev_d"]
+    tw_c = briefing["tw_card"]
+    etf_c = briefing["etf_card"]
+    fl = briefing["flow"]
+    mg = briefing["margin"]
+    op = briefing["oi_pcr"]
+    nv = briefing["nav"]
+    nt = briefing["night"]
+    us = briefing["us"]
+    news_list = briefing["news_list"]
+
+    # 主持人挑選 5 則最重要新聞 HTML
+    news_cards_html = ""
+    for idx, n in enumerate(news_list, 1):
+        p_col = "#38bdf8" if "已反映" in n["priced_tag"] else "#f59e0b"
+        b_tag = "✅ 含內文摘要" if n["has_body"] else "⚠️ 僅憑標題判斷"
+        news_cards_html += (
+            f"<div class='ev-card'>"
+            f"<div class='ev-head'>"
+            f"<span class='ev-num'>新聞 #{idx}</span>"
+            f"<a class='ev-link' href='{n['url']}' target='_blank' rel='noopener noreferrer'>{n['title']}<span class='ext-ico'>↗ 點擊核對原文 ({n['source']})</span></a>"
+            f"<span class='p-tag' style='border-color:{p_col};color:{p_col}'>{n['priced_tag']}</span>"
+            f"<span class='b-tag'>{b_tag}</span>"
+            f"</div>"
+            f"<div class='ev-detail'>"
+            f"<div class='ev-row'><span class='tag-dev'>🔹 事情發展</span><span>{n['dev']}</span></div>"
+            f"<div class='ev-row'><span class='tag-imp'>🔸 下個交易日影響</span><span>{n['imp']}</span></div>"
+            f"</div></div>"
+        )
+    if not news_cards_html:
+        news_cards_html = "<div class='ev-card'>目前白名單時間窗內未抓到可驗證連結之新聞，絕不自行編造標題。</div>"
+
+    # 第一輪：四位委員發言 HTML
+    r1_html = ""
+    for idx, m in enumerate(round1):
+        st_col = UP if m["stance"] == "偏多" else (DN if m["stance"] == "偏空" else "#FFC83D")
+        r1_html += (
             f"<div class='msg-row'>"
-            f"<div class='avatar' style='background:{ag['color']}'>{ag['short']}</div>"
+            f"<div class='avatar' style='background:{m['color']}'>{m['short']}</div>"
             f"<div class='bubble'>"
             f"<div class='b-head'>"
-            f"<span class='b-name'>{ag['name']}</span>"
-            f"<span class='b-role'>{ag['role']}</span>"
-            f"<span class='eng-tag'>{ag['engine_badge']}</span>"
-            f"<span class='v-badge' style='background:{s_meta['bg']};color:{s_meta['col']};border:1px solid {s_meta['col']}'>"
-            f"{s_meta['icon']} 表態：{v_st} ({p[v_st]}%)</span>"
-            f"<span class='b-time'>{target_d:%m/%d} {ag['time']}</span>"
+            f"<span class='b-name'>{m['name']}</span>"
+            f"<span class='b-role'>{m['role']}</span>"
+            f"<span class='v-badge' style='border:1px solid {st_col};color:{st_col};background:rgba(255,255,255,.05)'>第一輪結論：{m['stance']}</span>"
+            f"<span class='b-time'>{target_d:%m/%d} 08:30:{15 + idx*8:02d}</span>"
             f"</div>"
-            f"<div class='prob-box'>"
-            f"🧩 <b>三階段分解：</b>P(跳空開高)=<b>{ag['pg']*100:.1f}%</b> ｜ P(收≥開|開高)=<b>{ag['pu']*100:.1f}%</b> ｜ P(收≥開|開低)=<b>{ag['pd']*100:.1f}%</b><br>"
-            f"📊 <b>四態合成機率：</b>{p_labels}"
-            f"<div class='mini-bar'>{p_bar}</div>"
-            f"</div>"
-            f"<div class='sec-title'>📌 委員專屬維度實證與傳導解析：</div>"
-            f"<div class='ev-wrap'>{ev_items}</div>"
+            f"<div class='item-row'><b>1️⃣ 結論與信心程度：</b><span style='color:{st_col};font-weight:800'>{m['stance']}</span> ｜ 信心程度：{m['confidence']}</div>"
+            f"<div class='item-row'><b>2️⃣ 核心論點：</b>{m['thesis']}</div>"
+            f"<div class='item-row causal'><b>3️⃣ 因果鏈（A → B → 對 00631L 影響 C）：</b><br>{m['causal_chain']}</div>"
+            f"<div class='item-row'><b>4️⃣ 證據來源（嚴格引用簡報）：</b>{m['evidence']}</div>"
             f"<div class='think-grid'>"
-            f"<div class='think-box'><b>🌍 角色視角定調：</b><br>{ag['news_view']}</div>"
-            f"<div class='think-box'><b>💰 籌碼 / 風控檢核：</b><br>{ag['chip_view']}</div>"
+            f"<div class='think-box'><b>5️⃣-A 對 00631L 建議【空手者】：</b><br>{m['advice_flat']}</div>"
+            f"<div class='think-box'><b>5️⃣-B 對 00631L 建議【持有者（含止損）】：</b><br>{m['advice_hold']}</div>"
             f"</div>"
-            f"<div class='reason-box'><b>🎯 委員最終表態與操作建議：</b>{ag['reason']}</div>"
             f"</div></div>"
         )
 
-    vote_counts = {k: sum(1 for a in speeches if a["vote"] == k) for k in FOUR_STATES}
-    tally_str = " ｜ ".join(f"<b style='color:{STATE_META[k]['col']}'>{STATE_META[k]['icon']} {k} {vote_counts[k]} 票 (主模型 {master_probs[k]}%)</b>" for k in FOUR_STATES)
-    tally_bar = "".join(f"<div style='width:{max(master_probs[k], 2)}%;background:{STATE_META[k]['col']}'></div>" for k in FOUR_STATES)
-    win_meta = STATE_META[master_top]
+    # 第二輪：互相質疑 HTML
+    r2_html = ""
+    for idx, m in enumerate(round2):
+        r2_html += (
+            f"<div class='msg-row'>"
+            f"<div class='avatar' style='background:{m['color']}'>{m['short']}</div>"
+            f"<div class='bubble' style='border-color:#4b3f66'>"
+            f"<div class='b-head'>"
+            f"<span class='b-name'>{m['name']}（第二輪交叉質疑）</span>"
+            f"<span class='eng-tag'>質疑對象：{m['target']}</span>"
+            f"<span class='b-time'>{target_d:%m/%d} 08:31:{10 + idx*7:02d}</span>"
+            f"</div>"
+            f"<div class='item-row'><b>⚔️ 反駁與盲點指出：</b>{m['rebuttal']}</div>"
+            f"<div class='reason-box'><b>🔄 立場是否修正與理由：</b>{m['stance_change']}</div>"
+            f"</div></div>"
+        )
 
-    if master_top == "開高走高": action_guide = "早盤開高且盤中續攻機率高，00631L 可依策略 B 突破 5MA 乘數順勢做多。"
-    elif master_top == "開高走低": action_guide = "⚠️ 提防「早盤開高後逢高出貨（收黑K）」！09:00~09:15 切勿盲目追高 00631L。"
-    elif master_top == "開低走高": action_guide = "早盤開低但低接承接力道強（拉紅K下影線），切勿在開盤恐慌砍在低點。"
-    else: action_guide = "⚠️ 容易出現開低走低黑K，請嚴格執行策略 B 停損紀律，空手建議觀望。"
+    # 主持人決策樹 HTML
+    kv_li = "".join(f"<li>{x}</li>" for x in host_conclusion["key_variables"])
+    dt_li = "".join(f"<div class='tree-item'>{x}</div>" for x in host_conclusion["decision_tree"])
 
-    actual_st = row["ActualState"]
-    act_gap = float(row["ActualGapPct"])
-    act_intra = float(row["ActualIntraPct"])
-    act_day = float(row["ActualDayPct"])
-    is_hit = (actual_st == master_top)
-    hit_badge = (
-        "<span style='background:rgba(34,197,94,.22);color:#4ade80;border:1px solid #4ade80;padding:2px 10px;border-radius:99px;font-weight:800'>✅ 委員會共識命中實際狀態</span>"
-        if is_hit else f"<span style='background:rgba(245,158,11,.22);color:#fbbf24;border:1px solid #fbbf24;padding:2px 10px;border-radius:99px;font-weight:800'>🔸 實際狀態為「{actual_st}」</span>"
-    )
+    # 17:00 復盤紀錄 HTML
+    if review_rec["ready"]:
+        mem_li = "<br>".join(review_rec["member_reviews"])
+        review_html = (
+            f"<div class='msg-row host' style='border-color:#38bdf8;background:linear-gradient(90deg,rgba(56,189,248,.14),rgba(30,25,39,.95))'>"
+            f"<div class='avatar' style='background:#0284c7;color:#fff'>復</div>"
+            f"<div style='flex:1'>"
+            f"<div class='b-head'>"
+            f"<span class='b-name' style='color:#38bdf8'>17:00 盤後復盤紀錄（僅檢視推理品質 · 絕不回頭調參或改權重）</span>"
+            f"<span class='b-role'>滾動保存 6 個交易日</span>"
+            f"<span class='b-time'>{review_rec['updated_at']}</span>"
+            f"</div>"
+            f"<div style='font-size:.96rem;line-height:1.72'>"
+            f"📊 <b>當日實際收盤數據對帳（{target_d:%Y/%m/%d}）</b>：<br>"
+            f"‧ <b>加權指數 (^TWII)</b>：開 <b>{review_rec['tw_o']:,.2f}</b>（跳空 {review_rec['tw_gap']:+.2f}%）／ 高 <b>{review_rec['tw_h']:,.2f}</b> ／ 低 <b>{review_rec['tw_l']:,.2f}</b> ／ 收 <b>{review_rec['tw_c']:,.2f}</b>（盤中實體 {review_rec['tw_intra']:+.2f}%，全天 <b style='color:{_col(review_rec['tw_day'])}'>{review_rec['tw_day']:+.2f}%</b>）｜型態：<b>{review_rec['state_4']}</b><br>"
+            f"‧ <b>00631L (台灣50正2)</b>：開 <b>{review_rec['etf_o']:,.2f}</b>（跳空 {review_rec['etf_gap']:+.2f}%）／ 高 <b>{review_rec['etf_h']:,.2f}</b> ／ 低 <b>{review_rec['etf_l']:,.2f}</b> ／ 收 <b>{review_rec['etf_c']:,.2f}</b>（盤中實體 {review_rec['etf_intra']:+.2f}%，全天 <b style='color:{_col(review_rec['etf_day'])}'>{review_rec['etf_day']:+.2f}%</b>）<br>"
+            f"🌲 <b>早會決策樹觸發檢視</b>：{review_rec['tree_hit']}<br>"
+            f"🔍 <b>四位委員推理品質復盤</b>：<br>{mem_li}"
+            f"</div></div></div>"
+        )
+    else:
+        review_html = (
+            f"<div class='msg-row host' style='border-color:#64748b'>"
+            f"<div class='avatar' style='background:#475569;color:#fff'>復</div>"
+            f"<div style='flex:1'>{review_rec['msg']}</div></div>"
+        )
 
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
 body{{margin:0;background:transparent;color:#e8e6ee;font-family:-apple-system,"Noto Sans TC","Microsoft JhengHei",sans-serif}}
 .chat-room{{display:flex;flex-direction:column;gap:20px;padding:6px 6px 18px 6px}}
+.sec-banner{{background:#282036;border-left:4px solid #FFC83D;padding:8px 14px;border-radius:8px;font-weight:800;color:#FFC83D;font-size:1.02rem}}
 .msg-row{{display:flex;gap:14px;align-items:flex-start}}
-.msg-row.host{{background:linear-gradient(90deg,rgba(255,200,61,.14),rgba(30,25,39,.95));border:1px solid rgba(255,200,61,.4);border-radius:16px;padding:16px 20px}}
+.msg-row.host{{background:linear-gradient(90deg,rgba(255,200,61,.13),rgba(30,25,39,.96));border:1px solid rgba(255,200,61,.4);border-radius:16px;padding:16px 20px}}
 .avatar{{width:48px;height:48px;border-radius:13px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:1.15rem;flex-shrink:0;color:#fff;box-shadow:0 4px 12px rgba(0,0,0,.35)}}
-.bubble{{background:#1e1927;border:1px solid #322a44;border-radius:0 16px 16px 16px;padding:16px 20px;flex:1;line-height:1.7;font-size:1rem}}
-.b-head{{display:flex;align-items:center;gap:12px;margin-bottom:10px;flex-wrap:wrap}}
-.b-name{{font-weight:800;color:#fff;font-size:1.16rem}}
-.b-role{{font-size:.84rem;color:#b0adc0;background:#2a2436;padding:3px 10px;border-radius:6px}}
-.eng-tag{{font-size:.8rem;color:#c4b5fd;background:rgba(139,92,246,.16);border:1px solid rgba(139,92,246,.4);padding:2px 9px;border-radius:6px}}
-.b-time{{font-size:.84rem;color:#8a8699;margin-left:auto}}
-.v-badge{{padding:4px 13px;border-radius:99px;font-weight:800;font-size:.92rem;letter-spacing:.03em}}
-.prob-box{{background:rgba(0,0,0,.28);border:1px solid #312942;border-radius:10px;padding:10px 14px;margin-bottom:12px;font-size:.92rem;line-height:1.65}}
-.mini-bar{{display:flex;height:10px;border-radius:5px;overflow:hidden;background:#2a2433;margin-top:6px}}
-.sec-title{{font-size:.98rem;color:#d0cce0;font-weight:700;margin:6px 0 10px 0}}
-.ev-wrap{{display:flex;flex-direction:column;gap:10px;margin-bottom:14px}}
-.ev-card{{background:rgba(0,0,0,.26);border:1px solid #312942;border-radius:11px;padding:11px 14px}}
-.ev-head{{display:flex;align-items:baseline;gap:9px;margin-bottom:7px}}
-.ev-num{{background:#3b3154;color:#ffc83d;font-weight:800;font-size:.85rem;padding:1px 8px;border-radius:6px;flex-shrink:0}}
-.ev-link{{color:#fff;font-weight:700;font-size:1.04rem;text-decoration:none;border-bottom:1px dashed rgba(255,200,61,.55);padding-bottom:1px;transition:all .18s ease}}
-.ev-link:hover{{color:#FFC83D;border-bottom:1px solid #FFC83D}}
-.ext-ico{{font-size:.8rem;color:#a78bfa;margin-left:8px;font-weight:500}}
-.ev-link:hover .ext-ico{{color:#FFC83D}}
-.ev-detail{{display:flex;flex-direction:column;gap:5px;padding-left:4px;font-size:.96rem;color:#ddd9e8;line-height:1.65}}
+.bubble{{background:#1e1927;border:1px solid #322a44;border-radius:0 16px 16px 16px;padding:16px 20px;flex:1;line-height:1.7;font-size:.98rem}}
+.b-head{{display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap}}
+.b-name{{font-weight:800;color:#fff;font-size:1.14rem}}
+.b-role{{font-size:.83rem;color:#b0adc0;background:#2a2436;padding:3px 10px;border-radius:6px}}
+.eng-tag{{font-size:.82rem;color:#fca5a5;background:rgba(239,68,68,.16);border:1px solid rgba(239,68,68,.4);padding:2px 9px;border-radius:6px;font-weight:700}}
+.b-time{{font-size:.83rem;color:#8a8699;margin-left:auto}}
+.v-badge{{padding:3px 12px;border-radius:99px;font-weight:800;font-size:.9rem}}
+.fact-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:10px 0}}
+@media(max-width:800px){{.fact-grid{{grid-template-columns:1fr}}}}
+.fact-card{{background:rgba(0,0,0,.3);border:1px solid #3b3154;border-radius:11px;padding:11px 14px;font-size:.92rem;line-height:1.65}}
+.fact-card h4{{margin:0 0 6px 0;color:#FFC83D;font-size:.98rem}}
+.ev-wrap{{display:flex;flex-direction:column;gap:10px;margin-top:8px}}
+.ev-card{{background:rgba(0,0,0,.28);border:1px solid #312942;border-radius:11px;padding:11px 14px}}
+.ev-head{{display:flex;align-items:center;gap:9px;margin-bottom:7px;flex-wrap:wrap}}
+.ev-num{{background:#3b3154;color:#ffc83d;font-weight:800;font-size:.82rem;padding:2px 8px;border-radius:6px}}
+.ev-link{{color:#fff;font-weight:700;font-size:1.01rem;text-decoration:none;border-bottom:1px dashed rgba(255,200,61,.55)}}
+.ev-link:hover{{color:#FFC83D}}
+.ext-ico{{font-size:.78rem;color:#a78bfa;margin-left:7px;font-weight:500}}
+.p-tag{{border:1px solid;padding:1px 8px;border-radius:99px;font-size:.78rem;font-weight:700;margin-left:auto}}
+.b-tag{{background:rgba(255,255,255,.07);color:#cfcfd8;padding:1px 8px;border-radius:6px;font-size:.76rem}}
+.ev-detail{{display:flex;flex-direction:column;gap:5px;font-size:.93rem;color:#ddd9e8;line-height:1.62}}
 .ev-row{{display:flex;align-items:flex-start;gap:8px}}
-.tag-dev{{background:rgba(59,130,246,.18);color:#93c5fd;border:1px solid rgba(59,130,246,.4);font-size:.8rem;font-weight:700;padding:1px 7px;border-radius:5px;white-space:nowrap;margin-top:3px}}
-.tag-imp{{background:rgba(244,114,182,.18);color:#f9a8d4;border:1px solid rgba(244,114,182,.4);font-size:.8rem;font-weight:700;padding:1px 7px;border-radius:5px;white-space:nowrap;margin-top:3px}}
-.think-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}}
+.tag-dev{{background:rgba(59,130,246,.18);color:#93c5fd;border:1px solid rgba(59,130,246,.4);font-size:.78rem;font-weight:700;padding:1px 7px;border-radius:5px;white-space:nowrap;margin-top:2px}}
+.tag-imp{{background:rgba(244,114,182,.18);color:#f9a8d4;border:1px solid rgba(244,114,182,.4);font-size:.78rem;font-weight:700;padding:1px 7px;border-radius:5px;white-space:nowrap;margin-top:2px}}
+.item-row{{margin-bottom:8px;font-size:.95rem}}
+.item-row.causal{{background:rgba(59,130,246,.1);border-left:3px solid #3b82f6;padding:8px 12px;border-radius:6px}}
+.think-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:8px}}
 @media(max-width:768px){{.think-grid{{grid-template-columns:1fr}}}}
-.think-box{{background:rgba(255,255,255,.045);border:1px solid #352e47;border-radius:10px;padding:11px 14px;font-size:.96rem;color:#ddd9e8;line-height:1.65}}
-.think-box b{{color:#fff;font-size:.98rem}}
-.reason-box{{background:rgba(124,92,255,.15);border-left:4px solid #8b5cf6;padding:12px 16px;border-radius:8px;font-size:1.03rem;color:#fff;line-height:1.68}}
-.tally-bar{{display:flex;height:16px;border-radius:8px;overflow:hidden;background:#2a2433;margin:10px 0}}
+.think-box{{background:rgba(255,255,255,.045);border:1px solid #352e47;border-radius:10px;padding:10px 13px;font-size:.93rem;color:#ddd9e8;line-height:1.62}}
+.reason-box{{background:rgba(124,92,255,.15);border-left:4px solid #8b5cf6;padding:10px 14px;border-radius:8px;font-size:.95rem;color:#fff}}
+.tree-item{{background:rgba(0,0,0,.32);border:1px solid #453a5c;border-radius:9px;padding:9px 13px;margin-bottom:7px;font-size:.95rem;line-height:1.65}}
 </style></head><body>
 <div class="chat-room">
+
+  <div class="sec-banner">步驟一 ＆ 二：08:30 主持人盤前客觀簡報（只陳述事實、不下結論）＋ 5 則最重要白名單新聞</div>
+
   <div class="msg-row host">
     <div class="avatar" style="background:linear-gradient(135deg,#FFC83D,#d97706);color:#000">主</div>
     <div style="flex:1">
       <div class="b-head">
-        <span class="b-name" style="color:#FFC83D">網站主持人（委員會盤前事實卡中控台）</span>
-        <span class="b-role">{trading_status_str}</span>
-        <span class="b-time">{target_d:%m/%d} 08:30:00</span>
+        <span class="b-name" style="color:#FFC83D">網站主持人（08:30 盤前事實簡報）</span>
+        <span class="b-role">新聞時間窗：{prev_d:%m/%d} 08:30 ～ {target_d:%m/%d} 08:30（共 {briefing['window_hours']} 小時）</span>
+        <span class="b-time">{target_d:%Y/%m/%d} 08:30:00</span>
       </div>
-      <div style="font-size:1rem;line-height:1.75">
-        各位委員會成員早安，現在是台北時間 <b>{target_d:%m/%d} 08:30</b>，開始今日台股（基準 <code>{INDEX_TICKER}</code>／操作標的 <code>{ETF_TICKER}</code>）盤前決策會議。<br>
-        📊 <b>前日台股事實卡（{prev_d:%m/%d}）</b>：加權指數收 <b>{tw_close:,.2f}</b> 點（<b style="color:{_col(tw_pct)}">{tw_pct:+.2f}%</b>，振幅 {tw_hl:,.0f} 點），5MA 位於 <b>{tw_ma5:,.2f}</b>（乖離 <b>{bias5:+.2f}%</b>）。<br>
-        🌙 <b>期交所夜盤 ＆ 期權籌碼</b>：台指期夜盤 <b>{night_info['label']}</b> ｜ 外資台指期未平倉 <b>{oi_pcr_info['fx_label']}</b> ｜ 選擇權 Put/Call 比 <b>{oi_pcr_info['pcr_label']}</b>。<br>
-        🏷️ <b>00631L 淨值與折溢價</b>：<b>{nav_info['label']}</b> ｜ <b>白名單新聞檢索</b>：共 <b>{len(headlines)}</b> 則（已濾除論壇與內容農場黑名單）。<br>
-        💰 <b>三大法人現貨（昨 / 5日 / 10日）</b>：外資 <b style="color:{_col(f_net)}">{f_net:+,.1f}億</b> ({flow_info['f5']:+.0f}億 / {flow_info['f10']:+.0f}億) ｜
-        投信 <b style="color:{_col(t_net)}">{t_net:+,.1f}億</b> ({flow_info['t5']:+.0f}億 / {flow_info['t10']:+.0f}億) ｜ 自營商 <b style="color:{_col(z_net)}">{z_net:+,.1f}億</b>。<br>
-        🌎 <b>隔夜美股關鍵指標</b>：{us_summary}。<br>
-        請「技術面分析師」、「消息面分析師」、「風險控管官」與「反方辯士」依序獨立表態，最後由主持人整合！
+      <div style="font-size:.95rem;line-height:1.72">
+        ⚠️ <b>標的基準特別說明</b>：最終操作標的 <code>00631L</code> 追蹤的是<b>「臺灣 50 指數」單日正向 2 倍報酬（非加權指數）</b>，台指期夜盤或臺灣 50 成分股漲跌 1%，大約對應 <code>00631L</code> 漲跌 <b>2%</b> 左右。<br>
+        💰 <b>籌碼事實（上一交易日 {fl['date_label']}）</b>：<br>
+        ‧ <b>三大法人現貨買賣超</b>：外資 <b style="color:{_col(fl['f1'])}">{fl['f1']:+.1f} 億</b>（近5日 {fl['f5']:+.1f} 億）｜投信 <b style="color:{_col(fl['t1'])}">{fl['t1']:+.1f} 億</b>（近5日 {fl['t5']:+.1f} 億）｜自營商 <b style="color:{_col(fl['z1'])}">{fl['z1']:+.1f} 億</b>。<br>
+        ‧ <b>大盤融資融券</b>：{mg['label']}<br>
+        ‧ <b>外資台指期未平倉 ＆ 選擇權 P/C 比</b>：外資台指期淨部位 <b>{op['fx_label']}</b> ｜ 選擇權 Put/Call 比 <b>{op['pcr_label']}</b><br>
+        ‧ <b>00631L 折溢價與量能</b>：{nv['label']} ｜ <b>昨晚台指期夜盤與日盤差距</b>：{nt['label']}<br>
+        🌎 <b>費半與美股事實（{us['date_str']} 收盤）</b>：費半 <b style="color:{_col(us['sox_pct'])}">{us['sox_pct']:+.2f}%</b> ｜ 台積電 ADR <b style="color:{_col(us['tsm_pct'])}">{us['tsm_pct']:+.2f}%</b>（換算台股溢價率 <b>{us['adr_prem']:+.2f}%</b>）｜ NVDA <b style="color:{_col(us['nvda_pct'])}">{us['nvda_pct']:+.2f}%</b> ｜ S&P 500 <b style="color:{_col(us['sp_pct'])}">{us['sp_pct']:+.2f}%</b> ｜ VIX <b>{us['vix_close']:.2f}</b>（{us['vix_pct']:+.2f}%）｜ 10Y 殖利率 <b>{us['tnx_close']:.2f}%</b> ｜ 美元兌台幣 <b>{us['fx_close']:.2f}</b>（{us['fx_pct']:+.2f}%）。
+
+        <div class="fact-grid">
+          <div class="fact-card">
+            <h4>📐 技術面事實卡 A：加權指數 (^TWII)</h4>
+            <b>‧ 趨勢：</b>{tw_c['trend_fact']}<br>
+            <b>‧ 量價：</b>{tw_c['vol_fact']}<br>
+            <b>‧ 前日 K 棒描述：</b>{tw_c['kbar_fact']}<br>
+            <b>‧ 關鍵價位：</b>{tw_c['levels_fact']}<br>
+            <b>‧ 條件式價位：</b><span style="color:#fde047">{tw_c['cond_fact']}</span>
+          </div>
+          <div class="fact-card">
+            <h4>📐 技術面事實卡 B：元大台灣50正2 (00631L)</h4>
+            <b>‧ 趨勢：</b>{etf_c['trend_fact']}<br>
+            <b>‧ 量價：</b>{etf_c['vol_fact']}<br>
+            <b>‧ 前日 K 棒描述：</b>{etf_c['kbar_fact']}<br>
+            <b>‧ 關鍵價位：</b>{etf_c['levels_fact']}<br>
+            <b>‧ 00631L 波動與耗損：</b>{etf_c['etf_extra']}<br>
+            <b>‧ 條件式價位：</b><span style="color:#fde047">{etf_c['cond_fact']}</span>
+          </div>
+        </div>
+
+        <div style="margin-top:10px;font-weight:800;color:#FFC83D">📰 主持人挑選 5 則對下一交易日台股與 00631L 最重要之白名單新聞（含已反映／尚未反映判定）：</div>
+        <div class="ev-wrap">{news_cards_html}</div>
       </div>
     </div>
   </div>
-  {cards_html}
+
+  <div class="sec-banner">步驟三：四位委員第一輪獨立發言（基本面 · 產業面 · 技術面 · 籌碼面）</div>
+  {r1_html}
+
+  <div class="sec-banner">步驟四：第二輪互相質疑（每人反駁另一人論點，並說明是否修正立場與理由）</div>
+  {r2_html}
+
+  <div class="sec-banner">步驟五：主持人結論（不平均票數 — 列出共識、分歧環節、關鍵變數與「如果…就…」決策樹）</div>
   <div class="msg-row host">
     <div class="avatar" style="background:linear-gradient(135deg,#FFC83D,#d97706);color:#000">結</div>
     <div style="flex:1">
       <div class="b-head">
-        <span class="b-name" style="color:#FFC83D">網站主持人（委員會整合與 Walk-Forward 統計檢定）</span>
-        <span class="b-role">近 60 日樣本外命中 {eval_60['hit']}/{eval_60['n']} vs 基準 {eval_60['base']}/{eval_60['n']} (二項檢定 p={eval_60['p']:.3f})</span>
-        <span class="b-time">{target_d:%m/%d} 08:31:00</span>
+        <span class="b-name" style="color:#FFC83D">網站主持人（最終整合與條件式決策樹）</span>
+        <span class="b-role">不做票數平均 · 以條件式行動劇本取代單一買賣標籤</span>
+        <span class="b-time">{target_d:%Y/%m/%d} 08:32:00</span>
       </div>
-      <div style="font-size:1.02rem;line-height:1.75">
-        感謝各位委員表態！今日（{fmt_d(target_d)}）委員會共識與三階段模型機率：<br>
-        🧩 <b>主模型分解：P(跳空向上) = {pg_m*100:.1f}% ｜ P(收≥開|高) = {pu_m*100:.1f}% ｜ P(收≥開|低) = {pd_m*100:.1f}%</b><br>
-        {tally_str}
-        <div class="tally-bar">{tally_bar}</div>
-        📢 <b>委員會最終整合決議：<span style="color:{win_meta['col']}">{win_meta['icon']} {master_top}（模型機率 {master_probs[master_top]}% ｜ 訓練期常態基準：{base_st_name}）</span></b><br>
-        🎯 <b>00631L 槓桿操作指引</b>：{action_guide}
-        <div style="margin-top:10px;padding:10px 14px;background:rgba(0,0,0,.35);border:1px solid #453a5c;border-radius:10px;font-size:.95rem">
-          🏁 <b>【{target_d:%m/%d} 13:30 收盤真實結果對帳】</b> {hit_badge}<br>
-          ‧ 實際開盤跳空：<b>{act_gap:+.2f}%</b> ｜ 實際盤中實體 (收vs開)：<b>{act_intra:+.2f}%</b> ｜ 全天漲跌：<b>{act_day:+.2f}%</b> ｜ 實際狀態：<b style="color:{STATE_META[actual_st]['col']}">{actual_st}</b>
-        </div>
+      <div style="font-size:.96rem;line-height:1.72">
+        🤝 <b>一、今日委員會共識</b>：<br>{host_conclusion['consensus'].replace(chr(10), '<br>')}<br><br>
+        ⚡ <b>二、分歧在哪個因果環節</b>：<br>{host_conclusion['divergence'].replace(chr(10), '<br>')}<br><br>
+        🔎 <b>三、今日盯盤的 3 個關鍵變數</b>：<ul style="margin:4px 0 12px 18px;padding:0">{kv_li}</ul>
+        🧭 <b>四、「如果…就…」00631L 條件式決策樹</b>：
+        <div style="margin-top:6px">{dt_li}</div>
       </div>
     </div>
   </div>
+
+  <div class="sec-banner">步驟六：17:00 盤後復盤紀錄（滾動保存 6 個交易日 · 不回頭調整任何規則或權重）</div>
+  {review_html}
+
 </div>
 </body></html>"""
 
-def _eval_to_df(df, eval_res):
-    rows = []
-    for r in eval_res["rows"]:
-        t = r["t"]
-        row = df.iloc[t]
-        p_top = FOUR_STATES[r["top"]]
-        act_st = FOUR_STATES[r["actual"]]
-        base_st = FOUR_STATES[r["base_st"]]
-        rows.append({
-            "日期": fmt_d(row["date"]),
-            "隔夜費半/TSM": f"{row['sox_pct']:+.2f}% / {row['tsm_pct']:+.2f}%",
-            "P(跳空向上)": f"{r['pg']*100:.1f}%",
-            "P(收≥開|開高)": f"{r['pu']*100:.1f}%",
-            "P(收≥開|開低)": f"{r['pd']*100:.1f}%",
-            "Walk-Forward預測": f"{p_top} ({r['probs'][r['top']]*100:.1f}%)",
-            "訓練期最常見基準": base_st,
-            "實際跳空/盤中": f"{row['ActualGapPct']:+.2f}% / {row['ActualIntraPct']:+.2f}%",
-            "實際四態": act_st,
-            "命中": "✅" if r["top"] == r["actual"] else "❌"
-        })
-    return pd.DataFrame(rows)
-
 def vote_page():
-    today_d = datetime.now(TZ).date()
-    is_open_today, hol_reason = is_tw_trading_day(today_d)
-
-    with st.spinner("同步期交所夜盤、外資未平倉/PCR、00631L 淨值折溢價、白名單新聞與無洩漏 Walk-Forward 引擎…"):
-        wf_sys = run_walk_forward_system()
+    with st.spinner("檢查交易日曆與 08:30 排程狀態，載入雙標的技術面事實卡、白名單新聞與 6 日滾動復盤存檔…"):
+        tw_df = load_daily(INDEX_TICKER, "3y")
+        etf_df = load_daily(ETF_TICKER, "3y")
         days_flow = last_15_flows()
-        night_info = fetch_taifex_night_session()
-        oi_pcr_info = fetch_taifex_oi_and_pcr()
-        nav_info = fetch_00631l_nav_premium()
-        headlines = fetch_whitelist_news()
 
-    if not wf_sys:
-        st.error("歷史樣本不足 150 筆，無法啟動無洩漏 Walk-Forward 引擎。")
+    if tw_df.empty or etf_df.empty:
+        st.error("無法取得加權指數或 00631L 日線資料。")
         return
 
-    df = wf_sys["df"]
-    X, gap, intra, sidx = wf_sys["X"], wf_sys["gap"], wf_sys["intra"], wf_sys["sidx"]
-    cols_all = wf_sys["cols_all"]
-    lam, hl = wf_sys["master_lam"], wf_sys["master_hl"]
-    w1_indices, w2_indices = wf_sys["w1_indices"], wf_sys["w2_indices"]
-    eval_60, eval_w1, eval_w2 = wf_sys["eval_60"], wf_sys["eval_w1"], wf_sys["eval_w2"]
-
-    sched_msg = (
-        f"🟢 今日（{fmt_d(today_d)}）為正常交易日"
-        if is_open_today else
-        f"⏸️ 今日（{fmt_d(today_d)}）為【{hol_reason}】— 排程自動攔截休市日，目前顯示最近一交易日紀錄"
-    )
+    sched = get_schedule_state(tw_df)
+    archive_dates = sched["archive_dates"]
+    valid_6_strs = [d.strftime("%Y-%m-%d") for d in archive_dates]
+    store = load_rolling_archive()
 
     with st.container(key="vote_card"):
         st.markdown(
-            f"<div class='fl-h'>🤖 盤前投研委員會早會聊天室 ＆ 無洩漏（Walk-Forward）四態中心"
-            f"<small>{sched_msg} · 預設模型：{DEFAULT_OPENAI_MODEL}</small></div>",
+            "<div class='fl-h'>🤖 08:30 盤前結構化早會 ＆ 17:00 盤後復盤紀錄中心"
+            "<small>只陳述事實與因果鏈 · 兩輪交叉質疑 · 條件式決策樹 · 6 日滾動存檔</small></div>",
             unsafe_allow_html=True
         )
 
-        p_cols = st.columns(5)
-        p_cols[0].metric("🌙 期交所台指期夜盤",
-                         f"{night_info['close']:,.0f} 點" if night_info["ok"] else "未取得",
-                         f"{night_info['diff']:+.0f} 點 ({night_info['pct']:+.2f}%)" if night_info["ok"] else night_info["source"])
-        p_cols[1].metric("🏦 外資台指期淨未平倉",
-                         f"{oi_pcr_info['fx_net_oi']:+,d} 口" if oi_pcr_info["fx_oi_ok"] else "未取得",
-                         f"日變動 {oi_pcr_info['fx_net_chg']:+,d} 口" if (oi_pcr_info["fx_oi_ok"] and oi_pcr_info["fx_net_chg"] is not None) else oi_pcr_info["fx_date"] or "期交所 OpenAPI")
-        p_cols[2].metric("⚖️ 臺指選擇權 Put/Call 比",
-                         f"{oi_pcr_info['pcr_oi_ratio']:.2f}%" if oi_pcr_info["pcr_ok"] else "未取得",
-                         f"成交量比 {oi_pcr_info['pcr_vol_ratio']:.2f}%" if (oi_pcr_info["pcr_ok"] and oi_pcr_info["pcr_vol_ratio"]) else oi_pcr_info["pcr_date"] or "期交所 OpenAPI")
-        p_cols[3].metric("🏷️ 00631L 預估淨值 / 折溢價",
-                         f"{nav_info['nav']:,.2f} 元" if nav_info["ok"] else "未取得",
-                         f"折溢價 {nav_info['prem_pct']:+.2f}% (市價 {nav_info['price'] or '--'})" if nav_info["ok"] else "證交所 MIS")
-        p_cols[4].metric("📰 白名單新聞過濾器",
-                         f"{len(headlines)} 則合格",
-                         f"含摘要 {sum(1 for h in headlines if h.get('has_body'))} 則 / 已濾黑名單")
-
-        all_eval_indices = (w1_indices + w2_indices)[::-1]
-        if not all_eval_indices:
-            all_eval_indices = [len(df) - 1]
-        opt_map = {f"{fmt_d(df.iloc[idx]['date'])} 08:30 早會場次": idx for idx in all_eval_indices}
-        chosen_label = st.selectbox("📅 切換檢視早會場次（預設為最新交易日，可回放 11/02～11/13 任一日委員會決策與對帳）", list(opt_map.keys()), index=0)
-        sel_idx = opt_map[chosen_label]
-
-        sel_row = df.iloc[sel_idx]
-        target_d = sel_row["date"]
-        prev_d = df.iloc[sel_idx - 1]["date"] if sel_idx > 0 else (target_d - timedelta(days=1))
-
-        p_arr, (pg_m, pu_m, pd_m), _ = predict_state(X, gap, intra, sel_idx, cols_all, lam, hl)
-        master_probs = {FOUR_STATES[i]: round(float(p_arr[i]) * 100.0, 1) for i in range(4)}
-        master_top = FOUR_STATES[int(p_arr.argmax())]
-        base_st_name = FOUR_STATES[baseline_state(sidx, sel_idx)]
-
-        sub_flows = [x for x in days_flow if x.get("dt") and x["dt"] < target_d] or days_flow
-        if sub_flows:
-            f_list = [x["外資"] / 1e8 for x in sub_flows]
-            t_list = [x["投信"] / 1e8 for x in sub_flows]
-            z_list = [x["自營"] / 1e8 for x in sub_flows]
-            flow_info = {
-                "f1": f_list[-1], "f5": sum(f_list[-5:]), "f10": sum(f_list[-10:]),
-                "t1": t_list[-1], "t5": sum(t_list[-5:]), "t10": sum(t_list[-10:]),
-                "z1": z_list[-1], "z5": sum(z_list[-5:]), "z10": sum(z_list[-10:]),
-            }
+        # 醒目顯示今日是否召開早會（解決「今天週六休市怎麼會有會議」的問題）
+        if sched["banner_state"] == "live":
+            st.success(sched["banner_msg"])
+        elif sched["banner_state"] == "waiting":
+            st.warning(sched["banner_msg"])
         else:
-            flow_info = {k: 0.0 for k in ("f1", "f5", "f10", "t1", "t5", "t10", "z1", "z5", "z10")}
+            st.error(sched["banner_msg"])
 
-        m = st.columns(6)
-        m[0].metric("🔴 開高走高", f"{master_probs['開高走高']:.1f}%", f"P(開高)={pg_m*100:.0f}%×P(走高|高)={pu_m*100:.0f}%")
-        m[1].metric("🟠 開高走低", f"{master_probs['開高走低']:.1f}%", f"P(開高)={pg_m*100:.0f}%×P(走低|高)={(1-pu_m)*100:.0f}%", delta_color="inverse")
-        m[2].metric("🔵 開低走高", f"{master_probs['開低走高']:.1f}%", f"P(開低)={(1-pg_m)*100:.0f}%×P(走高|低)={pd_m*100:.0f}%")
-        m[3].metric("🟢 開低走低", f"{master_probs['開低走低']:.1f}%", f"P(開低)={(1-pg_m)*100:.0f}%×P(走低|低)={(1-pd_m)*100:.0f}%", delta_color="inverse")
-        m[4].metric("📐 近60日樣本外命中", f"{eval_60['hit']}/{eval_60['n']} ({eval_60['hit']/max(1,eval_60['n'])*100:.1f}%)", f"基準 {eval_60['base']}/{eval_60['n']} ｜ p={eval_60['p']:.3f}")
-        m[5].metric("🎯 跳空 / 盤中方向準確率", f"{eval_60['gap']/max(1,eval_60['n'])*100:.0f}% / {eval_60['intra']/max(1,eval_60['n'])*100:.0f}%", f"11/9~13: {eval_w2['hit']}/{eval_w2['n']} ｜ 11/2~6: {eval_w1['hit']}/{eval_w1['n']}")
-
-        with st.expander("📰 展開檢視：白名單新聞清單（已自動剔除 PTT / Dcard / CMoney / 內容農場等黑名單）", expanded=False):
-            if headlines:
-                st.dataframe(pd.DataFrame([
-                    {"媒體": h["source"], "網域": h["domain"], "標題": h["title"], "摘要狀態": "✅ 含內文摘要" if h["has_body"] else "⚠️ 僅有標題", "連結": h["url"]}
-                    for h in headlines
-                ]), hide_index=True, use_container_width=True)
-            else:
-                st.info("目前白名單新聞暫無符合條件之項目。")
-
-        with st.expander("📊 展開檢視：無洩漏 Walk-Forward 雙週（11/02~11/06 ＆ 11/09~11/13）與基準比較驗證表", expanded=False):
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown(f"**🔹 11/09～11/13 成績：命中 `{eval_w2['hit']}/{eval_w2['n']}` ｜ 基準 `{eval_w2['base']}/{eval_w2['n']}` ｜ 二項檢定 `p={eval_w2['p']:.3f}`**")
-                st.dataframe(_eval_to_df(df, eval_w2), hide_index=True, use_container_width=True)
-            with c2:
-                st.markdown(f"**🔸 11/02～11/06 成績：命中 `{eval_w1['hit']}/{eval_w1['n']}` ｜ 基準 `{eval_w1['base']}/{eval_w1['n']}` ｜ 二項檢定 `p={eval_w1['p']:.3f}`**")
-                st.dataframe(_eval_to_df(df, eval_w1), hide_index=True, use_container_width=True)
-
-        speeches = build_committee_speeches(wf_sys, sel_idx, flow_info, headlines, night_info, oi_pcr_info, nav_info)
-        html_doc = build_chatroom_html(
-            target_d, prev_d, sched_msg, sel_row, flow_info, night_info, oi_pcr_info, nav_info,
-            headlines, speeches, master_probs, (pg_m, pu_m, pd_m), master_top, base_st_name, eval_60
+        opt_map = {
+            f"{'🟢 [今日早會]' if (sched['has_live_meeting'] and d == sched['cur_d']) else '📁 [歷史存檔]'} {fmt_d(d)} 08:30 早會與 17:00 復盤紀錄": d
+            for d in archive_dates
+        }
+        chosen_label = st.selectbox(
+            f"📅 選擇檢視紀錄（系統嚴格滾動保留最近 {MAX_ARCHIVE_DAYS} 個交易日，舊紀錄自動刪除）",
+            list(opt_map.keys()),
+            index=0
         )
-        components.html(html_doc, height=1550, scrolling=True)
+        sel_d = opt_map[chosen_label]
+        is_latest = (sel_d == archive_dates[0])
+
+        briefing = build_meeting_briefing_for_date(sel_d, tw_df, etf_df, days_flow, is_latest)
+        round1, round2, host_conclusion = generate_two_round_meeting_and_tree(briefing)
+        review_rec = build_1700_review_record(sel_d, sched["now"], tw_df, etf_df, briefing, round1, host_conclusion)
+
+        # 更新並滾動修剪 6 日存檔 JSON
+        d_key = sel_d.strftime("%Y-%m-%d")
+        store[d_key] = {
+            "date": d_key,
+            "stances": {m["name"]: m["stance"] for m in round1},
+            "review_ready": review_rec["ready"],
+            "state_4": review_rec.get("state_4", "待 17:00 更新"),
+            "tw_day_pct": f"{review_rec['tw_day']:+.2f}%" if review_rec["ready"] else "--",
+            "etf_day_pct": f"{review_rec['etf_day']:+.2f}%" if review_rec["ready"] else "--",
+            "tree_hit": review_rec.get("tree_hit", "待 17:00 更新"),
+        }
+        store = save_rolling_archive(store, valid_6_strs)
+
+        with st.expander(f"🗂️ 展開檢視：最近 {MAX_ARCHIVE_DAYS} 個交易日早會立場與 17:00 復盤滾動存檔一覽表", expanded=False):
+            summary_rows = []
+            for d_item in archive_dates:
+                dk = d_item.strftime("%Y-%m-%d")
+                if dk not in store:
+                    b_tmp = build_meeting_briefing_for_date(d_item, tw_df, etf_df, days_flow, False)
+                    r1_tmp, _, hc_tmp = generate_two_round_meeting_and_tree(b_tmp)
+                    rv_tmp = build_1700_review_record(d_item, sched["now"], tw_df, etf_df, b_tmp, r1_tmp, hc_tmp)
+                    store[dk] = {
+                        "date": dk,
+                        "stances": {m["name"]: m["stance"] for m in r1_tmp},
+                        "review_ready": rv_tmp["ready"],
+                        "state_4": rv_tmp.get("state_4", "待 17:00 更新"),
+                        "tw_day_pct": f"{rv_tmp['tw_day']:+.2f}%" if rv_tmp["ready"] else "--",
+                        "etf_day_pct": f"{rv_tmp['etf_day']:+.2f}%" if rv_tmp["ready"] else "--",
+                        "tree_hit": rv_tmp.get("tree_hit", "待 17:00 更新"),
+                    }
+                rec = store[dk]
+                st_map = rec["stances"]
+                summary_rows.append({
+                    "交易日": fmt_d(d_item),
+                    "基本面": st_map.get("基本面委員", "--"),
+                    "產業面": st_map.get("產業面委員", "--"),
+                    "技術面": st_map.get("技術面委員", "--"),
+                    "籌碼面": st_map.get("籌碼面委員", "--"),
+                    "17:00 實際走勢": rec["state_4"],
+                    "加權全天": rec["tw_day_pct"],
+                    "00631L全天": rec["etf_day_pct"],
+                    "決策樹復盤": rec["tree_hit"],
+                })
+            store = save_rolling_archive(store, valid_6_strs)
+            st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
+
+        html_doc = render_morning_meeting_html(briefing, round1, round2, host_conclusion, review_rec)
+        components.html(html_doc, height=1850, scrolling=True)
 
 # ───────────────────────── 導覽列與三頁整合組版 ─────────────────────────
 with st.container(key="nav"):
