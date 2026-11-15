@@ -81,7 +81,7 @@ COMMITTEE_ROLES = [
 ]
 _ROLE_MAP = {r["id"]: r for r in COMMITTEE_ROLES}
 
-# ───────────────────────── 全域樣式 ─────────────────────────
+# ───────────────────────── 全域樣式（強化深色卡片高對比字體） ─────────────────────────
 st.markdown("""<style>
 header[data-testid=stHeader],footer,#MainMenu{display:none}
 .stApp{background:linear-gradient(135deg,#f8c8e6 0%,#dcb8fb 52%,#b9a6f7 100%);background-attachment:fixed}
@@ -97,12 +97,87 @@ header[data-testid=stHeader],footer,#MainMenu{display:none}
 .st-key-nav h1{color:#FFC83D;font-size:1.35rem;font-weight:800;letter-spacing:.05em;margin:0!important;padding:0!important;line-height:1.4!important}
 .st-key-body{padding:.8rem 1.2rem 1.2rem}
 .st-key-chart_card,.st-key-chart_card_s{background:#000;border-radius:18px;padding:.8rem 1rem .6rem;box-shadow:0 10px 30px rgba(70,30,120,.3)}
-.st-key-flow_card,.st-key-strat_card,.st-key-trade_card,.st-key-vote_card{background:#15111c;border-radius:18px;padding:.9rem 1.2rem;color:#e8e6ee;box-shadow:0 10px 30px rgba(70,30,120,.25)}
+.st-key-flow_card,.st-key-strat_card,.st-key-trade_card,.st-key-vote_card{background:#15111c;border-radius:18px;padding:1rem 1.3rem;color:#ffffff;box-shadow:0 10px 30px rgba(70,30,120,.25)}
 .st-key-chart_card iframe,.st-key-chart_card_s iframe,.st-key-flow_card iframe,.st-key-vote_card iframe{border-radius:12px;display:block}
-.ttl{color:#fff;font-size:1.05rem;font-weight:700}.ttl span{color:#8d8d99;font-size:.8rem;margin-left:.4rem;font-weight:500}
-.fl-h{color:#fff;font-size:1.1rem;font-weight:700;margin-bottom:.4rem}.fl-h small{color:#8d8d99;font-weight:400;margin-left:.5rem;font-size:.85rem}
-div[data-testid=stMetric]{background:#1e1927;border-radius:12px;padding:.5rem .8rem}
-div[data-testid=stMetric] label p{color:#a9a6b5!important}div[data-testid=stMetricValue]{color:#fff}
+
+/* 標題與副標題高對比顯示 */
+.ttl{color:#fff;font-size:1.1rem;font-weight:800}.ttl span{color:#d0cde0;font-size:.88rem;margin-left:.45rem;font-weight:600}
+.fl-h{color:#fff;font-size:1.18rem;font-weight:800;margin-bottom:.5rem}
+.fl-h small{color:#e2dff0!important;font-weight:500;margin-left:.6rem;font-size:.92rem}
+
+/* 強制深色卡片內所有表單標籤（Selectbox / NumberInput 等）為亮白粗體 */
+.st-key-vote_card [data-testid=stWidgetLabel],
+.st-key-vote_card [data-testid=stWidgetLabel] p,
+.st-key-vote_card label p,
+.st-key-strat_card [data-testid=stWidgetLabel],
+.st-key-strat_card [data-testid=stWidgetLabel] p,
+.st-key-strat_card label p{
+  color:#FFC83D!important;
+  font-size:.98rem!important;
+  font-weight:800!important;
+  opacity:1!important;
+}
+
+/* 下拉選單與數字輸入框內文字高對比清晰化 */
+.st-key-vote_card [data-baseweb=select] div,
+.st-key-strat_card [data-baseweb=select] div{
+  color:#111111!important;
+  font-weight:700!important;
+  font-size:.96rem!important;
+}
+.st-key-vote_card input,
+.st-key-strat_card input{
+  color:#111111!important;
+  -webkit-text-fill-color:#111111!important;
+  font-weight:700!important;
+  font-size:.96rem!important;
+  opacity:1!important;
+}
+.st-key-vote_card input:disabled,
+.st-key-strat_card input:disabled{
+  color:#4b5563!important;
+  -webkit-text-fill-color:#4b5563!important;
+  background-color:#e5e7eb!important;
+  font-weight:700!important;
+  opacity:1!important;
+}
+
+/* Expander 摺疊列標題與邊框高對比 */
+.st-key-vote_card [data-testid=stExpander],
+.st-key-strat_card [data-testid=stExpander]{
+  background:#1e1927!important;
+  border:1px solid #4b3f66!important;
+  border-radius:12px!important;
+}
+.st-key-vote_card [data-testid=stExpander] summary p,
+.st-key-strat_card [data-testid=stExpander] summary p{
+  color:#ffffff!important;
+  font-size:.98rem!important;
+  font-weight:700!important;
+}
+.st-key-vote_card [data-testid=stExpander] summary svg,
+.st-key-strat_card [data-testid=stExpander] summary svg{
+  fill:#FFC83D!important;
+  color:#FFC83D!important;
+}
+
+/* Caption 狀態小字與提示框放大提亮 */
+.st-key-vote_card [data-testid=stCaptionContainer],
+.st-key-vote_card [data-testid=stCaptionContainer] p,
+.st-key-strat_card [data-testid=stCaptionContainer],
+.st-key-strat_card [data-testid=stCaptionContainer] p{
+  color:#f1f5f9!important;
+  font-size:.94rem!important;
+  font-weight:600!important;
+}
+[data-testid=stAlert] p{
+  font-size:1rem!important;
+  font-weight:700!important;
+}
+
+div[data-testid=stMetric]{background:#1e1927;border:1px solid #352c47;border-radius:12px;padding:.55rem .85rem}
+div[data-testid=stMetric] label p{color:#e2dff0!important;font-weight:700!important;font-size:.92rem!important}
+div[data-testid=stMetricValue]{color:#fff!important;font-weight:800!important}
 </style>""", unsafe_allow_html=True)
 
 # ───────────────────────── 基礎資料與交易日曆模組 ─────────────────────────
@@ -379,12 +454,12 @@ def _col(a):
 
 FL_HEAD = """<!DOCTYPE html><html><head><meta charset="utf-8"><style>
 body{margin:0;background:transparent;color:#e8e6ee;font-family:-apple-system,"Noto Sans TC","Microsoft JhengHei",sans-serif;overflow:hidden}
-.fl-h{color:#fff;font-size:.95rem;font-weight:700;margin-bottom:.3rem}
-.fl-h small{color:#8d8d99;font-weight:400;margin-left:.5rem}
+.fl-h{color:#fff;font-size:.98rem;font-weight:800;margin-bottom:.3rem}
+.fl-h small{color:#d8d4e8;font-weight:500;margin-left:.5rem}
 .fl{display:grid;grid-template-columns:50px 130px 1fr 240px;gap:20px;align-items:center;padding:6px 0;border-top:1px solid #2a2433}
 .fl .nm{font-weight:700;color:#fff}
 .fl .lt{font-size:1.15rem;font-weight:800}
-.fl .sm{font-size:1rem;color:#a9a6b5}
+.fl .sm{font-size:1rem;color:#d0cde0}
 .fl .sm .row{display:flex;gap:25px;white-space:nowrap}
 .fl .sm b{font-weight:700;font-size:1.05rem}
 .bars{display:grid;grid-template-columns:repeat(10,1fr);gap:5px;height:42px}
@@ -393,15 +468,15 @@ body{margin:0;background:transparent;color:#e8e6ee;font-family:-apple-system,"No
 .bars .u,.bars .d{flex:1;display:flex}
 .bars .u{align-items:flex-end}.bars .d{align-items:flex-start}
 .bars i{display:block;width:100%;border-radius:2px}
-.dates{display:grid;grid-template-columns:repeat(10,1fr);gap:5px;color:#7d7a8a;font-size:.68rem;text-align:center}
+.dates{display:grid;grid-template-columns:repeat(10,1fr);gap:5px;color:#b8b4c9;font-size:.72rem;text-align:center}
 .dates div{cursor:pointer;border-radius:3px}.dates div.hi{color:#fff;background:rgba(255,255,255,.10)}
 </style></head><body>
 <div class="fl-h">近 10 日三大法人買賣超<small>上市 · 億元 · 紅＝買超 綠＝賣超（游標移到長條或日期上，左側數值會顯示該日資料）</small></div>
 <div class="fl" style="border:0;padding-bottom:2px">
   <div></div>
-  <div class="lt" id="dlab" style="font-size:.8rem;color:#9a97a8">最新 當日買賣超</div>
+  <div class="lt" id="dlab" style="font-size:.82rem;color:#d0cde0">最新 當日買賣超</div>
   <div></div>
-  <div class="sm"><div class="row" style="font-size:.75rem;color:#7d7a8a"><div style="width:95px">近 5 日累積</div><div style="width:95px">近 10 日累積</div></div></div>
+  <div class="sm"><div class="row" style="font-size:.78rem;color:#d0cde0"><div style="width:95px">近 5 日累積</div><div style="width:95px">近 10 日累積</div></div></div>
 </div>
 """
 
@@ -575,7 +650,7 @@ def strategy_page():
             return
         if not intra:
             st.warning("抓不到 5 分 K，回測退回日 K 判斷。")
-        with st.expander("策略參數"):
+        with st.expander("⚙️ 策略參數設定"):
             c = st.columns(6)
             em = c[0].number_input("強勢進場乘數", value=1.04, step=0.01)
             xm = c[1].number_input("強勢出場乘數", value=0.98, step=0.01)
@@ -1107,21 +1182,21 @@ def render_ask_ai_buttons_html(prompt_text):
     prompt_json = json.dumps(prompt_text)
 
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
-body{{margin:0;background:transparent;font-family:-apple-system,"Noto Sans TC","Microsoft JhengHei",sans-serif;color:#e8e6ee}}
-.ai-bar{{background:linear-gradient(90deg,rgba(255,200,61,.12),rgba(139,92,246,.14));border:1px solid rgba(255,200,61,.45);
-  border-radius:14px;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}}
-.ai-title{{font-weight:800;color:#FFC83D;font-size:1rem;display:flex;flex-direction:column;gap:3px}}
-.ai-title small{{color:#cfcfd8;font-weight:400;font-size:.82rem}}
+body{{margin:0;background:transparent;font-family:-apple-system,"Noto Sans TC","Microsoft JhengHei",sans-serif;color:#ffffff}}
+.ai-bar{{background:linear-gradient(90deg,rgba(255,200,61,.16),rgba(139,92,246,.20));border:1.5px solid rgba(255,200,61,.65);
+  border-radius:14px;padding:13px 18px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}}
+.ai-title{{font-weight:800;color:#FFC83D;font-size:1.05rem;display:flex;flex-direction:column;gap:4px}}
+.ai-title small{{color:#f8fafc;font-weight:600;font-size:.88rem}}
 .btn-group{{display:flex;gap:10px;flex-wrap:wrap;align-items:center}}
-.ai-btn{{display:inline-flex;align-items:center;gap:7px;padding:9px 16px;border-radius:10px;font-weight:800;font-size:.93rem;
-  text-decoration:none;color:#fff;cursor:pointer;border:1px solid rgba(255,255,255,.18);transition:all .15s ease;
-  box-shadow:0 4px 12px rgba(0,0,0,.3)}}
+.ai-btn{{display:inline-flex;align-items:center;gap:7px;padding:9px 16px;border-radius:10px;font-weight:800;font-size:.95rem;
+  text-decoration:none;color:#fff;cursor:pointer;border:1px solid rgba(255,255,255,.25);transition:all .15s ease;
+  box-shadow:0 4px 12px rgba(0,0,0,.35)}}
 .ai-btn:hover{{transform:translateY(-2px);filter:brightness(1.12)}}
 .btn-gpt{{background:linear-gradient(135deg,#10a37f,#0d8a6a)}}
 .btn-gemini{{background:linear-gradient(135deg,#3b82f6,#8b5cf6)}}
 .btn-claude{{background:linear-gradient(135deg,#d97706,#b45309)}}
 .btn-copy{{background:#2a2436;color:#FFC83D;border-color:#FFC83D}}
-#toast{{font-size:.82rem;color:#34d399;font-weight:700;display:none;margin-left:6px}}
+#toast{{font-size:.88rem;color:#34d399;font-weight:800;display:none;margin-left:6px}}
 </style></head><body>
 <div class="ai-bar">
   <div class="ai-title">
@@ -1631,7 +1706,7 @@ def render_morning_meeting_html(briefing, round1, round2, host_conclusion, revie
     us = briefing["us"]
     news_list = briefing["news_list"]
 
-    # ── 修改 2：僅擷取新聞標題、媒體、時間與網址，不顯示所謂的「事情發展」及「影響」 ──
+    # ── 僅擷取新聞標題、媒體、時間與網址 ──
     news_cards_html = ""
     for idx, n in enumerate(news_list, 1):
         pub_txt = f" · {n['pub']}" if n.get("pub") else ""
@@ -1701,7 +1776,7 @@ def render_morning_meeting_html(briefing, round1, round2, host_conclusion, revie
             f"<span class='b-role'>滾動保存 5 個交易日</span>"
             f"<span class='b-time'>{review_rec['updated_at']}</span>"
             f"</div>"
-            f"<div style='font-size:.96rem;line-height:1.72'>"
+            f"<div style='font-size:.98rem;line-height:1.75;color:#ffffff'>"
             f"📊 <b>當日實際收盤數據對帳（{target_d:%Y/%m/%d}）</b>：<br>"
             f"‧ <b>加權指數 (^TWII)</b>：開 <b>{review_rec['tw_o']:,.2f}</b>（跳空 {review_rec['tw_gap']:+.2f}%）／ 高 <b>{review_rec['tw_h']:,.2f}</b> ／ 低 <b>{review_rec['tw_l']:,.2f}</b> ／ 收 <b>{review_rec['tw_c']:,.2f}</b>（盤中實體 {review_rec['tw_intra']:+.2f}%，全天 <b style='color:{_col(review_rec['tw_day'])}'>{review_rec['tw_day']:+.2f}%</b>）｜型態：<b>{review_rec['state_4']}</b><br>"
             f"‧ <b>00631L (台灣50正2)</b>：開 <b>{review_rec['etf_o']:,.2f}</b>（跳空 {review_rec['etf_gap']:+.2f}%）／ 高 <b>{review_rec['etf_h']:,.2f}</b> ／ 低 <b>{review_rec['etf_l']:,.2f}</b> ／ 收 <b>{review_rec['etf_c']:,.2f}</b>（盤中實體 {review_rec['etf_intra']:+.2f}%，全天 <b style='color:{_col(review_rec['etf_day'])}'>{review_rec['etf_day']:+.2f}%</b>）<br>"
@@ -1710,42 +1785,41 @@ def render_morning_meeting_html(briefing, round1, round2, host_conclusion, revie
             f"</div></div></div>"
         )
     else:
-        review_html = f"<div class='msg-row host' style='border-color:#64748b'><div class='avatar' style='background:#475569;color:#fff'>復</div><div style='flex:1'>{review_rec['msg']}</div></div>"
+        review_html = f"<div class='msg-row host' style='border-color:#64748b'><div class='avatar' style='background:#475569;color:#fff'>復</div><div style='flex:1;color:#fff;font-size:.98rem'>{review_rec['msg']}</div></div>"
 
-    # ── 修改 1：.fact-grid 設為 grid-template-columns: 1fr，讓事實卡 B 移到事實卡 A 的正下方 ──
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
-body{{margin:0;background:transparent;color:#e8e6ee;font-family:-apple-system,"Noto Sans TC","Microsoft JhengHei",sans-serif}}
+body{{margin:0;background:transparent;color:#ffffff;font-family:-apple-system,"Noto Sans TC","Microsoft JhengHei",sans-serif}}
 .chat-room{{display:flex;flex-direction:column;gap:20px;padding:6px 6px 18px 6px}}
-.sec-banner{{background:#282036;border-left:4px solid #FFC83D;padding:8px 14px;border-radius:8px;font-weight:800;color:#FFC83D;font-size:1.02rem}}
+.sec-banner{{background:#282036;border-left:4px solid #FFC83D;padding:9px 14px;border-radius:8px;font-weight:800;color:#FFC83D;font-size:1.05rem}}
 .msg-row{{display:flex;gap:14px;align-items:flex-start}}
-.msg-row.host{{background:linear-gradient(90deg,rgba(255,200,61,.13),rgba(30,25,39,.96));border:1px solid rgba(255,200,61,.4);border-radius:16px;padding:16px 20px}}
+.msg-row.host{{background:linear-gradient(90deg,rgba(255,200,61,.14),rgba(30,25,39,.96));border:1px solid rgba(255,200,61,.45);border-radius:16px;padding:16px 20px}}
 .avatar{{width:48px;height:48px;border-radius:13px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:1.15rem;flex-shrink:0;color:#fff;box-shadow:0 4px 12px rgba(0,0,0,.35)}}
-.bubble{{background:#1e1927;border:1px solid #322a44;border-radius:0 16px 16px 16px;padding:16px 20px;flex:1;line-height:1.7;font-size:.98rem}}
+.bubble{{background:#1e1927;border:1px solid #3d3354;border-radius:0 16px 16px 16px;padding:16px 20px;flex:1;line-height:1.72;font-size:.99rem;color:#ffffff}}
 .b-head{{display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap}}
-.b-name{{font-weight:800;color:#fff;font-size:1.14rem}}
-.b-role{{font-size:.83rem;color:#b0adc0;background:#2a2436;padding:3px 10px;border-radius:6px}}
-.b-time{{font-size:.83rem;color:#8a8699;margin-left:auto}}
+.b-name{{font-weight:800;color:#fff;font-size:1.15rem}}
+.b-role{{font-size:.86rem;color:#e2dff0;background:#2f2840;padding:3px 10px;border-radius:6px;font-weight:600}}
+.b-time{{font-size:.86rem;color:#cbc7d8;margin-left:auto;font-weight:600}}
 .fact-grid{{display:grid;grid-template-columns:1fr;gap:12px;margin:10px 0}}
-.fact-card{{background:rgba(0,0,0,.3);border:1px solid #3b3154;border-radius:11px;padding:11px 14px;font-size:.92rem;line-height:1.65}}
-.fact-card h4{{margin:0 0 6px 0;color:#FFC83D;font-size:.98rem}}
+.fact-card{{background:rgba(0,0,0,.36);border:1px solid #483c63;border-radius:11px;padding:12px 15px;font-size:.95rem;line-height:1.68;color:#ffffff}}
+.fact-card h4{{margin:0 0 6px 0;color:#FFC83D;font-size:1.02rem}}
 .ev-wrap{{display:flex;flex-direction:column;gap:8px;margin-top:8px}}
-.ev-card{{background:rgba(0,0,0,.28);border:1px solid #312942;border-radius:11px;padding:10px 14px}}
+.ev-card{{background:rgba(0,0,0,.34);border:1px solid #3f3556;border-radius:11px;padding:10px 14px}}
 .ev-head{{display:flex;align-items:center;gap:9px;flex-wrap:wrap}}
-.ev-num{{background:#3b3154;color:#ffc83d;font-weight:800;font-size:.82rem;padding:2px 8px;border-radius:6px}}
-.ev-link{{color:#fff;font-weight:700;font-size:.98rem;text-decoration:none;border-bottom:1px dashed rgba(255,200,61,.55)}}
+.ev-num{{background:#3b3154;color:#ffc83d;font-weight:800;font-size:.84rem;padding:2px 8px;border-radius:6px}}
+.ev-link{{color:#fff;font-weight:700;font-size:1rem;text-decoration:none;border-bottom:1px dashed rgba(255,200,61,.65)}}
 .ev-link:hover{{color:#FFC83D}}
-.ev-url{{margin-top:5px;font-size:.82rem;color:#93c5fd;word-break:break-all}}
+.ev-url{{margin-top:5px;font-size:.85rem;color:#93c5fd;word-break:break-all}}
 .ev-url a{{color:#93c5fd;text-decoration:underline}}
-.b-tag{{background:rgba(255,255,255,.08);color:#cfcfd8;padding:2px 8px;border-radius:6px;font-size:.78rem}}
-.item-row{{margin-bottom:8px;font-size:.95rem}}
-.item-row.causal{{background:rgba(59,130,246,.1);border-left:3px solid #3b82f6;padding:8px 12px;border-radius:6px}}
+.b-tag{{background:rgba(255,255,255,.12);color:#f1f0f7;padding:2px 8px;border-radius:6px;font-size:.82rem;font-weight:600}}
+.item-row{{margin-bottom:8px;font-size:.97rem;color:#ffffff}}
+.item-row.causal{{background:rgba(59,130,246,.14);border-left:3px solid #3b82f6;padding:8px 12px;border-radius:6px}}
 .think-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:8px}}
 @media(max-width:768px){{.think-grid{{grid-template-columns:1fr}}}}
-.think-box{{background:rgba(255,255,255,.045);border:1px solid #352e47;border-radius:10px;padding:10px 13px;font-size:.93rem;color:#ddd9e8;line-height:1.62}}
-.reason-box{{background:rgba(124,92,255,.15);border-left:4px solid #8b5cf6;padding:10px 14px;border-radius:8px;font-size:.95rem;color:#fff}}
-.tree-item{{background:rgba(0,0,0,.32);border:1px solid #453a5c;border-radius:9px;padding:9px 13px;margin-bottom:7px;font-size:.95rem;line-height:1.65}}
-.eng-tag{{font-size:.83rem;color:#fbbf24;background:rgba(251,191,36,.15);padding:3px 10px;border-radius:6px}}
-.v-badge{{font-size:.83rem;font-weight:800;padding:2px 10px;border-radius:6px}}
+.think-box{{background:rgba(255,255,255,.06);border:1px solid #453c5c;border-radius:10px;padding:10px 13px;font-size:.95rem;color:#ffffff;line-height:1.65}}
+.reason-box{{background:rgba(124,92,255,.18);border-left:4px solid #8b5cf6;padding:10px 14px;border-radius:8px;font-size:.97rem;color:#fff}}
+.tree-item{{background:rgba(0,0,0,.36);border:1px solid #4e4268;border-radius:9px;padding:10px 14px;margin-bottom:7px;font-size:.97rem;line-height:1.68;color:#ffffff}}
+.eng-tag{{font-size:.85rem;color:#fbbf24;background:rgba(251,191,36,.18);padding:3px 10px;border-radius:6px;font-weight:700}}
+.v-badge{{font-size:.85rem;font-weight:800;padding:2px 10px;border-radius:6px}}
 </style></head><body>
 <div class="chat-room">
 
@@ -1759,7 +1833,7 @@ body{{margin:0;background:transparent;color:#e8e6ee;font-family:-apple-system,"N
         <span class="b-role">新聞時間窗：{prev_d:%m/%d} 08:30 ～ {target_d:%m/%d} 08:30（共 {briefing['window_hours']} 小時）</span>
         <span class="b-time">{target_d:%Y/%m/%d} 08:30:00</span>
       </div>
-      <div style="font-size:.95rem;line-height:1.72">
+      <div style="font-size:.97rem;line-height:1.75;color:#ffffff">
         ⚠️ <b>標的基準特別說明</b>：最終操作標的 <code>00631L</code> 追蹤的是<b>「臺灣 50 指數」單日正向 2 倍報酬（非加權指數）</b>，台指期夜盤或臺灣 50 成分股漲跌 1%，大約對應 <code>00631L</code> 漲跌 <b>2%</b> 左右。<br>
         💰 <b>籌碼事實（上一交易日 {fl['date_label']}）</b>：<br>
         ‧ <b>三大法人現貨買賣超</b>：外資 <b style="color:{_col(fl['f1'])}">{fl['f1']:+.1f} 億</b>（近5日 {fl['f5']:+.1f} 億｜近10日 {fl['f10']:+.1f} 億）｜投信 <b style="color:{_col(fl['t1'])}">{fl['t1']:+.1f} 億</b>（近5日 {fl['t5']:+.1f} 億）｜自營商 <b style="color:{_col(fl['z1'])}">{fl['z1']:+.1f} 億</b>。<br>
@@ -1809,7 +1883,7 @@ body{{margin:0;background:transparent;color:#e8e6ee;font-family:-apple-system,"N
         <span class="b-role">不做票數平均 · 以條件式行動劇本取代單一買賣標籤</span>
         <span class="b-time">{target_d:%Y/%m/%d} 08:32:00</span>
       </div>
-      <div style="font-size:.96rem;line-height:1.72">
+      <div style="font-size:.98rem;line-height:1.75;color:#ffffff">
         🤝 <b>一、今日委員會共識</b>：<br>{host_conclusion['consensus'].replace(chr(10), '<br>')}<br><br>
         ⚡ <b>二、分歧在哪個因果環節</b>：<br>{host_conclusion['divergence'].replace(chr(10), '<br>')}<br><br>
         🔎 <b>三、今日盯盤的 3 個關鍵變數</b>：<ul style="margin:4px 0 12px 18px;padding:0">{kv_li}</ul>
@@ -1889,9 +1963,9 @@ def meeting_page():
         round1, round2, host_conclusion = generate_two_round_meeting_and_tree(briefing)
         review_rec = build_1700_review_record(sel_d, sched["now"], tw_df, etf_df, briefing, round1, host_conclusion)
 
-        # ── 修改 3 & 4：生成最新數據提示詞，並顯示「問問 GPT / Gemini / Claude」按鈕列 ──
+        # ── 生成最新數據提示詞，並顯示「問問 GPT / Gemini / Claude」按鈕列 ──
         prompt_str = build_external_ai_prompt(briefing, user_position_str=user_pos_str)
-        components.html(render_ask_ai_buttons_html(prompt_str), height=78, scrolling=False)
+        components.html(render_ask_ai_buttons_html(prompt_str), height=82, scrolling=False)
 
         with st.expander("📄 檢視／手動複製最新動態生成的完整 AI 提示詞", expanded=False):
             st.code(prompt_str, language="markdown")
