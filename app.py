@@ -5,7 +5,6 @@ from datetime import datetime, date, time as dtime, timedelta
 import numpy as np, pandas as pd, pytz, requests, yfinance as yf
 import streamlit as st
 import streamlit.components.v1 as components
-import concurrent.futures
 
 # ── 解決 Streamlit Cloud 或部分環境的 SSL 憑證問題 ──
 try:
@@ -13,19 +12,6 @@ try:
     truststore.inject_into_ssl()
 except ImportError:
     pass
-
-# ── 正文提取核心庫 ──
-try:
-    import trafilatura
-    _TRAFILATURA_OK = True
-except ImportError:
-    _TRAFILATURA_OK = False
-
-try:
-    from bs4 import BeautifulSoup
-    _BS4_OK = True
-except ImportError:
-    _BS4_OK = False
 
 # ── OpenAI 客戶端 ──
 try:
@@ -45,7 +31,7 @@ INDEX_TICKER = "^TWII"
 ETF_TICKER = "00631L.TW"
 SYM = ETF_TICKER
 ARCHIVE_FILE = "review_archive_5d.json"
-MAX_ARCHIVE_DAYS = 5  # 改為 5 個交易日
+MAX_ARCHIVE_DAYS = 5
 
 # ── OpenAI API Key 讀取（env > st.secrets） ──
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -60,7 +46,6 @@ def _get_openai_client():
     if not _OPENAI_OK or not OPENAI_API_KEY:
         return None
     try:
-        # 若有中轉站，可透過環境變數 OPENAI_BASE_URL 指定；否則預設官方網址
         base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
         return OpenAI(api_key=OPENAI_API_KEY, base_url=base_url, timeout=90)
     except Exception as e:
@@ -511,7 +496,7 @@ def strategy_data():
                 df.loc[last_idx, "Volume"] = max(df.loc[last_idx, "Volume"], g["Volume"].sum())
     return df, intra
 
-def simulate(df, intra, em, xm, sl, tp1, sl1, cool):
+def simulate(df, intra, em=1.04, xm=0.98, sl=0.03, tp1=0.20, sl1=0.03, cool=5):
     d = df.copy()
     for p in (5, 10, 240):
         d[f"m{p}"] = d.Close.rolling(p).mean()
@@ -831,11 +816,12 @@ def compute_tech_fact_card(df_full, upto_date, label_name, is_etf=False):
         f"若開盤落於 {pivot_dn:,.2f}（前日低點/5MA 下沿）以下，下方第一支撐位在 {sup_1:,.2f}，次一支撐位在 {sup_2:,.2f}。"
     )
 
+    rets_5 = d["Ret"].tail(5).dropna().values
+    std_5d = float(np.std(rets_5, ddof=1)) if len(rets_5) >= 2 else 0.0
+    abs_mean_5d = float(np.mean(np.abs(rets_5))) if len(rets_5) >= 1 else 0.0
+
     etf_extra = ""
     if is_etf:
-        rets_5 = d["Ret"].tail(5).dropna().values
-        std_5d = float(np.std(rets_5, ddof=1)) if len(rets_5) >= 2 else 0.0
-        abs_mean_5d = float(np.mean(np.abs(rets_5))) if len(rets_5) >= 1 else 0.0
         strat_entry = round(ma5 * 1.04, 2)
         strat_exit = round(ma5 * 0.98, 2)
         etf_extra = (
@@ -848,7 +834,8 @@ def compute_tech_fact_card(df_full, upto_date, label_name, is_etf=False):
         "name": label_name, "date_str": r_last.name.strftime("%Y/%m/%d"),
         "close": c, "open": o, "high": h, "low": l, "prev_close": prev_c,
         "chg": chg, "pct": pct, "ma5": ma5, "ma20": ma20, "ma60": ma60, "ma240": ma240,
-        "vol_ratio": round(vol_ratio, 2), "h20": h20, "l20": l20,
+        "vol_cur": vol_cur, "vol_ma5": vol_ma5, "vol_ratio": round(vol_ratio, 2),
+        "h20": h20, "l20": l20, "gap_str": gap_str, "std_5d": round(std_5d, 2),
         "upper_round": upper_round, "lower_round": lower_round,
         "pivot_up": round(pivot_up, 2), "res_1": round(res_1, 2), "res_2": round(res_2, 2),
         "pivot_dn": round(pivot_dn, 2), "sup_1": round(sup_1, 2), "sup_2": round(sup_2, 2),
@@ -871,39 +858,6 @@ def _assign_topic_cluster(title_txt):
             return cl["id"], cl["name"]
     return "general_mkt", "國際財經與市場焦點"
 
-# ── 方案 B：改用 markdown.new 代理抓正文（繞反爬且免 Key） ──
-def _try_extract_article_snippet(url, title_str, src_name, is_paywall):
-    """改用 markdown.new 免費代理抓正文（免 API Key，抗反爬）"""
-    if is_paywall:
-        return False, "僅憑標題判斷（付費牆來源，無法取得全文）"
-
-    try:
-        # 使用免 Key 的 markdown.new 服務
-        proxy_url = f"https://markdown.new/{url}"
-        
-        resp = requests.get(proxy_url, timeout=25)
-        if resp.status_code != 200:
-            return False, f"僅憑標題判斷（代理回應 HTTP {resp.status_code}）"
-
-        text = resp.text or ""
-        if len(text) < 60:
-            return False, "僅憑標題判斷（回傳內容過短）"
-
-        # 清理 markdown 標記與多餘空白
-        text = re.sub(r"\s+", " ", text).strip()
-        if title_str and title_str in text:
-            text = text.replace(title_str, "", 1).strip(" -｜|—：:")
-            
-        if len(text) < 50:
-            return False, "僅憑標題判斷（正文過短，可能為純圖片頁）"
-
-        return True, text[:2400]
-    except requests.exceptions.Timeout:
-        return False, "僅憑標題判斷（連線超時）"
-    except Exception as e:
-        return False, f"僅憑標題判斷（異常：{str(e)[:30]}）"
-
-
 def _judge_priced_in(cluster_id, title_txt, sox_pct, tsm_pct, sp_pct):
     t = title_txt
     bull_words = ["大漲", "創高", "優於預期", "買超", "利多", "上調", "強勁", "成長", "rally", "surge", "beat", "gain"]
@@ -912,22 +866,46 @@ def _judge_priced_in(cluster_id, title_txt, sox_pct, tsm_pct, sp_pct):
     is_bear = any(w in t.lower() for w in bear_words)
     ref_move = 0.5 * sox_pct + 0.5 * tsm_pct if cluster_id in ("tsmc_semi", "nvda_ai") else sp_pct
     if is_bull and ref_move >= 0.6:
-        return "📌 已反映", f"隔夜費半 ({sox_pct:+.2f}%) 與 TSM ({tsm_pct:+.2f}%) 已先行上漲吸收此利多，開盤跳空即反映，不宜追高。"
+        return "📌 已反映"
     if is_bear and ref_move <= -0.6:
-        return "📌 已反映", f"隔夜費半 ({sox_pct:+.2f}%) 與 TSM ({tsm_pct:+.2f}%) 已先行下跌反應此利空，直接體現於開盤跳空。"
+        return "📌 已反映"
     if abs(ref_move) >= 1.2:
-        return "📌 大部分已反映", f"隔夜美股指標波動達 {ref_move:+.2f}%，價格已高度吸收，早盤重點在於現貨開盤承接力道。"
-    return "🔥 尚未完全反映", f"隔夜美股指標變動僅 {ref_move:+.2f}%，需觀察今日開盤後外資與投信現貨實際交投反應。"
+        return "📌 大部分已反映"
+    return "🔥 尚未完全反映"
 
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_and_select_top5_news(window_hours, sox_pct, tsm_pct, nvda_pct, sp_pct):
+    """擷取白名單新聞標題、媒體、時間與新聞網址（不寫發展與影響，亦不耗時爬全文）"""
     days_param = max(2, math.ceil(window_hours / 24.0) + 1)
     raw_candidates = []
     seen_titles = set()
     headers = {"User-Agent": "Mozilla/5.0"}
 
-    # 1. 快速收集 RSS 標題與連結
+    # 1. 優先從鉅亨網台股公開 API 抓取真實直連新聞網址
+    try:
+        r_cn = requests.get("https://api.cnyes.com/media/api/v1/newslist/category/tw_stock?limit=12",
+                            headers=headers, timeout=5)
+        if r_cn.status_code == 200:
+            items = r_cn.json().get("items", {}).get("data", [])
+            for it in items[:5]:
+                nid = it.get("newsId")
+                title = str(it.get("title", "")).strip()
+                pub_ts = it.get("publishAt", 0)
+                if nid and title and len(title) >= 8 and title not in seen_titles:
+                    url = f"https://news.cnyes.com/news/id/{nid}"
+                    pub_str = datetime.fromtimestamp(pub_ts, TZ).strftime("%Y/%m/%d %H:%M") if pub_ts else ""
+                    cid, cname = _assign_topic_cluster(title)
+                    seen_titles.add(title)
+                    raw_candidates.append({
+                        "source": "鉅亨網", "domain": "cnyes.com", "title": title, "url": url,
+                        "pub": pub_str, "cluster_id": cid, "cluster_name": cname,
+                        "is_paywall": False,
+                    })
+    except Exception:
+        pass
+
+    # 2. 從白名單 Google News RSS 收集新聞網址與標題
     for src in NEWS_WHITELIST:
         dom, lang = src["domain"], src["lang"]
         q_str = f"site:{dom} (台股 OR 台積電 OR 費半 OR 輝達 OR 聯準會 OR 外資 OR 半導體) when:{days_param}d" if lang == "zh" else f"site:{dom} (TSMC OR NVIDIA OR semiconductor OR Fed OR Taiwan) when:{days_param}d"
@@ -959,38 +937,11 @@ def fetch_and_select_top5_news(window_hours, sox_pct, tsm_pct, nvda_pct, sp_pct)
                     "pub": (pub_el.text if pub_el is not None else "")[:16],
                     "cluster_id": cid, "cluster_name": cname,
                     "is_paywall": src["paywall"],
-                    "has_body": False, "snippet": ""
                 })
         except Exception:
             continue
 
-    # 2. 先分群，每個 cluster 只取前 3 條送代理抓正文（省時省頻寬）
-    clusters_pre = {}
-    for c in raw_candidates:
-        clusters_pre.setdefault(c["cluster_id"], []).append(c)
-    to_fetch = []
-    for cid, items in clusters_pre.items():
-        # 免費來源優先
-        items_sorted = sorted(items, key=lambda x: x["is_paywall"])
-        to_fetch.extend(items_sorted[:3])
-
-    if to_fetch:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
-            future_to_candidate = {
-                executor.submit(_try_extract_article_snippet, c["url"], c["title"], c["source"], c["is_paywall"]): c
-                for c in to_fetch
-            }
-            for future in concurrent.futures.as_completed(future_to_candidate):
-                c = future_to_candidate[future]
-                try:
-                    has_body, snip = future.result()
-                    c["has_body"] = has_body
-                    c["snippet"] = snip
-                except Exception:
-                    c["has_body"] = False
-                    c["snippet"] = "僅憑標題判斷（正文提取失敗）"
-
-    # 3. 分群挑代表（同群內已含正文者優先）
+    # 3. 依主題分群挑選代表新聞（最多 5 則）
     clusters = {}
     for c in raw_candidates:
         clusters.setdefault(c["cluster_id"], []).append(c)
@@ -998,15 +949,15 @@ def fetch_and_select_top5_news(window_hours, sox_pct, tsm_pct, nvda_pct, sp_pct)
     sorted_cids = sorted(clusters.keys(), key=lambda k: (len(clusters[k]), k != "general_mkt"), reverse=True)
     selected, used_urls = [], set()
     for cid in sorted_cids:
-        group = sorted(clusters[cid], key=lambda x: x["has_body"], reverse=True)
+        group = sorted(clusters[cid], key=lambda x: (x["domain"] != "cnyes.com", x["is_paywall"]))
         rep = group[0]
         other_sources = sorted(list({x["source"] for x in group}))
-        priced_tag, priced_reason = _judge_priced_in(cid, rep["title"], sox_pct, tsm_pct, sp_pct)
+        priced_tag = _judge_priced_in(cid, rep["title"], sox_pct, tsm_pct, sp_pct)
         selected.append({
-            **rep, "source_count": len(other_sources), "all_sources": ", ".join(other_sources),
+            **rep,
+            "source_count": len(other_sources),
+            "all_sources": ", ".join(other_sources),
             "priced_tag": priced_tag,
-            "dev": f"【{rep['cluster_name']}｜共 {len(other_sources)} 家白名單報導（{', '.join(other_sources)}）】{rep['snippet']}",
-            "imp": f"{priced_reason} 對 00631L 而言，臺灣 50 權值股將直接受此事件與隔夜 ADR ({tsm_pct:+.2f}%) 連動。",
         })
         used_urls.add(rep["url"])
         if len(selected) >= 5:
@@ -1016,14 +967,200 @@ def fetch_and_select_top5_news(window_hours, sox_pct, tsm_pct, nvda_pct, sp_pct)
         if len(selected) >= 5:
             break
         if c["url"] not in used_urls:
-            priced_tag, priced_reason = _judge_priced_in(c["cluster_id"], c["title"], sox_pct, tsm_pct, sp_pct)
+            priced_tag = _judge_priced_in(c["cluster_id"], c["title"], sox_pct, tsm_pct, sp_pct)
             selected.append({
-                **c, "source_count": 1, "all_sources": c["source"], "priced_tag": priced_tag,
-                "dev": f"【{c['source']}（{c['domain']}）】{c['snippet']}", "imp": f"{priced_reason}",
+                **c,
+                "source_count": 1,
+                "all_sources": c["source"],
+                "priced_tag": priced_tag,
             })
             used_urls.add(c["url"])
 
     return selected[:5]
+
+
+# ───────────────────────── 動態生成使用者指定之 AI 提示詞 ─────────────────────────
+def build_external_ai_prompt(briefing, user_position_str="空手"):
+    target_d = briefing["target_d"]
+    tw_c = briefing["tw_card"]
+    etf_c = briefing["etf_card"]
+    fl = briefing["flow"]
+    mg = briefing["margin"]
+    op = briefing["oi_pcr"]
+    nv = briefing["nav"]
+    us = briefing["us"]
+    news_list = briefing["news_list"]
+
+    # A. 新聞網址
+    if news_list:
+        news_lines = []
+        for idx, n in enumerate(news_list, 1):
+            pub_info = f"｜發布時間：{n['pub']}" if n.get("pub") else ""
+            news_lines.append(
+                f"{idx}. {n['url']} （標題：{n['title']}｜媒體：{n['source']}{pub_info}）"
+            )
+        news_sec = "\n".join(news_lines)
+    else:
+        news_sec = "1. （目前時間窗內未擷取到新聞網址）"
+
+    # C. 籌碼面欄位格式化
+    if mg.get("ok"):
+        margin_line = f"- 融資餘額：{mg['margin_yi']:,.2f} 億（日增減 {mg['margin_chg_yi']:+.2f} 億）｜融券：{mg['short_lots']:,d} 張（日增減 {mg['short_chg_lots']:+,d} 張）"
+    else:
+        margin_line = "- 融資餘額：未取得（日增減：未取得）｜融券：未取得（日增減：未取得）"
+
+    fx_oi_str = op.get("fx_label", "未取得")
+    pcr_str = op.get("pcr_label", "未取得")
+    nav_str = nv.get("label", "未取得")
+
+    prompt_text = f"""# 角色
+你是台股短線研究員，專長是把「新聞事件、籌碼面、技術面」整合成條件式的交易判斷。
+最終操作標的是 00631L（元大台灣50正2，追蹤臺灣50指數單日正向 2 倍報酬，每日再平衡）。
+
+# 硬性規則
+1. 新聞：請直接讀取下方網址內文；讀不到的網址請用「標題＋媒體名稱」搜尋同一則報導。
+   仍然讀不到的，標註「僅憑標題／未能讀取」，不得編造內容。
+2. 所有論點必須引用下方提供的具體數字（例如「外資 -35.4 億」「收盤低於 5MA 1.2%」），禁止空泛形容。
+3. 區分「事實」與「推論」，推論要寫出信心程度（高／中／低）。
+4. 判斷新聞是否「已被市場反映」：對照隔夜美股與當日實際漲跌，若價格已先行大幅波動，視為已反映，不宜追價。
+5. 不給單一「買／不買」標籤，要給「條件式」結論：在什麼價位或條件下可以買、什麼條件下不要買、何處停損。
+6. 00631L 是 2 倍槓桿，必須評估波動耗損、跳空風險，並以 00631L 自己的價位給出進出場參考。
+7. 你不是持牌投資顧問，結論僅為資訊整理，最後必須附上風險提醒。
+
+# 輸入資料
+
+## A. 新聞網址（共 {len(news_list)} 則）
+{news_sec}
+
+## B. 交易日：{target_d.strftime('%Y/%m/%d')}（台股籌碼與日K基準日：{tw_c['date_str']}）
+
+## C. 籌碼面（上市，億元）
+- 外資現貨：當日 {fl['f1']:+.2f} 億｜近 5 日 {fl['f5']:+.2f} 億｜近 10 日 {fl['f10']:+.2f} 億
+- 投信：當日 {fl['t1']:+.2f} 億｜近 5 日 {fl['t5']:+.2f} 億
+- 自營商：當日 {fl['z1']:+.2f} 億
+{margin_line}
+- 外資台指期淨未平倉：{fx_oi_str}
+- 選擇權 Put/Call 比：{pcr_str}
+- 00631L 折溢價：{nav_str}，成交量：{etf_c['vol_cur']:,.0f} 股（為 5 日均量的 {etf_c['vol_ratio']:.2f} 倍）
+
+## D. 技術面
+加權指數（^TWII）：
+- 開 {tw_c['open']:,.2f} 高 {tw_c['high']:,.2f} 低 {tw_c['low']:,.2f} 收 {tw_c['close']:,.2f}（漲跌 {tw_c['pct']:+.2f}%）
+- 5MA {tw_c['ma5']:,.2f}｜20MA {tw_c['ma20']:,.2f}｜60MA {tw_c['ma60']:,.2f}｜240MA {tw_c['ma240']:,.2f}
+- 成交量為 5 日均量的 {tw_c['vol_ratio']:.2f} 倍
+- 近 20 日高 {tw_c['h20']:,.2f}、低 {tw_c['l20']:,.2f}；未回補缺口：{tw_c['gap_str']}
+00631L：
+- 開 {etf_c['open']:,.2f} 高 {etf_c['high']:,.2f} 低 {etf_c['low']:,.2f} 收 {etf_c['close']:,.2f}（漲跌 {etf_c['pct']:+.2f}%）
+- 5MA {etf_c['ma5']:,.2f}｜20MA {etf_c['ma20']:,.2f}｜240MA {etf_c['ma240']:,.2f}
+- 近 5 日單日報酬標準差：{etf_c['std_5d']:.2f}%
+- 我目前的狀態：{user_position_str}
+
+## E. 隔夜國際市場
+費半 {us['sox_pct']:+.2f}%｜台積電 ADR {us['tsm_pct']:+.2f}%｜NVDA {us['nvda_pct']:+.2f}%｜S&P 500 {us['sp_pct']:+.2f}%｜VIX {us['vix_close']:.2f}（{us['vix_pct']:+.2f}%）｜美債 10Y {us['tnx_close']:.2f}%｜美元兌台幣 {us['fx_close']:.2f}（{us['fx_pct']:+.2f}%）
+
+# 分析流程（請依序完成）
+步驟 1：逐則整理新聞，輸出「事情發展」（發生什麼、關鍵數字、時間點）。
+步驟 2：逐則分析「對台股大盤與臺灣50權值股的影響」，標註利多／利空／中性、影響產業或個股、是否已反映。
+步驟 3：解讀籌碼面，指出哪些指標與新聞方向一致、哪些互相矛盾。
+步驟 4：解讀技術面，指出趨勢位階、量價、關鍵支撐與壓力。
+步驟 5：整合三者，找出「最可能的短線情境」與「最大的反向風險」。
+步驟 6：針對 00631L 給出條件式操作建議。
+
+# 輸出格式（嚴格依此）
+## 一、新聞重點
+| # | 事情發展（100字內） | 方向 | 影響標的 | 是否已反映 |
+
+## 二、籌碼面解讀
+（3~5 點，每點含數字與意義）
+
+## 三、技術面解讀
+（3~5 點，含明確支撐／壓力價位）
+
+## 四、大盤短線展望（1~3 個交易日）
+- 基準情境（機率估計）：…
+- 偏多情境（機率估計）：…
+- 偏空情境（機率估計）：…
+- 三者最關鍵的分歧訊號：…
+
+## 五、00631L 操作建議
+- 整體傾向：偏多／中性／偏空（信心：高／中／低，並說明理由）
+- 若我空手：
+  - 可考慮買進的條件：（價位＋觸發條件，如「開盤站穩 X 元 15 分鐘」）
+  - 不應買進的條件：…
+  - 建議部位上限與停損價：…
+- 若我已持有：續抱／減碼／停損的條件與價位
+- 近 2 日最需盯的 3 個觀察點
+
+## 六、風險與資料限制
+- 本次分析哪些來源讀取失敗或只憑標題
+- 對結論影響最大的不確定因素
+- 非投資建議之免責聲明"""
+    return prompt_text
+
+
+def render_ask_ai_buttons_html(prompt_text):
+    """產生問問 GPT、Gemini、Claude 的一鍵跳轉＋自動帶入／複製提示詞組件"""
+    encoded_q = urllib.parse.quote(prompt_text)
+    gpt_url = f"https://chatgpt.com/?q={encoded_q}"
+    claude_url = f"https://claude.ai/new?q={encoded_q}"
+    gemini_url = f"https://gemini.google.com/app?q={encoded_q}"
+    prompt_json = json.dumps(prompt_text)
+
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+body{{margin:0;background:transparent;font-family:-apple-system,"Noto Sans TC","Microsoft JhengHei",sans-serif;color:#e8e6ee}}
+.ai-bar{{background:linear-gradient(90deg,rgba(255,200,61,.12),rgba(139,92,246,.14));border:1px solid rgba(255,200,61,.45);
+  border-radius:14px;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}}
+.ai-title{{font-weight:800;color:#FFC83D;font-size:1rem;display:flex;flex-direction:column;gap:3px}}
+.ai-title small{{color:#cfcfd8;font-weight:400;font-size:.82rem}}
+.btn-group{{display:flex;gap:10px;flex-wrap:wrap;align-items:center}}
+.ai-btn{{display:inline-flex;align-items:center;gap:7px;padding:9px 16px;border-radius:10px;font-weight:800;font-size:.93rem;
+  text-decoration:none;color:#fff;cursor:pointer;border:1px solid rgba(255,255,255,.18);transition:all .15s ease;
+  box-shadow:0 4px 12px rgba(0,0,0,.3)}}
+.ai-btn:hover{{transform:translateY(-2px);filter:brightness(1.12)}}
+.btn-gpt{{background:linear-gradient(135deg,#10a37f,#0d8a6a)}}
+.btn-gemini{{background:linear-gradient(135deg,#3b82f6,#8b5cf6)}}
+.btn-claude{{background:linear-gradient(135deg,#d97706,#b45309)}}
+.btn-copy{{background:#2a2436;color:#FFC83D;border-color:#FFC83D}}
+#toast{{font-size:.82rem;color:#34d399;font-weight:700;display:none;margin-left:6px}}
+</style></head><body>
+<div class="ai-bar">
+  <div class="ai-title">
+    <span>🚀 一鍵問問 AI（已自動替換為今日最新新聞網址、籌碼與技術面數據）</span>
+    <small>點擊任一按鈕即會直接開啟該 AI 網站並帶入最新提示詞（同時自動複製到剪貼簿，若網站未自動帶入可直接 Ctrl+V 貼上送出）</small>
+  </div>
+  <div class="btn-group">
+    <a class="ai-btn btn-gpt" href="{gpt_url}" target="_blank" rel="noopener noreferrer" onclick="copyPrompt('ChatGPT')">💬 問問 GPT</a>
+    <a class="ai-btn btn-gemini" href="{gemini_url}" target="_blank" rel="noopener noreferrer" onclick="copyPrompt('Gemini')">✨ 問問 Gemini</a>
+    <a class="ai-btn btn-claude" href="{claude_url}" target="_blank" rel="noopener noreferrer" onclick="copyPrompt('Claude')">🧠 問問 Claude</a>
+    <button class="ai-btn btn-copy" onclick="copyPrompt('剪貼簿')">📋 僅複製提示詞</button>
+    <span id="toast">✅ 已複製最新提示詞！</span>
+  </div>
+</div>
+<script>
+const PROMPT_TEXT = {prompt_json};
+function copyPrompt(targetName) {{
+  if (navigator.clipboard && navigator.clipboard.writeText) {{
+    navigator.clipboard.writeText(PROMPT_TEXT).catch(()=>fallbackCopy());
+  }} else {{
+    fallbackCopy();
+  }}
+  const t = document.getElementById('toast');
+  if (t) {{
+    t.innerText = '✅ 已同步複製提示詞（可直接於 ' + targetName + ' 送出）';
+    t.style.display = 'inline';
+    setTimeout(()=>{{ t.style.display = 'none'; }}, 5000);
+  }}
+}}
+function fallbackCopy() {{
+  const ta = document.createElement('textarea');
+  ta.value = PROMPT_TEXT;
+  document.body.appendChild(ta);
+  ta.select();
+  document.execCommand('copy');
+  document.body.removeChild(ta);
+}}
+</script>
+</body></html>"""
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1059,20 +1196,17 @@ VIX {us['vix_close']:.2f}（{us['vix_pct']:+.2f}%）
 """
 
 
-def _build_news_block(briefing, max_chars_per_news=1400):
+def _build_news_block(briefing):
     lines = []
     for i, n in enumerate(briefing["news_list"], 1):
-        body = n["snippet"] if n.get("has_body") else "（僅標題，無正文）"
-        body = body[:max_chars_per_news]
         lines.append(
-            f"--- 新聞 {i}｜{n['source']}（{n.get('cluster_name', n.get('cluster_id', ''))}）｜{n['priced_tag']} ---\n"
-            f"標題：{n['title']}\n內文：{body}\n"
+            f"--- 新聞 {i}｜{n['source']}｜{n['priced_tag']} ---\n"
+            f"標題：{n['title']}\n網址：{n['url']}\n"
         )
     return "\n".join(lines) if lines else "（無可用新聞）"
 
 
 def _call_llm_json(client, prompt, model, temperature=0.4, max_tokens=4000):
-    """呼叫 LLM 並強制解析 JSON；失敗回傳 None"""
     try:
         resp = client.chat.completions.create(
             model=model,
@@ -1093,7 +1227,6 @@ def _call_llm_json(client, prompt, model, temperature=0.4, max_tokens=4000):
 
 
 def _ai_generate_committee(briefing):
-    """用 LLM 生成 3 輪討論；失敗則回傳 None"""
     client = _get_openai_client()
     if client is None:
         return None
@@ -1102,7 +1235,6 @@ def _ai_generate_committee(briefing):
     facts = _build_facts_block(briefing)
     news_block = _build_news_block(briefing)
 
-    # ---------- Round 1 ----------
     prompt_r1 = f"""你是一場盤前投資委員會的主持人，需要模擬 4 位委員的第一輪獨立發言。
 
 {facts}
@@ -1152,7 +1284,6 @@ def _ai_generate_committee(briefing):
         if not base:
             continue
         merged = {**base, **{k: v for k, v in item.items() if k != "id"}}
-        # 强制立场一致性
         if merged.get("stance") not in ("偏多", "偏空", "觀望"):
             merged["stance"] = "觀望"
         for k in ("confidence", "thesis", "causal_chain", "evidence", "advice_flat", "advice_hold"):
@@ -1162,7 +1293,6 @@ def _ai_generate_committee(briefing):
     if len(round1) < 4:
         return None
 
-    # ---------- Round 2 ----------
     r1_summary = "\n".join(
         f"- {m['name']}（{m['stance']}）：{m['thesis']}" for m in round1
     )
@@ -1213,7 +1343,6 @@ def _ai_generate_committee(briefing):
     if len(round2) < 4:
         return None
 
-    # ---------- Host Conclusion ----------
     prompt_host = f"""作為主持人，整合以下資訊並給出最終結論。
 
 {facts}
@@ -1255,7 +1384,7 @@ def _ai_generate_committee(briefing):
     return round1, round2, host
 
 
-# ── 保底：規則引擎（原版本） ──
+# ── 保底：規則引擎 ──
 def _rule_based_committee(briefing):
     us, flow, margin, oi_pcr, nav = briefing["us"], briefing["flow"], briefing["margin"], briefing["oi_pcr"], briefing["nav"]
     tw_card, etf_card, news_list = briefing["tw_card"], briefing["etf_card"], briefing["news_list"]
@@ -1335,7 +1464,6 @@ def _rule_based_committee(briefing):
 
 
 def generate_two_round_meeting_and_tree(briefing):
-    """AI 優先；失敗回退規則引擎。用 session_state 快取結果避免重複燒 token。"""
     cache_key = (
         f"ai_committee_{briefing['target_d']}_"
         f"{briefing['us']['sox_pct']:.2f}_{briefing['us']['tsm_pct']:.2f}_"
@@ -1503,22 +1631,19 @@ def render_morning_meeting_html(briefing, round1, round2, host_conclusion, revie
     us = briefing["us"]
     news_list = briefing["news_list"]
 
+    # ── 修改 2：僅擷取新聞標題、媒體、時間與網址，不顯示所謂的「事情發展」及「影響」 ──
     news_cards_html = ""
     for idx, n in enumerate(news_list, 1):
-        p_col = "#38bdf8" if "已反映" in n["priced_tag"] else "#f59e0b"
-        b_tag = "✅ 含內文摘要" if n.get("has_body") else "⚠️ 僅憑標題判斷"
+        pub_txt = f" · {n['pub']}" if n.get("pub") else ""
         news_cards_html += (
             f"<div class='ev-card'>"
             f"<div class='ev-head'>"
             f"<span class='ev-num'>新聞 #{idx}</span>"
-            f"<a class='ev-link' href='{n['url']}' target='_blank' rel='noopener noreferrer'>{n['title']}<span class='ext-ico'>↗ 點擊核對原文 ({n['source']})</span></a>"
-            f"<span class='p-tag' style='border-color:{p_col};color:{p_col}'>{n['priced_tag']}</span>"
-            f"<span class='b-tag'>{b_tag}</span>"
+            f"<span class='b-tag'>{n['source']}{pub_txt}</span>"
+            f"<a class='ev-link' href='{n['url']}' target='_blank' rel='noopener noreferrer'>{n['title']}</a>"
             f"</div>"
-            f"<div class='ev-detail'>"
-            f"<div class='ev-row'><span class='tag-dev'>🔹 事情發展</span><span>{n['dev']}</span></div>"
-            f"<div class='ev-row'><span class='tag-imp'>🔸 下個交易日影響</span><span>{n['imp']}</span></div>"
-            f"</div></div>"
+            f"<div class='ev-url'>🔗 網址：<a href='{n['url']}' target='_blank' rel='noopener noreferrer'>{n['url']}</a></div>"
+            f"</div>"
         )
     if not news_cards_html:
         news_cards_html = "<div class='ev-card'>目前白名單時間窗內未抓到可驗證連結之新聞，絕不自行編造標題。</div>"
@@ -1587,6 +1712,7 @@ def render_morning_meeting_html(briefing, round1, round2, host_conclusion, revie
     else:
         review_html = f"<div class='msg-row host' style='border-color:#64748b'><div class='avatar' style='background:#475569;color:#fff'>復</div><div style='flex:1'>{review_rec['msg']}</div></div>"
 
+    # ── 修改 1：.fact-grid 設為 grid-template-columns: 1fr，讓事實卡 B 移到事實卡 A 的正下方 ──
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
 body{{margin:0;background:transparent;color:#e8e6ee;font-family:-apple-system,"Noto Sans TC","Microsoft JhengHei",sans-serif}}
 .chat-room{{display:flex;flex-direction:column;gap:20px;padding:6px 6px 18px 6px}}
@@ -1599,23 +1725,18 @@ body{{margin:0;background:transparent;color:#e8e6ee;font-family:-apple-system,"N
 .b-name{{font-weight:800;color:#fff;font-size:1.14rem}}
 .b-role{{font-size:.83rem;color:#b0adc0;background:#2a2436;padding:3px 10px;border-radius:6px}}
 .b-time{{font-size:.83rem;color:#8a8699;margin-left:auto}}
-.fact-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:10px 0}}
-@media(max-width:800px){{.fact-grid{{grid-template-columns:1fr}}}}
+.fact-grid{{display:grid;grid-template-columns:1fr;gap:12px;margin:10px 0}}
 .fact-card{{background:rgba(0,0,0,.3);border:1px solid #3b3154;border-radius:11px;padding:11px 14px;font-size:.92rem;line-height:1.65}}
 .fact-card h4{{margin:0 0 6px 0;color:#FFC83D;font-size:.98rem}}
-.ev-wrap{{display:flex;flex-direction:column;gap:10px;margin-top:8px}}
-.ev-card{{background:rgba(0,0,0,.28);border:1px solid #312942;border-radius:11px;padding:11px 14px}}
-.ev-head{{display:flex;align-items:center;gap:9px;margin-bottom:7px;flex-wrap:wrap}}
+.ev-wrap{{display:flex;flex-direction:column;gap:8px;margin-top:8px}}
+.ev-card{{background:rgba(0,0,0,.28);border:1px solid #312942;border-radius:11px;padding:10px 14px}}
+.ev-head{{display:flex;align-items:center;gap:9px;flex-wrap:wrap}}
 .ev-num{{background:#3b3154;color:#ffc83d;font-weight:800;font-size:.82rem;padding:2px 8px;border-radius:6px}}
-.ev-link{{color:#fff;font-weight:700;font-size:1.01rem;text-decoration:none;border-bottom:1px dashed rgba(255,200,61,.55)}}
+.ev-link{{color:#fff;font-weight:700;font-size:.98rem;text-decoration:none;border-bottom:1px dashed rgba(255,200,61,.55)}}
 .ev-link:hover{{color:#FFC83D}}
-.ext-ico{{font-size:.78rem;color:#a78bfa;margin-left:7px;font-weight:500}}
-.p-tag{{border:1px solid;padding:1px 8px;border-radius:99px;font-size:.78rem;font-weight:700;margin-left:auto}}
-.b-tag{{background:rgba(255,255,255,.07);color:#cfcfd8;padding:1px 8px;border-radius:6px;font-size:.76rem}}
-.ev-detail{{display:flex;flex-direction:column;gap:5px;font-size:.93rem;color:#ddd9e8;line-height:1.62}}
-.ev-row{{display:flex;align-items:flex-start;gap:8px}}
-.tag-dev{{background:rgba(59,130,246,.18);color:#93c5fd;border:1px solid rgba(59,130,246,.4);font-size:.78rem;font-weight:700;padding:1px 7px;border-radius:5px;white-space:nowrap;margin-top:2px}}
-.tag-imp{{background:rgba(244,114,182,.18);color:#f9a8d4;border:1px solid rgba(244,114,182,.4);font-size:.78rem;font-weight:700;padding:1px 7px;border-radius:5px;white-space:nowrap;margin-top:2px}}
+.ev-url{{margin-top:5px;font-size:.82rem;color:#93c5fd;word-break:break-all}}
+.ev-url a{{color:#93c5fd;text-decoration:underline}}
+.b-tag{{background:rgba(255,255,255,.08);color:#cfcfd8;padding:2px 8px;border-radius:6px;font-size:.78rem}}
 .item-row{{margin-bottom:8px;font-size:.95rem}}
 .item-row.causal{{background:rgba(59,130,246,.1);border-left:3px solid #3b82f6;padding:8px 12px;border-radius:6px}}
 .think-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:8px}}
@@ -1628,7 +1749,7 @@ body{{margin:0;background:transparent;color:#e8e6ee;font-family:-apple-system,"N
 </style></head><body>
 <div class="chat-room">
 
-  <div class="sec-banner">步驟一 ＆ 二：08:30 主持人盤前客觀簡報（只陳述事實、不下結論）＋ 5 則最重要白名單新聞</div>
+  <div class="sec-banner">步驟一 ＆ 二：08:30 主持人盤前客觀簡報（只陳述事實、不下結論）＋ 5 則白名單新聞網址</div>
 
   <div class="msg-row host">
     <div class="avatar" style="background:linear-gradient(135deg,#FFC83D,#d97706);color:#000">主</div>
@@ -1641,10 +1762,10 @@ body{{margin:0;background:transparent;color:#e8e6ee;font-family:-apple-system,"N
       <div style="font-size:.95rem;line-height:1.72">
         ⚠️ <b>標的基準特別說明</b>：最終操作標的 <code>00631L</code> 追蹤的是<b>「臺灣 50 指數」單日正向 2 倍報酬（非加權指數）</b>，台指期夜盤或臺灣 50 成分股漲跌 1%，大約對應 <code>00631L</code> 漲跌 <b>2%</b> 左右。<br>
         💰 <b>籌碼事實（上一交易日 {fl['date_label']}）</b>：<br>
-        ‧ <b>三大法人現貨買賣超</b>：外資 <b style="color:{_col(fl['f1'])}">{fl['f1']:+.1f} 億</b>（近5日 {fl['f5']:+.1f} 億）｜投信 <b style="color:{_col(fl['t1'])}">{fl['t1']:+.1f} 億</b>（近5日 {fl['t5']:+.1f} 億）｜自營商 <b style="color:{_col(fl['z1'])}">{fl['z1']:+.1f} 億</b>。<br>
+        ‧ <b>三大法人現貨買賣超</b>：外資 <b style="color:{_col(fl['f1'])}">{fl['f1']:+.1f} 億</b>（近5日 {fl['f5']:+.1f} 億｜近10日 {fl['f10']:+.1f} 億）｜投信 <b style="color:{_col(fl['t1'])}">{fl['t1']:+.1f} 億</b>（近5日 {fl['t5']:+.1f} 億）｜自營商 <b style="color:{_col(fl['z1'])}">{fl['z1']:+.1f} 億</b>。<br>
         ‧ <b>大盤融資融券</b>：{mg['label']}<br>
         ‧ <b>外資台指期未平倉 ＆ 選擇權 P/C 比</b>：外資台指期淨部位 <b>{op['fx_label']}</b> ｜ 選擇權 Put/Call 比 <b>{op['pcr_label']}</b><br>
-        ‧ <b>00631L 折溢價與量能</b>：{nv['label']}<br>
+        ‧ <b>00631L 折溢價與量能</b>：{nv['label']}（成交量 {etf_c['vol_cur']:,.0f} 股，為 5 日均量的 {etf_c['vol_ratio']:.2f} 倍）<br>
         🌎 <b>費半與美股事實（{us['date_str']} 收盤）</b>：費半 <b style="color:{_col(us['sox_pct'])}">{us['sox_pct']:+.2f}%</b> ｜ 台積電 ADR <b style="color:{_col(us['tsm_pct'])}">{us['tsm_pct']:+.2f}%</b>（換算台股溢價率 <b>{us['adr_prem']:+.2f}%</b>）｜ NVDA <b style="color:{_col(us['nvda_pct'])}">{us['nvda_pct']:+.2f}%</b> ｜ S&P 500 <b style="color:{_col(us['sp_pct'])}">{us['sp_pct']:+.2f}%</b> ｜ VIX <b>{us['vix_close']:.2f}</b>（{us['vix_pct']:+.2f}%）｜ 10Y 殖利率 <b>{us['tnx_close']:.2f}%</b> ｜ 美元兌台幣 <b>{us['fx_close']:.2f}</b>（{us['fx_pct']:+.2f}%）。
 
         <div class="fact-grid">
@@ -1667,7 +1788,7 @@ body{{margin:0;background:transparent;color:#e8e6ee;font-family:-apple-system,"N
           </div>
         </div>
 
-        <div style="margin-top:10px;font-weight:800;color:#FFC83D">📰 主持人挑選 5 則對下一交易日台股與 00631L 最重要之白名單新聞（含已反映／尚未反映判定）：</div>
+        <div style="margin-top:10px;font-weight:800;color:#FFC83D">📰 擷取之白名單新聞網址清單（共 {len(news_list)} 則）：</div>
         <div class="ev-wrap">{news_cards_html}</div>
       </div>
     </div>
@@ -1716,14 +1837,23 @@ def meeting_page():
     valid_5_strs = [d.strftime("%Y-%m-%d") for d in archive_dates]
     store = load_rolling_archive()
 
-    with st.spinner("載入早會簡報、白名單新聞與 5 日滾動存檔…"):
-        etf_df = load_daily(ETF_TICKER, "3y")
+    with st.spinner("載入早會簡報、白名單新聞網址與 5 日滾動存檔…"):
+        etf_df, etf_intra = strategy_data()
         days_flow = last_15_flows()
+
+    # 讀取策略 B 目前部位狀態作為提示詞預設值
+    default_pos_idx = 0
+    default_cost = float(etf_df["Close"].iloc[-1]) if not etf_df.empty else 200.0
+    if len(etf_df) >= 245:
+        sim_res = simulate(etf_df, etf_intra)
+        if sim_res["pos"]:
+            default_pos_idx = 1
+            default_cost = round(float(sim_res["ep"]), 2)
 
     with st.container(key="vote_card"):
         st.markdown(
             "<div class='fl-h'>🤖 08:30 盤前結構化早會 ＆ 17:00 盤後復盤紀錄中心"
-            "<small>AI 生成雙輪討論 · 條件式決策樹 · 5 日滾動存檔</small></div>",
+            "<small>一鍵問問 AI（GPT / Gemini / Claude）· 條件式決策樹 · 5 日滾動存檔</small></div>",
             unsafe_allow_html=True
         )
 
@@ -1734,21 +1864,37 @@ def meeting_page():
         else:
             st.error(sched["banner_msg"])
 
-        opt_map = {
-            f"{'🟢 [今日早會]' if (sched['has_live_meeting'] and d == sched['cur_d']) else '📁 [歷史存檔]'} {fmt_d(d)} 08:30 早會與 17:00 復盤紀錄": d
-            for d in archive_dates
-        }
-        chosen_label = st.selectbox(
-            f"📅 選擇檢視紀錄（系統嚴格滾動保留最近 {MAX_ARCHIVE_DAYS} 個交易日，舊紀錄自動刪除）",
-            list(opt_map.keys()),
-            index=0
-        )
+        c_sel, c_pos, c_cost = st.columns([3.2, 1.2, 1.2], vertical_alignment="bottom")
+        with c_sel:
+            opt_map = {
+                f"{'🟢 [今日早會]' if (sched['has_live_meeting'] and d == sched['cur_d']) else '📁 [歷史存檔]'} {fmt_d(d)} 08:30 早會與 17:00 復盤紀錄": d
+                for d in archive_dates
+            }
+            chosen_label = st.selectbox(
+                f"📅 選擇檢視紀錄（滾動保留最近 {MAX_ARCHIVE_DAYS} 個交易日）",
+                list(opt_map.keys()),
+                index=0
+            )
+        with c_pos:
+            pos_status = st.selectbox("📌 提示詞部位狀態", ["空手", "持有"], index=default_pos_idx)
+        with c_cost:
+            hold_cost = st.number_input("💰 持有成本（元）", value=default_cost, step=0.5, disabled=(pos_status == "空手"))
+
+        user_pos_str = "空手" if pos_status == "空手" else f"持有，成本 {hold_cost:,.2f} 元"
+
         sel_d = opt_map[chosen_label]
         is_latest = (sel_d == archive_dates[0])
 
         briefing = build_meeting_briefing_for_date(sel_d, tw_df, etf_df, days_flow, is_latest)
         round1, round2, host_conclusion = generate_two_round_meeting_and_tree(briefing)
         review_rec = build_1700_review_record(sel_d, sched["now"], tw_df, etf_df, briefing, round1, host_conclusion)
+
+        # ── 修改 3 & 4：生成最新數據提示詞，並顯示「問問 GPT / Gemini / Claude」按鈕列 ──
+        prompt_str = build_external_ai_prompt(briefing, user_position_str=user_pos_str)
+        components.html(render_ask_ai_buttons_html(prompt_str), height=78, scrolling=False)
+
+        with st.expander("📄 檢視／手動複製最新動態生成的完整 AI 提示詞", expanded=False):
+            st.code(prompt_str, language="markdown")
 
         ai_status = st.session_state.get(f"ai_status_{sel_d}", "")
         if ai_status == "ai":
@@ -1758,7 +1904,7 @@ def meeting_page():
         elif ai_status == "ai_error":
             st.caption("⚠️ AI 呼叫異常（網路／額度／key 問題），本日已回退至規則引擎")
         elif ai_status == "no_key":
-            st.caption("🔑 未偵測到 `OPENAI_API_KEY`，使用內建規則引擎產出討論。設定環境變數後即可啟用 AI 生成。")
+            st.caption("🔑 未偵測到 `OPENAI_API_KEY`，使用內建規則引擎產出討論。亦可直接點擊上方「問問 GPT / Gemini / Claude」進行分析。")
 
         d_key = sel_d.strftime("%Y-%m-%d")
         store[d_key] = {
