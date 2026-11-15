@@ -23,6 +23,7 @@ INDEX_TICKER = "^TWII"
 ETF_TICKER = "00631L.TW"
 SYM = ETF_TICKER
 MAX_ARCHIVE_DAYS = 5
+MAX_NEWS_COUNT = 10                              # 網站新聞擷取數量提升為 10 則
 
 NEWS_WHITELIST = [
     {"name": "中央社",    "domain": "cna.com.tw",       "lang": "zh", "paywall": False},
@@ -864,8 +865,8 @@ def _assign_topic_cluster(title_txt):
     return "general_mkt", "國際財經與市場焦點"
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_and_select_top5_news(window_hours):
-    """擷取白名單新聞標題、媒體、時間與新聞網址"""
+def fetch_and_select_top10_news(window_hours, max_count=MAX_NEWS_COUNT):
+    """擷取 10 則白名單新聞標題、媒體、時間與新聞網址（主題分群輪詢平衡）"""
     days_param = max(2, math.ceil(window_hours / 24.0) + 1)
     raw_candidates = []
     seen_titles = set()
@@ -873,11 +874,11 @@ def fetch_and_select_top5_news(window_hours):
 
     # 1. 優先從鉅亨網台股公開 API 抓取真實直連新聞網址
     try:
-        r_cn = requests.get("https://api.cnyes.com/media/api/v1/newslist/category/tw_stock?limit=12",
+        r_cn = requests.get("https://api.cnyes.com/media/api/v1/newslist/category/tw_stock?limit=15",
                             headers=headers, timeout=5)
         if r_cn.status_code == 200:
             items = r_cn.json().get("items", {}).get("data", [])
-            for it in items[:5]:
+            for it in items[:8]:
                 nid = it.get("newsId")
                 title = str(it.get("title", "")).strip()
                 pub_ts = it.get("publishAt", 0)
@@ -906,7 +907,7 @@ def fetch_and_select_top5_news(window_hours):
             root = ET.fromstring(r.content)
             cnt = 0
             for item in root.findall(".//item"):
-                if cnt >= 3:
+                if cnt >= 4:
                     break
                 raw_t = item.find("title")
                 link_el = item.find("link")
@@ -930,29 +931,40 @@ def fetch_and_select_top5_news(window_hours):
         except Exception:
             continue
 
-    # 3. 依主題分群挑選代表新聞（最多 5 則）
+    # 3. 依主題分群輪詢挑選代表新聞（最多 10 則）
     clusters = {}
     for c in raw_candidates:
         clusters.setdefault(c["cluster_id"], []).append(c)
 
+    for cid in clusters:
+        clusters[cid] = sorted(clusters[cid], key=lambda x: (x["domain"] != "cnyes.com", x["is_paywall"]))
+
     sorted_cids = sorted(clusters.keys(), key=lambda k: (len(clusters[k]), k != "general_mkt"), reverse=True)
     selected, used_urls = [], set()
-    for cid in sorted_cids:
-        group = sorted(clusters[cid], key=lambda x: (x["domain"] != "cnyes.com", x["is_paywall"]))
-        rep = group[0]
-        selected.append(rep)
-        used_urls.add(rep["url"])
-        if len(selected) >= 5:
+
+    # 多輪輪詢各主題群組，確保 10 則新聞主題多元不單一
+    for round_idx in range(3):
+        for cid in sorted_cids:
+            if len(selected) >= max_count:
+                break
+            group = clusters[cid]
+            if round_idx < len(group):
+                rep = group[round_idx]
+                if rep["url"] not in used_urls:
+                    selected.append(rep)
+                    used_urls.add(rep["url"])
+        if len(selected) >= max_count:
             break
 
+    # 若未滿 10 則，由剩餘候選池補足
     for c in raw_candidates:
-        if len(selected) >= 5:
+        if len(selected) >= max_count:
             break
         if c["url"] not in used_urls:
             selected.append(c)
             used_urls.add(c["url"])
 
-    return selected[:5]
+    return selected[:max_count]
 
 
 # ───────────────────────── 動態生成使用者指定之 AI 提示詞 ─────────────────────────
@@ -967,7 +979,7 @@ def build_external_ai_prompt(briefing, user_position_str="空手"):
     us = briefing["us"]
     news_list = briefing["news_list"]
 
-    # A. 新聞網址
+    # A. 新聞網址（共 N 則）
     if news_list:
         news_lines = []
         for idx, n in enumerate(news_list, 1):
@@ -994,14 +1006,12 @@ def build_external_ai_prompt(briefing, user_position_str="空手"):
 最終操作標的是 00631L（元大台灣50正2，追蹤臺灣50指數單日正向 2 倍報酬，每日再平衡）。
 
 # 硬性規則
-1. 新聞：請直接讀取下方網址內文；讀不到的網址請用「標題＋媒體名稱」搜尋同一則報導。
+1. 新聞：請直接讀取下方網址內文；讀不到的網址請用「標題＋媒體名稱」搜尋同一則報導，並從中挑出你覺得對於台股市場最有影響力的8篇去分析。
    仍然讀不到的，標註「僅憑標題／未能讀取」，不得編造內容。
-2. 所有論點必須引用下方提供的具體數字（例如「外資 -35.4 億」「收盤低於 5MA 1.2%」），禁止空泛形容。
-3. 區分「事實」與「推論」，推論要寫出信心程度（高／中／低）。
+2. 所有論點必須引用下方提供的具體數字（例如「外資 -35.4 億」「收盤低於 5MA 1.2%」），禁止空泛形容，若提供資料過少，不足於提供分析使用，可自行上網搜尋，但需標示哪些是你去另外找的。
+3. 區分「事實」與「推論」。
 4. 判斷新聞是否「已被市場反映」：對照隔夜美股與當日實際漲跌，若價格已先行大幅波動，視為已反映，不宜追價。
 5. 不給單一「買／不買」標籤，要給「條件式」結論：在什麼價位或條件下可以買、什麼條件下不要買、何處停損。
-6. 00631L 是 2 倍槓桿，必須評估波動耗損、跳空風險，並以 00631L 自己的價位給出進出場參考。
-7. 你不是持牌投資顧問，結論僅為資訊整理，最後必須附上風險提醒。
 
 # 輸入資料
 
@@ -1044,7 +1054,7 @@ def build_external_ai_prompt(briefing, user_position_str="空手"):
 
 # 輸出格式（嚴格依此）
 ## 一、新聞重點
-| # | 事情發展（100字內） | 方向 | 影響標的 | 是否已反映 |
+| # | 事情發展（100字內） | 方向 | 影響標的 | 其他相關影響 |
 
 ## 二、籌碼面解讀
 （3~5 點，每點含數字與意義）
@@ -1059,7 +1069,7 @@ def build_external_ai_prompt(briefing, user_position_str="空手"):
 - 三者最關鍵的分歧訊號：…
 
 ## 五、00631L 操作建議
-- 整體傾向：偏多／中性／偏空（信心：高／中／低，並說明理由）
+- 整體傾向：偏多／中性／偏空（說明理由）
 - 若我空手：
   - 可考慮買進的條件：（價位＋觸發條件，如「開盤站穩 X 元 15 分鐘」）
   - 不應買進的條件：…
@@ -1069,8 +1079,7 @@ def build_external_ai_prompt(briefing, user_position_str="空手"):
 
 ## 六、風險與資料限制
 - 本次分析哪些來源讀取失敗或只憑標題
-- 對結論影響最大的不確定因素
-- 非投資建議之免責聲明"""
+- 對結論影響最大的不確定因素"""
     return prompt_text
 
 
@@ -1101,7 +1110,7 @@ body{{margin:0;background:transparent;font-family:-apple-system,"Noto Sans TC","
 </style></head><body>
 <div class="ai-bar">
   <div class="ai-title">
-    <span>🚀 一鍵問問 AI（已自動替換為今日最新新聞網址、籌碼與技術面數據）</span>
+    <span>🚀 一鍵問問 AI（已自動替換為今日最新 10 則新聞網址、籌碼與技術面數據）</span>
     <small>GPT／Claude 點擊即自動帶入對話框；Gemini 因 Google 官方不開放網址填入，點擊時已自動複製提示詞，進頁面直接按 Ctrl+V 貼上即可送出</small>
   </div>
   <div class="btn-group">
@@ -1140,7 +1149,6 @@ function syncCopyText(text) {{
 }}
 
 function openAI(mode) {{
-  // 1. 在開啟新分頁前，先於當前焦點同步強制寫入剪貼簿
   syncCopyText(PROMPT_TEXT);
 
   const t = document.getElementById('toast');
@@ -1159,7 +1167,6 @@ function openAI(mode) {{
   }}
   t.style.display = 'block';
 
-  // 2. 開啟對應 AI 網站
   window.open(URL_MAP[mode], '_blank', 'noopener,noreferrer');
 }}
 </script>
@@ -1220,7 +1227,7 @@ def build_meeting_briefing_for_date(target_d, tw_df, etf_df, days_flow, is_lates
         "sp_close": sp_c, "sp_pct": sp_pct, "vix_close": vix_c, "vix_pct": vix_pct,
         "tnx_close": tnx_c, "tnx_pct": tnx_pct, "fx_close": fx_c, "fx_pct": fx_pct, "adr_prem": adr_prem,
     }
-    news_list = fetch_and_select_top5_news(window_hours)
+    news_list = fetch_and_select_top10_news(window_hours, max_count=MAX_NEWS_COUNT)
 
     return {
         "target_d": target_d, "prev_d": prev_d, "window_hours": window_hours,
@@ -1231,7 +1238,7 @@ def build_meeting_briefing_for_date(target_d, tw_df, etf_df, days_flow, is_lates
 
 
 def render_morning_meeting_html(briefing):
-    """僅呈現盤前客觀簡報、技術面事實卡 A & B（上下排列）與新聞網址清單，不分步驟且刪除新聞後所有內容"""
+    """僅呈現盤前客觀簡報、技術面事實卡 A & B（上下排列）與 10 則新聞網址清單"""
     target_d = briefing["target_d"]
     prev_d = briefing["prev_d"]
     tw_c = briefing["tw_card"]
@@ -1338,7 +1345,7 @@ def meeting_page():
     sched = get_schedule_state(tw_df)
     archive_dates = sched["archive_dates"]
 
-    with st.spinner("載入早會簡報與白名單新聞網址…"):
+    with st.spinner("載入早會簡報與 10 則白名單新聞網址…"):
         etf_df, etf_intra = strategy_data()
         days_flow = last_15_flows()
 
@@ -1354,7 +1361,7 @@ def meeting_page():
     with st.container(key="vote_card"):
         st.markdown(
             "<div class='fl-h'>🤖 08:30 盤前結構化早會中心"
-            "<small>一鍵問問 AI（GPT / Gemini / Claude）· 盤前數據與新聞網址整合</small></div>",
+            "<small>一鍵問問 AI（GPT / Gemini / Claude）· 盤前數據與 10 則新聞網址整合</small></div>",
             unsafe_allow_html=True
         )
 
@@ -1388,13 +1395,13 @@ def meeting_page():
 
         briefing = build_meeting_briefing_for_date(sel_d, tw_df, etf_df, days_flow, is_latest)
 
-        # ── 僅保留「一鍵問問 AI」按鈕列（刪除下方檢視提示詞展開匣與警告文字） ──
+        # ── 僅保留「一鍵問問 AI」按鈕列 ──
         prompt_str = build_external_ai_prompt(briefing, user_position_str=user_pos_str)
         components.html(render_ask_ai_buttons_html(prompt_str), height=100, scrolling=False)
 
-        # ── 顯示盤前事實簡報與新聞網址（不分步驟、刪除新聞之後的所有內容） ──
+        # ── 顯示盤前事實簡報與 10 則新聞網址 ──
         html_doc = render_morning_meeting_html(briefing)
-        components.html(html_doc, height=960, scrolling=True)
+        components.html(html_doc, height=1300, scrolling=True)
 
 
 # ───────────────────────── 導覽列與三頁整合組版 ─────────────────────────
