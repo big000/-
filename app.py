@@ -1366,7 +1366,7 @@ with st.container(key="nav"):
     nl, nr = st.columns([5, 4], vertical_alignment="center")
     nl.markdown("<h1>📈 破產後重生之我要靠量化交易發財</h1>", unsafe_allow_html=True)
     with nr:
-        page = pick("導覽", ["大盤", "策略 ", "早會"], "nav_page")
+        page = pick("導覽", ["大盤", "策略B ", "早會簡報"], "nav_page")
 
 with st.container(key="body"):
     if page == "大盤":
