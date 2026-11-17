@@ -13,12 +13,8 @@ try:
 except ImportError:
     pass
 
-st.set_page_config(
-    page_title="破產後重生之我要靠量化交易發財",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+st.set_page_config(page_title="破產後重生之我要靠量化交易發財", page_icon="📈", layout="wide",
+                   initial_sidebar_state="collapsed")
 TZ = pytz.timezone("Asia/Taipei")
 UP, DN = "#ff4d5a", "#22c55e"                   # 台股慣例：紅漲綠跌
 
@@ -27,18 +23,18 @@ INDEX_TICKER = "^TWII"
 ETF_TICKER = "00631L.TW"
 SYM = ETF_TICKER
 MAX_ARCHIVE_DAYS = 5
-MAX_NEWS_COUNT = 10                             # 網站新聞擷取數量提升為 10 則
+MAX_NEWS_COUNT = 10                              # 網站新聞擷取數量提升為 10 則
 
 NEWS_WHITELIST = [
-    {"name": "中央社",   "domain": "cna.com.tw",       "lang": "zh", "paywall": False},
-    {"name": "經濟日報", "domain": "money.udn.com",    "lang": "zh", "paywall": False},
-    {"name": "工商時報", "domain": "ctee.com.tw",      "lang": "zh", "paywall": False},
-    {"name": "鉅亨網",   "domain": "cnyes.com",        "lang": "zh", "paywall": False},
-    {"name": "Reuters",  "domain": "reuters.com",      "lang": "en", "paywall": False},
-    {"name": "CNBC",     "domain": "cnbc.com",         "lang": "en", "paywall": False},
-    {"name": "Bloomberg","domain": "bloomberg.com",    "lang": "en", "paywall": True},
-    {"name": "WSJ",      "domain": "wsj.com",          "lang": "en", "paywall": True},
-    {"name": "FT",       "domain": "ft.com",           "lang": "en", "paywall": True},
+    {"name": "中央社",    "domain": "cna.com.tw",       "lang": "zh", "paywall": False},
+    {"name": "經濟日報",  "domain": "money.udn.com",    "lang": "zh", "paywall": False},
+    {"name": "工商時報",  "domain": "ctee.com.tw",      "lang": "zh", "paywall": False},
+    {"name": "鉅亨網",    "domain": "cnyes.com",        "lang": "zh", "paywall": False},
+    {"name": "Reuters",   "domain": "reuters.com",      "lang": "en", "paywall": False},
+    {"name": "CNBC",      "domain": "cnbc.com",         "lang": "en", "paywall": False},
+    {"name": "Bloomberg", "domain": "bloomberg.com",    "lang": "en", "paywall": True},
+    {"name": "WSJ",       "domain": "wsj.com",          "lang": "en", "paywall": True},
+    {"name": "FT",        "domain": "ft.com",           "lang": "en", "paywall": True},
 ]
 NEWS_BLACKLIST = [
     "ptt.cc", "dcard.tw", "kknews.cc", "mobile01.com", "facebook.com",
@@ -142,15 +138,6 @@ header[data-testid=stHeader],footer,#MainMenu{display:none}
 div[data-testid=stMetric]{background:#1e1927;border:1px solid #352c47;border-radius:12px;padding:.55rem .85rem}
 div[data-testid=stMetric] label p{color:#e2dff0!important;font-weight:700!important;font-size:.92rem!important}
 div[data-testid=stMetricValue]{color:#fff!important;font-weight:800!important}
-
-/* 早會簡報卡片與新聞列表專用樣式 */
-.fact-box{background:#1e1927;border:1px solid #3d3354;border-radius:12px;padding:12px 16px;margin-bottom:10px;line-height:1.65;font-size:.95rem;color:#f1f5f9}
-.fact-box b{color:#FFC83D}
-.news-item{background:#1e1927;border:1px solid #352c47;border-radius:10px;padding:10px 14px;margin-bottom:8px;display:flex;flex-direction:column;gap:4px}
-.news-item a{color:#60a5fa;font-weight:800;font-size:1rem;text-decoration:none}
-.news-item a:hover{text-decoration:underline;color:#93c5fd}
-.news-meta{font-size:.85rem;color:#cbd5e1;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-.badge{background:#312645;color:#FFC83D;padding:2px 8px;border-radius:6px;font-weight:700;font-size:.8rem;border:1px solid rgba(255,200,61,.4)}
 </style>""", unsafe_allow_html=True)
 
 # ───────────────────────── 基礎資料與交易日曆模組 ─────────────────────────
@@ -220,10 +207,10 @@ def twse_margin_day(ymd):
                          params={"date": ymd, "selectType": "MS", "response": "json"},
                          headers={"User-Agent": "Mozilla/5.0"}).json()
         if r.get("stat") != "OK":
-            return {"ok": False, "label": "未取得"}
+            return None
         tables = r.get("tables", [])
         if not tables:
-            return {"ok": False, "label": "未取得"}
+            return None
         rows = tables[0].get("data", [])
         margin_bal = margin_chg = None
         short_bal = short_chg = None
@@ -698,52 +685,10 @@ def fetch_taifex_oi_and_pcr_for_date(ymd):
 def fetch_00631l_nav_info():
     return {"ok": False, "label": "未取得"}
 
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_overnight_us_market(upto_date):
-    tickers = {
-        "sox": "^SOX",
-        "tsm": "TSM",
-        "nvda": "NVDA",
-        "sp": "^GSPC",
-        "vix": "^VIX",
-        "tnx": "^TNX",
-        "fx": "TWD=X",
-    }
-    res = {
-        "sox_pct": 0.0, "tsm_pct": 0.0, "nvda_pct": 0.0, "sp_pct": 0.0,
-        "vix_close": 0.0, "vix_pct": 0.0, "tnx_close": 0.0,
-        "fx_close": 32.0, "fx_pct": 0.0,
-    }
-    for k, sym in tickers.items():
-        try:
-            d = load_daily(sym, period="1mo")
-            if d.empty:
-                continue
-            dts = pd.DatetimeIndex(d.index).tz_localize(None).date
-            sub = d[dts <= upto_date]
-            if len(sub) < 2:
-                sub = d
-            c = float(sub["Close"].iloc[-1])
-            p = float(sub["Close"].iloc[-2]) if len(sub) >= 2 else c
-            pct = (c / p - 1.0) * 100.0 if p else 0.0
-            if k in ("sox", "tsm", "nvda", "sp"):
-                res[f"{k}_pct"] = round(pct, 2)
-            elif k == "vix":
-                res["vix_close"] = round(c, 2)
-                res["vix_pct"] = round(pct, 2)
-            elif k == "tnx":
-                res["tnx_close"] = round(c, 2)
-            elif k == "fx":
-                res["fx_close"] = round(c, 2)
-                res["fx_pct"] = round(pct, 2)
-        except Exception:
-            continue
-    return res
-
 def get_schedule_state(tw_df):
     now = datetime.now(TZ)
     cur_d = now.date()
-    dts = [i.date() if hasattr(i, "date") else i for i in tw_df.index]
+    dts = [i.date() if hasattr(i, 'date') else i for i in tw_df.index]
     unique_dates = sorted(list(set(dts)), reverse=True)
     is_trading, _ = is_tw_trading_day(cur_d)
 
@@ -770,7 +715,7 @@ def get_schedule_state(tw_df):
         "cur_d": cur_d,
         "has_live_meeting": has_live_meeting,
         "banner_state": banner_state,
-        "banner_msg": banner_msg,
+        "banner_msg": banner_msg
     }
 
 def compute_tech_fact_card(df_full, upto_date, label_name, is_etf=False):
@@ -856,10 +801,8 @@ def compute_tech_fact_card(df_full, upto_date, label_name, is_etf=False):
     step_round = 10.0 if is_etf else 500.0
     upper_round = math.ceil(c / step_round) * step_round
     lower_round = math.floor(c / step_round) * step_round
-    if upper_round == c:
-        upper_round += step_round
-    if lower_round == c:
-        lower_round -= step_round
+    if upper_round == c: upper_round += step_round
+    if lower_round == c: lower_round -= step_round
 
     levels_fact = (
         f"前日高點 {h:,.2f}、前日低點 {l:,.2f}｜"
@@ -999,6 +942,7 @@ def fetch_and_select_top10_news(window_hours, max_count=MAX_NEWS_COUNT):
     sorted_cids = sorted(clusters.keys(), key=lambda k: (len(clusters[k]), k != "general_mkt"), reverse=True)
     selected, used_urls = [], set()
 
+    # 多輪輪詢各主題群組，確保 10 則新聞主題多元不單一
     for round_idx in range(3):
         for cid in sorted_cids:
             if len(selected) >= max_count:
@@ -1012,6 +956,7 @@ def fetch_and_select_top10_news(window_hours, max_count=MAX_NEWS_COUNT):
         if len(selected) >= max_count:
             break
 
+    # 若未滿 10 則，由剩餘候選池補足
     for c in raw_candidates:
         if len(selected) >= max_count:
             break
@@ -1020,6 +965,7 @@ def fetch_and_select_top10_news(window_hours, max_count=MAX_NEWS_COUNT):
             used_urls.add(c["url"])
 
     return selected[:max_count]
+
 
 # ───────────────────────── 動態生成使用者指定之 AI 提示詞 ─────────────────────────
 def build_external_ai_prompt(briefing, user_position_str="空手"):
@@ -1136,6 +1082,7 @@ def build_external_ai_prompt(briefing, user_position_str="空手"):
 - 對結論影響最大的不確定因素"""
     return prompt_text
 
+
 def render_ask_ai_buttons_html(prompt_text):
     """產生問問 GPT、Gemini、Claude 的一鍵跳轉＋同步強制複製提示詞組件"""
     encoded_q = urllib.parse.quote(prompt_text)
@@ -1210,168 +1157,3 @@ function openAI(mode) {{
     t.style.display = 'block';
     return;
   }}
-  if (mode === 'gemini') {{
-    t.innerText = '✅ 已自動複製提示詞！正在開啟 Gemini，進入後請直接按 Ctrl+V 貼上送出。';
-  }} else {{
-    t.innerText = '✅ 已同步複製提示詞並正在開啟對話視窗（若網址過長被截斷，直接按 Ctrl+V 貼上即可）！';
-  }}
-  t.style.display = 'block';
-  window.open(URL_MAP[mode], '_blank', 'noopener,noreferrer');
-}}
-</script></body></html>"""
-
-def _render_tech_card_box(title_label, card):
-    if not card:
-        st.warning(f"{title_label} 資料不足，無法產生技術面事實卡。")
-        return
-    html = f"""
-    <div class="fact-box">
-      <div style="font-size:1.05rem;font-weight:800;color:#ffffff;margin-bottom:6px">
-        📊 {title_label}（基準日：{card['date_str']}）
-      </div>
-      <div><b>• 趨勢與均線位階：</b>{card['trend_fact']}</div>
-      <div><b>• 量能變化：</b>{card['vol_fact']}</div>
-      <div><b>• K 棒結構：</b>{card['kbar_fact']}</div>
-      <div><b>• 關鍵價位與缺口：</b>{card['levels_fact']}</div>
-      <div><b>• 條件式支撐壓力：</b>{card['cond_fact']}</div>
-      {f"<div><b>• 槓桿耗損與策略 B 價位：</b>{card['etf_extra']}</div>" if card.get('etf_extra') else ""}
-    </div>
-    """
-    st.markdown(html, unsafe_allow_html=True)
-
-def briefing_page():
-    with st.container(key="vote_card"):
-        st.markdown(
-            "<div class='fl-h'>08:30 盤前早會簡報 & 一鍵問問 AI"
-            "<small>自動彙整 10 則白名單新聞網址、上市籌碼、隔夜美股與雙技術面事實卡</small></div>",
-            unsafe_allow_html=True,
-        )
-        with st.spinner("正在載入早會簡報、籌碼與最新新聞…"):
-            tw_df = load_daily(INDEX_TICKER)
-            etf_df = load_daily(ETF_TICKER)
-            flows_all = last_15_flows()
-
-        if tw_df.empty or etf_df.empty:
-            st.error("無法取得台股或 00631L 歷史日線資料，請稍後再試。")
-            return
-
-        sched = get_schedule_state(tw_df)
-        if sched["banner_state"] == "live":
-            st.success(sched["banner_msg"])
-        elif sched["banner_state"] == "waiting":
-            st.info(sched["banner_msg"])
-        else:
-            st.warning(sched["banner_msg"])
-
-        c1, c2, c3 = st.columns([2, 2, 3])
-        archive_dates = sched["archive_dates"]
-        sel_d = c1.selectbox(
-            "📅 選擇早會交易日",
-            archive_dates,
-            format_func=lambda d: f"{d:%Y/%m/%d}（週{WD[d.weekday()]}）",
-        )
-        win_hr = c2.selectbox("📰 新聞擷取時間窗（小時）", [24, 36, 48, 72], index=1)
-        user_pos = c3.text_input("💼 我目前的 00631L 部位狀態（會自動帶入提示詞）", value="空手")
-
-        tw_card = compute_tech_fact_card(tw_df, sel_d, "加權指數 (^TWII)", is_etf=False)
-        etf_card = compute_tech_fact_card(etf_df, sel_d, "00631L (元大台灣50正2)", is_etf=True)
-        if not tw_card or not etf_card:
-            st.warning("所選日期的歷史資料不足以計算技術指標。")
-            return
-
-        sub_flows = [x for x in flows_all if x["dt"] <= sel_d] or flows_all
-        if sub_flows:
-            f_last = sub_flows[-1]
-            f1 = f_last["外資"] / 1e8
-            t1 = f_last["投信"] / 1e8
-            z1 = f_last["自營"] / 1e8
-            f5 = sum(x["外資"] for x in sub_flows[-5:]) / 1e8
-            f10 = sum(x["外資"] for x in sub_flows[-10:]) / 1e8
-            t5 = sum(x["投信"] for x in sub_flows[-5:]) / 1e8
-            ref_ymd = f_last["ymd"]
-        else:
-            f1 = t1 = z1 = f5 = f10 = t5 = 0.0
-            ref_ymd = sel_d.strftime("%Y%m%d")
-
-        flow_dict = {
-            "f1": round(f1, 2), "f5": round(f5, 2), "f10": round(f10, 2),
-            "t1": round(t1, 2), "t5": round(t5, 2), "z1": round(z1, 2),
-            "ymd": ref_ymd,
-        }
-        margin_info = twse_margin_day(ref_ymd)
-        oi_pcr_info = fetch_taifex_oi_and_pcr_for_date(ref_ymd)
-        nav_info = fetch_00631l_nav_info()
-        us_info = fetch_overnight_us_market(sel_d)
-        news_list = fetch_and_select_top10_news(win_hr, max_count=MAX_NEWS_COUNT)
-
-        briefing = {
-            "target_d": sel_d,
-            "tw_card": tw_card,
-            "etf_card": etf_card,
-            "flow": flow_dict,
-            "margin": margin_info,
-            "oi_pcr": oi_pcr_info,
-            "nav": nav_info,
-            "us": us_info,
-            "news_list": news_list,
-        }
-
-        prompt_text = build_external_ai_prompt(briefing, user_position_str=user_pos.strip() or "空手")
-        components.html(render_ask_ai_buttons_html(prompt_text), height=120, scrolling=False)
-
-        with st.expander("📋 檢視／手動複製完整 AI 提示詞內容"):
-            st.code(prompt_text, language="markdown")
-
-        st.markdown("<div style='height:0.4rem'></div>", unsafe_allow_html=True)
-        st.markdown("<div class='fl-h'>一、隔夜國際市場與台股籌碼快照</div>", unsafe_allow_html=True)
-        m = st.columns(5)
-        m[0].metric("費城半導體 (SOX)", f"{us_info['sox_pct']:+.2f}%")
-        m[1].metric("台積電 ADR (TSM)", f"{us_info['tsm_pct']:+.2f}%")
-        m[2].metric("輝達 (NVDA)", f"{us_info['nvda_pct']:+.2f}%")
-        m[3].metric("VIX 恐慌指數", f"{us_info['vix_close']:.2f}", f"{us_info['vix_pct']:+.2f}%", delta_color="inverse")
-        m[4].metric("外資現貨 (當日/5日)", f"{flow_dict['f1']:+.1f} 億", f"近5日 {flow_dict['f5']:+.1f} 億")
-
-        st.caption(
-            f"📌 籌碼補充：投信當日 {flow_dict['t1']:+.2f} 億（近5日 {flow_dict['t5']:+.2f} 億）｜"
-            f"自營商當日 {flow_dict['z1']:+.2f} 億｜{margin_info.get('label', '融資融券：未取得')}｜"
-            f"美債10Y {us_info['tnx_close']:.2f}%｜USD/TWD {us_info['fx_close']:.2f}（{us_info['fx_pct']:+.2f}%）"
-        )
-
-        st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
-        st.markdown("<div class='fl-h'>二、技術面事實卡（加權指數 & 00631L）</div>", unsafe_allow_html=True)
-        _render_tech_card_box("技術面事實卡 A：加權指數 (^TWII)", tw_card)
-        _render_tech_card_box("技術面事實卡 B：00631L (元大台灣50正2)", etf_card)
-
-        st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='fl-h'>三、最新精選白名單財經新聞（共 {len(news_list)} 則）</div>", unsafe_allow_html=True)
-        if not news_list:
-            st.info("目前時間窗內未抓取到符合條件的新聞。")
-        else:
-            for idx, n in enumerate(news_list, 1):
-                pub_txt = f"<span>🕒 {n['pub']}</span>" if n.get("pub") else ""
-                st.markdown(
-                    f"""<div class="news-item">
-                        <a href="{n['url']}" target="_blank" rel="noopener noreferrer">{idx}. {n['title']} ↗</a>
-                        <div class="news-meta">
-                            <span class="badge">{n['source']}</span>
-                            <span class="badge">{n['cluster_name']}</span>
-                            {pub_txt}
-                        </div>
-                    </div>""",
-                    unsafe_allow_html=True,
-                )
-
-# ───────────────────────── 頂部導覽列與主程式入口 ─────────────────────────
-with st.container(key="nav"):
-    nl, nr = st.columns([5, 4], vertical_alignment="center")
-    nl.markdown("<h1>📈 破產後重生之我要靠量化交易發財</h1>", unsafe_allow_html=True)
-    with nr:
-        page = pick("導覽", ["大盤", "策略B ", "早會簡報"], "nav_page")
-
-with st.container(key="body"):
-    if page == "大盤":
-        market_page()
-    elif page == "策略 B":
-        strategy_page()
-    else:
-        briefing_page()
