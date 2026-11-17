@@ -87,28 +87,63 @@ header[data-testid=stHeader],footer,#MainMenu{display:none}
   opacity:1!important;
 }
 
-/* 下拉選單與數字輸入框內文字高對比清晰化 */
+/* 數字輸入框、文字輸入框與下拉選單：鎖定深色底＋純白粗體字（徹底解決黑底黑字問題） */
+.st-key-vote_card [data-baseweb=input],
+.st-key-vote_card [data-baseweb=base-input],
+.st-key-strat_card [data-baseweb=input],
+.st-key-strat_card [data-baseweb=base-input],
+.st-key-vote_card [data-testid=stNumberInputContainer],
+.st-key-strat_card [data-testid=stNumberInputContainer]{
+  background-color:#282138!important;
+  border:1px solid #584b78!important;
+  border-radius:8px!important;
+}
+.st-key-vote_card [data-baseweb=select]>div,
+.st-key-strat_card [data-baseweb=select]>div{
+  background-color:#282138!important;
+  border:1px solid #584b78!important;
+  color:#ffffff!important;
+  font-weight:800!important;
+  font-size:.98rem!important;
+}
 .st-key-vote_card [data-baseweb=select] div,
-.st-key-strat_card [data-baseweb=select] div{
-  color:#111111!important;
-  font-weight:700!important;
-  font-size:.96rem!important;
+.st-key-strat_card [data-baseweb=select] div,
+.st-key-vote_card [data-baseweb=select] span,
+.st-key-strat_card [data-baseweb=select] span{
+  color:#ffffff!important;
+  -webkit-text-fill-color:#ffffff!important;
+  font-weight:800!important;
 }
 .st-key-vote_card input,
 .st-key-strat_card input{
-  color:#111111!important;
-  -webkit-text-fill-color:#111111!important;
-  font-weight:700!important;
-  font-size:.96rem!important;
+  background-color:transparent!important;
+  color:#ffffff!important;
+  -webkit-text-fill-color:#ffffff!important;
+  caret-color:#FFC83D!important;
+  font-weight:800!important;
+  font-size:1rem!important;
   opacity:1!important;
 }
-.st-key-vote_card input:disabled,
-.st-key-strat_card input:disabled{
-  color:#4b5563!important;
-  -webkit-text-fill-color:#4b5563!important;
-  background-color:#e5e7eb!important;
-  font-weight:700!important;
-  opacity:1!important;
+.st-key-vote_card button[data-testid=stNumberInputStepUp],
+.st-key-vote_card button[data-testid=stNumberInputStepDown],
+.st-key-strat_card button[data-testid=stNumberInputStepUp],
+.st-key-strat_card button[data-testid=stNumberInputStepDown]{
+  background-color:#352c4a!important;
+  color:#ffffff!important;
+  border-color:#584b78!important;
+}
+.st-key-vote_card button[data-testid=stNumberInputStepUp] svg,
+.st-key-vote_card button[data-testid=stNumberInputStepDown] svg,
+.st-key-strat_card button[data-testid=stNumberInputStepUp] svg,
+.st-key-strat_card button[data-testid=stNumberInputStepDown] svg{
+  fill:#ffffff!important;
+}
+.st-key-vote_card button[data-testid=stNumberInputStepUp]:hover,
+.st-key-vote_card button[data-testid=stNumberInputStepDown]:hover,
+.st-key-strat_card button[data-testid=stNumberInputStepUp]:hover,
+.st-key-strat_card button[data-testid=stNumberInputStepDown]:hover{
+  background-color:#4b3f66!important;
+  color:#FFC83D!important;
 }
 
 /* Expander 摺疊列標題與邊框高對比 */
