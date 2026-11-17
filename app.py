@@ -1129,15 +1129,20 @@ def fx_page():
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_taifex_oi_and_pcr_for_date(ymd):
     fx_days = last_10_taifex_fx_oi()
-    for x in reversed(fx_days):
-        if x["ymd"] <= ymd and x.get("net_short") is not None:
-            chg = int(x.get("chg", 0) or 0)
-            return {
-                "fx_oi_ok": True,
-                "fx_label": f"未平倉淨空單 {x['net_short']:,d} 口（當日增減 {chg:+,d} 口）",
-                "pcr_ok": False,
-                "pcr_label": "未取得",
-            }
+    sub = [x for x in fx_days if x["ymd"] <= ymd and x.get("net_short") is not None]
+    if sub:
+        last_item = sub[-1]
+        chg = int(last_item.get("chg", 0) or 0)
+        s5 = sum(int(x.get("chg", 0) or 0) for x in sub[-5:])
+        return {
+            "fx_oi_ok": True,
+            "net_short": last_item["net_short"],
+            "chg": chg,
+            "s5": s5,
+            "fx_label": f"未平倉淨空單 {last_item['net_short']:,d} 口｜今日變化量 {chg:+,d} 口（近 5 日累積 {s5:+,d} 口）",
+            "pcr_ok": False,
+            "pcr_label": "未取得",
+        }
     return {"fx_oi_ok": False, "fx_label": "未取得", "pcr_ok": False, "pcr_label": "未取得"}
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -1225,7 +1230,7 @@ def compute_tech_fact_card(df_full, upto_date, label_name):
     if len(d) < 30:
         return None
 
-    for p in (5, 20, 60, 240):
+    for p in (5, 10, 20, 60, 240):
         d[f"MA{p}"] = d["Close"].rolling(p).mean()
     d["VolMA5"] = d["Volume"].rolling(5).mean()
     d["Ret"] = d["Close"].pct_change() * 100.0
@@ -1241,6 +1246,7 @@ def compute_tech_fact_card(df_full, upto_date, label_name):
     pct = (c / prev_c - 1.0) * 100.0 if prev_c else 0.0
 
     ma5 = float(r_last["MA5"])
+    ma10 = float(r_last["MA10"]) if pd.notna(r_last["MA10"]) else ma5
     ma20 = float(r_last["MA20"])
     ma60 = float(r_last["MA60"]) if pd.notna(r_last["MA60"]) else ma20
     ma240 = float(r_last["MA240"]) if pd.notna(r_last["MA240"]) else ma60
@@ -1250,23 +1256,40 @@ def compute_tech_fact_card(df_full, upto_date, label_name):
         rel = "上方" if p_val >= m_val else "下方"
         return f"{m_name} {m_val:,.2f}（位於{rel} {diff_pct:+.2f}%）"
 
-    if ma5 > ma20 > ma60:
-        ma_align = "5MA > 20MA > 60MA（短中長期均線呈正向排列）"
-    elif ma5 < ma20 < ma60:
-        ma_align = "5MA < 20MA < 60MA（短中長期均線呈反向排列）"
-    else:
-        ma_align = f"5MA({ma5:,.1f})、20MA({ma20:,.1f})、60MA({ma60:,.1f}) 交錯排列"
+    # 依數值由高至低排列：5MA、10MA、20MA、60MA、240MA、收盤價
+    rank_items = [
+        ("收盤價", c),
+        ("5MA", ma5),
+        ("10MA", ma10),
+        ("20MA", ma20),
+        ("60MA", ma60),
+        ("240MA", ma240),
+    ]
+    rank_sorted = sorted(rank_items, key=lambda x: x[1], reverse=True)
+    ma_align_order = " > ".join(f"{k}({v:,.2f})" for k, v in rank_sorted)
 
     trend_fact = (
-        f"收盤 {c:,.2f}（{chg:+.2f} / {pct:+.2f}%）｜"
-        f"{_pos_str(c, ma5, '5MA')}、{_pos_str(c, ma20, '20MA')}、"
-        f"{_pos_str(c, ma60, '60MA')}、{_pos_str(c, ma240, '240MA')}｜排列狀態：{ma_align}。"
+        f"收盤價為 {c:,.2f}（{chg:+.2f}，{pct:+.2f}%）｜"
+        f"{_pos_str(c, ma5, '5MA')}、{_pos_str(c, ma10, '10MA')}、{_pos_str(c, ma20, '20MA')}、"
+        f"{_pos_str(c, ma60, '60MA')}、{_pos_str(c, ma240, '240MA')}｜"
+        f"排列狀態：{ma_align_order}"
     )
 
     vol_cur = float(r_last["Volume"]) if pd.notna(r_last["Volume"]) else 0.0
+    vol_prev = float(r_prev["Volume"]) if pd.notna(r_prev["Volume"]) else 0.0
     vol_ma5 = float(r_last["VolMA5"]) if (pd.notna(r_last["VolMA5"]) and r_last["VolMA5"] > 0) else 1.0
-    vol_ratio = vol_cur / vol_ma5
-    vol_fact = f"前一交易日成交量為 5 日均量的 {vol_ratio:.2f} 倍（當日量 {vol_cur:,.0f} vs 5日均量 {vol_ma5:,.0f}）。"
+    vol_ratio = vol_cur / vol_ma5 if vol_ma5 > 0 else 0.0
+    if vol_prev > 0:
+        vol_chg = vol_cur - vol_prev
+        vol_chg_pct = (vol_cur / vol_prev - 1.0) * 100.0
+        vol_vs_prev_str = f"較前一交易日 {vol_chg:+,.0f} / {vol_chg_pct:+.2f}%"
+    else:
+        vol_vs_prev_str = "前一交易日量能無資料"
+
+    vol_fact = (
+        f"交易量 {vol_cur:,.0f}（{vol_vs_prev_str}）"
+        f"（五日均量 {vol_ma5:,.0f}，為五日均量的 {vol_ratio:.2f} 倍）"
+    )
 
     body = abs(c - o)
     body_pct = body / prev_c * 100.0 if prev_c else 0.0
@@ -1275,8 +1298,8 @@ def compute_tech_fact_card(df_full, upto_date, label_name):
     l_wick = min(o, c) - l
     kbar_fact = (
         f"開 {o:,.2f} / 高 {h:,.2f} / 低 {l:,.2f} / 收 {c:,.2f}｜"
-        f"型態為{body_color}，實體長度 {body:,.2f}（{body_pct:.2f}%），"
-        f"上影線長 {u_wick:,.2f}，下影線長 {l_wick:,.2f}（全天高低振幅 {h - l:,.2f}）。"
+        f"型態為{body_color}，實體長度：{body:,.2f}（{body_pct:.2f}%），"
+        f"上影線長 {u_wick:,.2f}，下影線長 {l_wick:,.2f}，全天高低振幅 {h - l:,.2f}"
     )
 
     d20 = d.tail(20)
@@ -1310,7 +1333,7 @@ def compute_tech_fact_card(df_full, upto_date, label_name):
     levels_fact = (
         f"前日高點 {h:,.2f}、前日低點 {l:,.2f}｜"
         f"近 20 日高點 {h20:,.2f}、近 20 日低點 {l20:,.2f}｜"
-        f"未回補缺口：{gap_str}｜鄰近整數關卡：{lower_round:,.0f} 與 {upper_round:,.0f}。"
+        f"鄰近整數關卡：{lower_round:,.0f} 與 {upper_round:,.0f}（未回補缺口：{gap_str}）"
     )
 
     pivot_up = max(h, ma5)
@@ -1328,8 +1351,9 @@ def compute_tech_fact_card(df_full, upto_date, label_name):
     return {
         "name": label_name, "date_str": r_last.name.strftime("%Y/%m/%d"),
         "close": c, "open": o, "high": h, "low": l, "prev_close": prev_c,
-        "chg": chg, "pct": pct, "ma5": ma5, "ma20": ma20, "ma60": ma60, "ma240": ma240,
-        "vol_cur": vol_cur, "vol_ma5": vol_ma5, "vol_ratio": round(vol_ratio, 2),
+        "chg": chg, "pct": pct, "ma5": ma5, "ma10": ma10, "ma20": ma20, "ma60": ma60, "ma240": ma240,
+        "ma_align_order": ma_align_order,
+        "vol_cur": vol_cur, "vol_prev": vol_prev, "vol_ma5": vol_ma5, "vol_ratio": round(vol_ratio, 2),
         "h20": h20, "l20": l20, "gap_str": gap_str,
         "upper_round": upper_round, "lower_round": lower_round,
         "pivot_up": round(pivot_up, 2), "res_1": round(res_1, 2), "res_2": round(res_2, 2),
@@ -1453,52 +1477,72 @@ def fetch_and_select_top10_news(window_hours, max_count=MAX_NEWS_COUNT):
 
     return selected[:max_count]
 
-# ───────────────────────── 動態生成 AI 提示詞（不含 00631L） ─────────────────────────
+# ───────────────────────── 動態生成新版 AI 提示詞 ─────────────────────────
 def build_external_ai_prompt(briefing):
     target_d = briefing["target_d"]
     tw_c = briefing["tw_card"]
     fl = briefing["flow"]
     mg = briefing["margin"]
+    mg5 = briefing["margin_5d"]
     op = briefing["oi_pcr"]
     us = briefing["us"]
     news_list = briefing["news_list"]
 
-    # A. 新聞網址（共 N 則）
+    # A. 新聞網址（共 N 則）(主持人提供之晨會內容)
     if news_list:
         news_lines = []
         for idx, n in enumerate(news_list, 1):
             pub_info = f"｜發布時間：{n['pub']}" if n.get("pub") else ""
             news_lines.append(
-                f"{idx}. {n['url']} （標題：{n['title']}｜媒體：{n['source']}{pub_info}）"
+                f"{idx}. [{n['title']}]({n['url']}) （媒體：{n['source']}{pub_info}｜網址：{n['url']}）"
             )
         news_sec = "\n".join(news_lines)
     else:
         news_sec = "1. （目前時間窗內未擷取到新聞網址）"
 
-    # C. 籌碼面欄位格式化
+    # C. 籌碼面欄位格式化（含融資融券五日平均與外資期貨未平倉今日變化量）
     if mg.get("ok"):
-        maint_part = f"（大盤維持率 {mg['maint_ratio']:.1f}%）" if mg.get("maint_ratio") is not None else ""
-        margin_line = f"- 融資餘額：{mg['margin_yi']:,.2f} 億（日增減 {mg['margin_chg_yi']:+.2f} 億）{maint_part}｜融券：{mg['short_lots']:,d} 張（日增減 {mg['short_chg_lots']:+,d} 張）"
+        m_avg_str = (
+            f"｜五日平均餘額 {mg5['m_bal_avg']:,.2f} 億、五日平均增減 {mg5['m_chg_avg']:+.2f} 億"
+            if mg5.get("m_bal_avg") is not None else ""
+        )
+        s_avg_str = (
+            f"｜五日平均餘額 {mg5['s_bal_avg']:,.0f} 張、五日平均增減 {mg5['s_chg_avg']:+,.0f} 張"
+            if mg5.get("s_bal_avg") is not None else ""
+        )
+        maint_part = f"｜大盤維持率 {mg['maint_ratio']:.1f}%" if mg.get("maint_ratio") is not None else ""
+        margin_line = (
+            f"- 融資餘額：{mg['margin_yi']:,.2f} 億（日增減 {mg['margin_chg_yi']:+.2f} 億{m_avg_str}{maint_part}）｜"
+            f"融券：{mg['short_lots']:,d} 張（日增減 {mg['short_chg_lots']:+,d} 張{s_avg_str}）"
+        )
     else:
-        margin_line = "- 融資餘額：未取得（日增減：未取得）｜融券：未取得（日增減：未取得）"
+        margin_line = "- 融資餘額：未取得（日增減：未取得｜五日平均：未取得）｜融券：未取得（日增減：未取得｜五日平均：未取得）"
 
     fx_oi_str = op.get("fx_label", "未取得")
-    pcr_str = op.get("pcr_label", "未取得")
 
     prompt_text = f"""# 角色
-你是台股短線研究員，專長是把「新聞事件、籌碼面、技術面」整合成條件式的交易判斷。
+「請擔任專業的台股短線策略分析師。根據我給的資料，為我分析下一個交易日的台股大盤走勢。
+請依序評估以下四個維度：
+1. 國際盤連動：最新美股四大指數表現、費城半導體指數漲跌幅，以及台積電 ADR 與台指期夜盤的收盤狀況。
+2. 籌碼面動向：最近一日外資、投信、自營商的現貨買賣超金額，以及外資在台指期未平倉淨口數、融資融券的增減變化。
+3. 技術面位階：加權指數目前相對於 5 日線、月線、季線的位置，以及量價關係是否背離。
+4. 題材與風險：近期強勢主流族群（如 AI、半導體、重電或金融等），以及明天的重大財經事件或法說會。
+5. 資金面:
+=>從匯率去看資金動向
+=>看市場的分別流入什麼市場?流出什麼市場?
+6. 看法總結
+=> 目前多空力道誰佔上風？資金是在輪動還是撤出？
+=>明天開盤的預估走勢（開高走低、開高走高、或低開震盪）與關鍵觀察時間點（如 9:30 前的量能）。
 
 # 硬性規則
-1. 新聞：請直接讀取下方網址內文；讀不到的網址請用「標題＋媒體名稱」搜尋同一則報導，並從中挑出你覺得對於台股市場最有影響力的8篇去分析。
-   仍然讀不到的，標註「僅憑標題／未能讀取」，不得編造內容。
+1. 新聞：放棄 Google News RSS 的加密重導向網址直接命令 AI改用「標題＋關鍵字」搜尋；讀不到的網址請用「標題＋媒體名稱」搜尋同一則報導，並從中挑出你覺得對於台股市場最有影響力的5篇去分析。 仍然讀不到的，標註「僅憑標題／未能讀取」，不得編造內容。
 2. 所有論點必須引用下方提供的具體數字（例如「外資 -35.4 億」「收盤低於 5MA 1.2%」），禁止空泛形容，若提供資料過少，不足於提供分析使用，可自行上網搜尋，但需標示哪些是你去另外找的。
 3. 區分「事實」與「推論」。
-4. 判斷新聞是否「已被市場反映」：對照隔夜美股與當日實際漲跌，若價格已先行大幅波動，視為已反映，不宜追價。
-5. 不給單一「買／不買」標籤，要給「條件式」結論：在什麼點位或條件下偏多操作、什麼條件下觀望或避開、何處停損。
+4. 不給單一「買／不買」標籤，要給「條件式」結論：在什麼價位或條件下可以買、什麼條件下不要買、何處停損。
 
 # 輸入資料
 
-## A. 新聞網址（共 {len(news_list)} 則）
+## A. 新聞網址（共 {len(news_list)} 則）(主持人提供之晨會內容)
 {news_sec}
 
 ## B. 交易日：{target_d.strftime('%Y/%m/%d')}（台股籌碼與日K基準日：{tw_c['date_str']}）
@@ -1508,55 +1552,56 @@ def build_external_ai_prompt(briefing):
 - 投信：當日 {fl['t1']:+.2f} 億｜近 5 日 {fl['t5']:+.2f} 億
 - 自營商：當日 {fl['z1']:+.2f} 億
 {margin_line}
-- 外資台指期淨未平倉：{fx_oi_str}
-- 選擇權 Put/Call 比：{pcr_str}
+- 外資期貨未平倉數量以及今日變化量：{fx_oi_str}
 
 ## D. 技術面
 加權指數（^TWII）：
-- 開 {tw_c['open']:,.2f} 高 {tw_c['high']:,.2f} 低 {tw_c['low']:,.2f} 收 {tw_c['close']:,.2f}（漲跌 {tw_c['pct']:+.2f}%）
-- 5MA {tw_c['ma5']:,.2f}｜20MA {tw_c['ma20']:,.2f}｜60MA {tw_c['ma60']:,.2f}｜240MA {tw_c['ma240']:,.2f}
-- 成交量為 5 日均量的 {tw_c['vol_ratio']:.2f} 倍
-- 近 20 日高 {tw_c['h20']:,.2f}、低 {tw_c['l20']:,.2f}；未回補缺口：{tw_c['gap_str']}
+- 趨勢與均線位階：{tw_c['trend_fact']}
+- 量能變化：{tw_c['vol_fact']}
+- K 棒結構：{tw_c['kbar_fact']}
+- 關鍵價位：{tw_c['levels_fact']}
+- 條件式支撐壓力：{tw_c['cond_fact']}
 
-## E. 隔夜國際市場
-費半 {us['sox_pct']:+.2f}%｜台積電 ADR {us['tsm_pct']:+.2f}%｜NVDA {us['nvda_pct']:+.2f}%｜S&P 500 {us['sp_pct']:+.2f}%｜VIX {us['vix_close']:.2f}（{us['vix_pct']:+.2f}%）｜美債 10Y {us['tnx_close']:.2f}%｜美元兌台幣 {us['fx_close']:.2f}（{us['fx_pct']:+.2f}%）
+## E. 隔夜國際市場(數值，變化%)
+- 費半：{us['sox_close']:,.2f}（{us['sox_pct']:+.2f}%）
+- 台積電 ADR：{us['tsm_close']:,.2f}（{us['tsm_pct']:+.2f}%）
+- VIX：{us['vix_close']:.2f}（{us['vix_pct']:+.2f}%）
+- 美債 10Y 殖利率：{us['tnx_close']:.2f}%（{us['tnx_pct']:+.2f}%）
+- 台美匯率：{us['fx_close']:.2f}（{us['fx_chg']:+.3f} / {us['fx_pct']:+.2f}%）
 
 # 分析流程（請依序完成）
-步驟 1：逐則整理新聞，輸出「事情發展」（發生什麼、關鍵數字、時間點）。
-步驟 2：逐則分析「對台股大盤與權值股的影響」，標註利多／利空／中性、影響產業或個股、是否已反映。
-步驟 3：解讀籌碼面，指出哪些指標與新聞方向一致、哪些互相矛盾。
+步驟 1：逐則整理新聞，並依照你挑選的八則新聞，輸出「事情發展」（發生什麼、關鍵數字、時間點），並放棄 Google News RSS 的加密重導向網址直接命令 AI改用「標題＋關鍵字」搜尋。
+步驟 2：逐則分析「對台股大盤的影響」，除了分析字面上的因果關係，也去思考是否會有其他的連鎖反應，並標註利多／利空／、影響產業或個股
+步驟 3：解讀籌碼面，透過籌碼面妳看到了什麼?
 步驟 4：解讀技術面，指出趨勢位階、量價、關鍵支撐與壓力。
-步驟 5：整合三者，找出「最可能的短線情境」與「最大的反向風險」。
-步驟 6：針對台股大盤給出條件式操作建議。
+步驟 5 : 解讀資金面，透過外匯去了解外資動向，並且利用產業類別去分析資金去向
+步驟 6：整合上述，找出「最可能的短線情境」
 
 # 輸出格式（嚴格依此）
 ## 一、新聞重點
 | # | 事情發展（100字內） | 方向 | 影響標的 | 其他相關影響 |
 
 ## 二、籌碼面解讀
-（3~5 點，每點含數字與意義）
-
+（哪些消息代表多方、哪些消息代表空方）
+=>根據上述資訊，列出你的解讀及思考這些數據背後的意義
 ## 三、技術面解讀
 （3~5 點，含明確支撐／壓力價位）
 
-## 四、大盤短線展望（1~3 個交易日）
+## 四、資金面解讀
+=>
+
+## 五、大盤短線展望（1~3 個交易日）
+請用表格列出下一個交易日『偏多、震盪、偏空』三種劇本的觸發條件、關鍵支撐與壓力點位，以及對應的操作建議。」
+
 - 基準情境（機率估計）：…
 - 偏多情境（機率估計）：…
 - 偏空情境（機率估計）：…
 - 三者最關鍵的分歧訊號：…
 
-## 五、台股操作建議
-- 整體傾向：偏多／中性／偏空（說明理由）
-- 若空手：
-  - 可考慮進場的條件：（點位＋觸發條件，如「大盤開盤站穩 X 點 15 分鐘」）
-  - 不應進場的條件：…
-  - 建議部位上限與停損點位：…
-- 若已持有部位：續抱／減碼／停損的條件與點位
-- 近 2 日最需盯的 3 個觀察點
-
 ## 六、風險與資料限制
 - 本次分析哪些來源讀取失敗或只憑標題
-- 對結論影響最大的不確定因素"""
+- 缺值與異常值優先去網路找尋正確數據不得推論；如資料依舊缺失則標記說(缺值或異常)
+- 市場上你認為還有甚麼還未反映在價格裡面的利多或利空消息，在此處提出來，警示我目前市場上還有什麼風險"""
     return prompt_text
 
 def render_ask_ai_buttons_html(prompt_text):
@@ -1695,7 +1740,7 @@ def _render_tech_card_box(title_label, card):
       <div><b>• 趨勢與均線位階：</b>{card['trend_fact']}</div>
       <div><b>• 量能變化：</b>{card['vol_fact']}</div>
       <div><b>• K 棒結構：</b>{card['kbar_fact']}</div>
-      <div><b>• 關鍵價位與缺口：</b>{card['levels_fact']}</div>
+      <div><b>• 關鍵價位：</b>{card['levels_fact']}</div>
       <div><b>• 條件式支撐壓力：</b>{card['cond_fact']}</div>
     </div>
     """
@@ -1752,6 +1797,20 @@ def briefing_page():
             f1 = t1 = z1 = f5 = f10 = t5 = 0.0
             ref_ymd = sel_d.strftime("%Y%m%d")
 
+        # 計算近 5 日融資融券平均餘額與平均增減
+        recent_5 = sub_flows[-5:] if sub_flows else []
+        m_bals_5 = [x["融資餘額"] for x in recent_5 if x.get("融資餘額") is not None]
+        m_chgs_5 = [x["融資"] for x in recent_5 if x.get("融資") is not None]
+        s_bals_5 = [x["融券餘額"] for x in recent_5 if x.get("融券餘額") is not None]
+        s_chgs_5 = [x["融券"] for x in recent_5 if x.get("融券") is not None]
+
+        margin_5d_dict = {
+            "m_bal_avg": round(float(np.mean(m_bals_5)), 2) if m_bals_5 else None,
+            "m_chg_avg": round(float(np.mean(m_chgs_5)), 2) if m_chgs_5 else None,
+            "s_bal_avg": round(float(np.mean(s_bals_5)), 0) if s_bals_5 else None,
+            "s_chg_avg": round(float(np.mean(s_chgs_5)), 0) if s_chgs_5 else None,
+        }
+
         flow_dict = {
             "f1": round(f1, 2), "f5": round(f5, 2), "f10": round(f10, 2),
             "t1": round(t1, 2), "t5": round(t5, 2), "z1": round(z1, 2),
@@ -1767,6 +1826,7 @@ def briefing_page():
             "tw_card": tw_card,
             "flow": flow_dict,
             "margin": margin_info,
+            "margin_5d": margin_5d_dict,
             "oi_pcr": oi_pcr_info,
             "us": us_info,
             "news_list": news_list,
