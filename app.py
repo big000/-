@@ -1,5 +1,6 @@
 import os, io, csv, json, time, re, math
 import urllib.parse
+import urllib3
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date, time as dtime, timedelta
@@ -7,7 +8,9 @@ import numpy as np, pandas as pd, pytz, requests, yfinance as yf
 import streamlit as st
 import streamlit.components.v1 as components
 
-# ── 解決 Streamlit Cloud 或部分環境的 SSL 憑證問題 ──
+# ── 忽略期交所/證交所偶發的 SSL 憑證警告 ──
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 try:
     import truststore
     truststore.inject_into_ssl()
@@ -182,6 +185,22 @@ def _parse_num(val):
     except Exception:
         return None
 
+def _norm_ymd(s):
+    """將 '2026/11/4'、'2026-11-17' 或 '115/11/17' 統一轉為 8 碼 'YYYYMMDD'"""
+    if not s:
+        return None
+    s = str(s).strip()
+    m = re.match(r"^(\d{3,4})[/-](\d{1,2})[/-](\d{1,2})$", s)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if y < 1911:
+            y += 1911
+        return f"{y:04d}{mo:02d}{d:02d}"
+    digits = re.sub(r"\D", "", s)
+    if len(digits) == 8:
+        return digits
+    return None
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_daily(sym, period="3y"):
     return _clean(yf.download(sym, period=period, interval="1d", auto_adjust=False, progress=False))
@@ -227,7 +246,7 @@ def twse_day(ymd):
     try:
         r = requests.get("https://www.twse.com.tw/rwd/zh/fund/BFI82U", timeout=8,
                          params={"dayDate": ymd, "type": "day", "response": "json"},
-                         headers={"User-Agent": "Mozilla/5.0"}).json()
+                         headers={"User-Agent": "Mozilla/5.0"}, verify=False).json()
         time.sleep(0.12)
         if r.get("stat") != "OK":
             return None
@@ -252,6 +271,7 @@ def _fetch_margin_and_maint_raw(ymd):
             timeout=10,
             params={"date": ymd, "selectType": "ALL", "response": "json"},
             headers=headers,
+            verify=False,
         ).json()
         if r_m.get("stat") == "OK":
             for tbl in r_m.get("tables", []):
@@ -286,6 +306,7 @@ def _fetch_margin_and_maint_raw(ymd):
                 timeout=8,
                 params={"date": ymd, "selectType": "MS", "response": "json"},
                 headers=headers,
+                verify=False,
             ).json()
             if r_ms.get("stat") == "OK" and r_ms.get("tables"):
                 for row in r_ms["tables"][0].get("data", []):
@@ -315,6 +336,7 @@ def _fetch_margin_and_maint_raw(ymd):
                 timeout=10,
                 params={"date": ymd, "type": "ALLBUT0999", "response": "json"},
                 headers=headers,
+                verify=False,
             ).json()
             for tbl in r_idx.get("tables", []):
                 flds = tbl.get("fields", [])
@@ -398,6 +420,12 @@ def last_15_flows():
 def last_10_flows():
     return last_15_flows()[-10:]
 
+TAIFEX_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Referer": "https://www.taifex.com.tw/cht/3/futContractsDate",
+    "Origin": "https://www.taifex.com.tw",
+}
+
 def _fetch_taifex_tx_single_day(ymd):
     """單日備援：從期交所 futContractsDate 網頁擷取外資臺股期貨未平倉數據"""
     q_date = f"{ymd[:4]}/{ymd[4:6]}/{ymd[6:8]}"
@@ -405,8 +433,9 @@ def _fetch_taifex_tx_single_day(ymd):
         r = requests.post(
             "https://www.taifex.com.tw/cht/3/futContractsDate",
             data={"queryType": "1", "doQuery": "1", "queryDate": q_date, "commodityId": "TXF"},
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers=TAIFEX_HEADERS,
             timeout=8,
+            verify=False,
         )
         if r.status_code != 200:
             return None
@@ -414,11 +443,11 @@ def _fetch_taifex_tx_single_day(ymd):
         idx = html.find("外資及陸資")
         if idx == -1:
             return None
-        sub = html[idx:idx + 3500]
+        sub = html[idx:idx + 4000]
         tr_end = sub.find("</tr>")
         if tr_end != -1:
             sub = sub[:tr_end]
-        cells = re.findall(r"<td[^>]*>(.*?)</td>", sub, flags=re.S)
+        cells = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", sub, flags=re.S | re.I)
         nums = []
         for c in cells:
             clean_c = re.sub(r"<[^>]+>", "", c).strip()
@@ -440,18 +469,52 @@ def _fetch_taifex_tx_single_day(ymd):
         pass
     return None
 
+def _fetch_finmind_tx_oi(start_d, end_d):
+    """第二層備援：從 FinMind 公開 API 取得外資臺股期貨(TX)未平倉數據"""
+    out = {}
+    try:
+        r = requests.get(
+            "https://api.finmindtrade.com/api/v4/data",
+            params={
+                "dataset": "TaiwanFuturesInstitutionalInvestors",
+                "data_id": "TX",
+                "start_date": start_d.strftime("%Y-%m-%d"),
+                "end_date": end_d.strftime("%Y-%m-%d"),
+            },
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        ).json()
+        for row in r.get("data", []):
+            inv = str(row.get("institutional_investors", ""))
+            if "外資" in inv:
+                ymd = _norm_ymd(row.get("date", ""))
+                if not ymd:
+                    continue
+                long_oi = int(_parse_num(row.get("long_open_interest_balance_volume")) or 0)
+                short_oi = int(_parse_num(row.get("short_open_interest_balance_volume")) or 0)
+                net_oi = long_oi - short_oi
+                out[ymd] = {
+                    "ymd": ymd,
+                    "long_oi": long_oi,
+                    "short_oi": short_oi,
+                    "net_oi": net_oi,
+                    "net_short": short_oi - long_oi,
+                }
+    except Exception:
+        pass
+    return out
+
 @st.cache_data(ttl=900, show_spinner=False)
-def last_10_taifex_fx_oi():
-    """取得近 10 個交易日外資台指期未平倉空單與每日增減（含前 1 日基準以計算第 1 日增減）"""
+def _fetch_taifex_fx_oi_cached(anchor_ymd):
     flows = last_15_flows()
     if not flows:
         return []
     need_days = flows[-11:] if len(flows) >= 11 else flows
-    start_d = need_days[0]["dt"] - timedelta(days=3)
+    start_d = need_days[0]["dt"] - timedelta(days=5)
     end_d = need_days[-1]["dt"]
 
     by_ymd = {}
-    # 1. 優先使用期交所 CSV 批次下載端點
+    # 1. 第一層：期交所 CSV 批次下載端點（支援忽略 SSL 憑證與雙編碼自動切換）
     try:
         r = requests.post(
             "https://www.taifex.com.tw/cht/3/futContractsDateDown",
@@ -460,20 +523,32 @@ def last_10_taifex_fx_oi():
                 "queryEndDate": end_d.strftime("%Y/%m/%d"),
                 "commodityId": "TXF",
             },
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers=TAIFEX_HEADERS,
             timeout=10,
+            verify=False,
         )
-        if r.status_code == 200 and len(r.content) > 100:
-            txt = r.content.decode("cp950", errors="ignore")
+        if r.status_code == 200 and len(r.content) > 80:
+            txt = ""
+            for enc in ("cp950", "utf-8-sig", "utf-8", "big5"):
+                try:
+                    cand = r.content.decode(enc)
+                    if "外資" in cand:
+                        txt = cand
+                        break
+                except Exception:
+                    continue
+            if not txt:
+                txt = r.content.decode("cp950", errors="ignore")
+
             for row in csv.reader(io.StringIO(txt)):
                 if len(row) >= 14 and "外資" in row[2] and ("臺股" in row[1] or "台股" in row[1] or "TX" in row[1]):
-                    raw_d = row[0].strip().replace("/", "").replace("-", "")
-                    if len(raw_d) == 8 and raw_d.isdigit():
+                    ymd = _norm_ymd(row[0])
+                    if ymd:
                         long_oi = int(_parse_num(row[9]) or 0)
                         short_oi = int(_parse_num(row[11]) or 0)
                         net_oi = int(_parse_num(row[13]) or 0)
-                        by_ymd[raw_d] = {
-                            "ymd": raw_d,
+                        by_ymd[ymd] = {
+                            "ymd": ymd,
                             "long_oi": long_oi,
                             "short_oi": short_oi,
                             "net_oi": net_oi,
@@ -482,7 +557,15 @@ def last_10_taifex_fx_oi():
     except Exception:
         pass
 
-    # 2. 若有缺漏日期，平行以單日網頁查詢補齊
+    # 2. 第二層：若有缺漏日期，使用 FinMind 公開 API 批次補齊
+    missing_ymds = [x["ymd"] for x in need_days if x["ymd"] not in by_ymd]
+    if missing_ymds:
+        fm_map = _fetch_finmind_tx_oi(start_d, end_d)
+        for ymd, info in fm_map.items():
+            if ymd not in by_ymd:
+                by_ymd[ymd] = info
+
+    # 3. 第三層：若仍有缺漏日期，平行以期交所單日網頁查詢補齊
     missing_ymds = [x["ymd"] for x in need_days if x["ymd"] not in by_ymd]
     if missing_ymds:
         with ThreadPoolExecutor(max_workers=5) as ex:
@@ -525,10 +608,19 @@ def last_10_taifex_fx_oi():
 
     return ordered[-10:]
 
+def last_10_taifex_fx_oi():
+    flows = last_15_flows()
+    anchor = flows[-1]["ymd"] if flows else datetime.now(TZ).strftime("%Y%m%d")
+    res = _fetch_taifex_fx_oi_cached(anchor)
+    # 若全部未取得，清除快取以便下次重試
+    if res and all(x.get("net_short") is None for x in res):
+        _fetch_taifex_fx_oi_cached.clear()
+    return res
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def tw_holidays():
     try:
-        r = requests.get("https://openapi.twse.com.tw/v1/holidaySchedule/holidaySchedule", timeout=8)
+        r = requests.get("https://openapi.twse.com.tw/v1/holidaySchedule/holidaySchedule", timeout=8, verify=False)
         if r.status_code != 200:
             raise ValueError("API Error")
         out = {}
@@ -723,10 +815,10 @@ FL_HEAD = """<!DOCTYPE html><html><head><meta charset="utf-8"><style>
 body{margin:0;background:transparent;color:#e8e6ee;font-family:-apple-system,"Noto Sans TC","Microsoft JhengHei",sans-serif;overflow:hidden}
 .fl-h{color:#fff;font-size:.98rem;font-weight:800;margin-bottom:.3rem}
 .fl-h small{color:#d8d4e8;font-weight:500;margin-left:.5rem}
-.fl{display:grid;grid-template-columns:64px 140px 1fr 250px;gap:18px;align-items:center;padding:6px 0;border-top:1px solid #2a2433}
+.fl{display:grid;grid-template-columns:68px 175px 1fr 250px;gap:18px;align-items:center;padding:6px 0;border-top:1px solid #2a2433}
 .fl.has-bal{padding-top:26px}
-.fl .nm{font-weight:700;color:#fff}
-.fl .lt{font-size:1.12rem;font-weight:800}
+.fl .nm{font-weight:700;color:#fff;white-space:nowrap}
+.fl .lt{font-size:1.12rem;font-weight:800;white-space:nowrap}
 .fl .sm{font-size:.98rem;color:#d0cde0}
 .fl .sm .row{display:flex;gap:20px;white-space:nowrap}
 .fl .sm b{font-weight:700;font-size:1.02rem}
