@@ -21,7 +21,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 TZ = pytz.timezone("Asia/Taipei")
-UP, DN = "#ff4d5a", "#22c55e"                    # 台股慣例：紅漲(增)綠跌(減)
+UP, DN = "#ff4d5a", "#22c55e"                    # 台股慣例：紅漲(多)綠跌(空)
 
 # ───────────────────────── 系統設定與白名單設定 ─────────────────────────
 INDEX_TICKER = "^TWII"
@@ -616,6 +616,18 @@ DAILY_JS = (
     'chart.subscribeCrosshairMove(q=>show(tkey(q.time)));show();</script>'
 )
 
+DAILY_LINE_JS = (
+    'chart=mk({timeScale:{borderColor:"#1f1f26",rightOffset:3}});const n=D.k.length;'
+    'const ls=chart.addAreaSeries({lineColor:"#60a5fa",topColor:"rgba(96,165,250,.28)",bottomColor:"rgba(96,165,250,.02)",lineWidth:2,priceLineVisible:true,lastValueVisible:true});'
+    'ls.setData(D.k.map(b=>({time:b.time,value:b.close})));'
+    'ls.priceScale().applyOptions({scaleMargins:{top:.12,bottom:.12}});'
+    'chart.timeScale().setVisibleLogicalRange({from:Math.max(0,n-60),to:n+2});'
+    'const idx={};D.k.forEach((b,i)=>idx[b.time]=i);'
+    'function show(t){const i=(t in idx)?idx[t]:n-1,b=D.k[i],p=i?D.k[i-1].close:b.open,ch=b.close-p,pc=p?ch/p*100:0,c=ch>=0?UP:DN,s=ch>=0?"+":"";'
+    'lg.innerHTML=`<b style="color:#fff">${b.time.replace(/-/g,"/")}</b> 收盤 <b style="color:${c}">${f2(b.close)}</b> <span style="color:${c}">${s}${f2(ch)} (${s}${pc.toFixed(2)}%)</span> ｜ 高 ${f2(b.high)} 低 ${f2(b.low)}`}'
+    'chart.subscribeCrosshairMove(q=>show(tkey(q.time)));show();</script>'
+)
+
 INTRA_JS = (
     'chart=mk({handleScroll:false,handleScale:false,timeScale:{visible:false,fixLeftEdge:true,fixRightEdge:true},'
     'rightPriceScale:{borderColor:"#1f1f26",scaleMargins:{top:.1,bottom:.12}}});'
@@ -653,6 +665,13 @@ def daily_html(df, h=390, n=130):
     data = dict(k=k, v=[int(x) if pd.notna(x) else 0 for x in d.Volume], m=m)
     return (BASE + DAILY_JS).replace("__H__", str(h)).replace("__DATA__", json.dumps(data))
 
+def daily_line_html(df, h=390, n=180):
+    d = df.copy().tail(n)
+    k = [dict(time=i.strftime("%Y-%m-%d"), open=round(float(r.Open), 3), high=round(float(r.High), 3),
+              low=round(float(r.Low), 3), close=round(float(r.Close), 3)) for i, r in d.iterrows()]
+    data = dict(k=k)
+    return (BASE + DAILY_LINE_JS).replace("__H__", str(h)).replace("__DATA__", json.dumps(data))
+
 def intraday_html(d, prev, h=390, step=60, floor=20, dec=0, mm=1, start_hr=9, dur_min=270, grid_sec=1800):
     off = 8 * 3600
     base = int(d.index[-1].normalize().timestamp()) + off
@@ -683,6 +702,15 @@ def _bar(a, mx, up):
 
 def _col(a):
     return UP if a >= 0 else DN
+
+def _bar_short(a, mx, up):
+    """外資期貨空單專用柱狀：空單增加(a>=0)為綠色(看空)，空單減少(a<0)為紅色"""
+    ok = (a >= 0) == up
+    return f"<i style='height:{abs(a) / mx * 100:.0f}%;background:{DN if up else UP}'></i>" if ok else ""
+
+def _col_short(a):
+    """外資期貨空單專用文字顏色：空單增加(>0)為綠色(看空)，空單減少(<0)為紅色"""
+    return DN if a >= 0 else UP
 
 def _tag_pos_cls(i, total=10):
     if i <= 2:
@@ -833,7 +861,7 @@ def flows_html(days):
     return FL_HEAD + header_block + rows + js_str
 
 def fx_oi_html(fx_days):
-    """近 10 日外資期貨未平倉空單互動式圖表（與三大法人區塊相同設計）"""
+    """近 10 日外資期貨未平倉空單互動式圖表（空單增加為綠色看空、空單減少為紅色）"""
     raw = []
     oi_tags = []
     vals = []
@@ -848,7 +876,7 @@ def fx_oi_html(fx_days):
         raw.append({
             "d": x["d"],
             "外資空單": f"{chg:+,d}口",
-            "外資空單c": _col(chg),
+            "外資空單c": _col_short(chg),
         })
 
     total_n = len(fx_days)
@@ -858,14 +886,14 @@ def fx_oi_html(fx_days):
         pos_cls = _tag_pos_cls(i, total_n)
         tag_html = f"<span class='bal-tag {pos_cls}' data-bal-i='{i}'>{oi_tags[i]}</span>"
         bar_cells.append(
-            f"<div data-i='{i}'>{tag_html}<div class='u'>{_bar(a, mx, True)}</div><div class='d'>{_bar(a, mx, False)}</div></div>"
+            f"<div data-i='{i}'>{tag_html}<div class='u'>{_bar_short(a, mx, True)}</div><div class='d'>{_bar_short(a, mx, False)}</div></div>"
         )
     bars = "".join(bar_cells)
     s5, s10 = sum(vals[-5:]), sum(vals)
 
     header_block = (
         '<div class="fl-h">近10日外資期貨未平倉空單'
-        '<small>臺股期貨(TX) · 口 · 紅＝空單增加 綠＝空單減少（游標移到長條或日期上，左側當日增減與柱狀上方未平倉總額會同步切換）</small></div>'
+        '<small>臺股期貨(TX) · 口 · 綠＝空單增加(看空) 紅＝空單減少（游標移到長條或日期上，左側當日增減與柱狀上方未平倉總額會同步切換）</small></div>'
         '<div class="fl" style="border:0;padding-bottom:2px">'
         '<div></div><div class="lt" id="dlab" style="font-size:.82rem;color:#d0cde0">最新 當日空單增減</div>'
         '<div></div><div class="sm"><div class="row" style="font-size:.78rem;color:#d0cde0">'
@@ -875,11 +903,11 @@ def fx_oi_html(fx_days):
     last_v = vals[-1] if vals else 0
     rows = (
         f"<div class='fl has-bal'><div class='nm'>外資空單</div>"
-        f"<div class='lt' id='val_外資空單' style='color:{_col(last_v)}'>{last_v:+,d}口</div>"
+        f"<div class='lt' id='val_外資空單' style='color:{_col_short(last_v)}'>{last_v:+,d}口</div>"
         f"<div class='bars'>{bars}</div>"
         f"<div class='sm'><div class='row'>"
-        f"<div style='width:105px'><b style='color:{_col(s5)}'>{s5:+,d}口</b></div>"
-        f"<div style='width:105px'><b style='color:{_col(s10)}'>{s10:+,d}口</b></div>"
+        f"<div style='width:105px'><b style='color:{_col_short(s5)}'>{s5:+,d}口</b></div>"
+        f"<div style='width:105px'><b style='color:{_col_short(s10)}'>{s10:+,d}口</b></div>"
         f"</div></div></div>"
     )
     dates = "".join(f"<div data-i='{i}'>{x['d']}</div>" for i, x in enumerate(fx_days))
@@ -1114,7 +1142,7 @@ def fx_page():
         elif daily.empty:
             st.warning("匯率日線資料載入失敗。")
         else:
-            components.html(daily_html(daily, h=390), height=400)
+            components.html(daily_line_html(daily, h=390), height=400)
 
     st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
     with st.container(key="fx_flow_card"):
