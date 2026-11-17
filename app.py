@@ -26,6 +26,7 @@ UP, DN = "#ff4d5a", "#22c55e"                    # 台股慣例：紅漲(增)綠
 # ───────────────────────── 系統設定與白名單設定 ─────────────────────────
 INDEX_TICKER = "^TWII"
 ETF_TICKER = "00631L.TW"
+FX_TICKER = "TWD=X"
 SYM = ETF_TICKER
 MAX_ARCHIVE_DAYS = 5
 MAX_NEWS_COUNT = 10                              # 網站新聞擷取數量提升為 10 則
@@ -61,9 +62,9 @@ header[data-testid=stHeader],footer,#MainMenu{display:none}
 .st-key-nav [data-testid=stMarkdownContainer]{display:flex;align-items:center}
 .st-key-nav h1{color:#FFC83D;font-size:1.35rem;font-weight:800;letter-spacing:.05em;margin:0!important;padding:0!important;line-height:1.4!important}
 .st-key-body{padding:.8rem 1.2rem 1.2rem}
-.st-key-chart_card,.st-key-chart_card_s{background:#000;border-radius:18px;padding:.8rem 1rem .6rem;box-shadow:0 10px 30px rgba(70,30,120,.3)}
-.st-key-flow_card,.st-key-strat_card,.st-key-trade_card,.st-key-vote_card{background:#15111c;border-radius:18px;padding:1rem 1.3rem;color:#ffffff;box-shadow:0 10px 30px rgba(70,30,120,.25)}
-.st-key-chart_card iframe,.st-key-chart_card_s iframe,.st-key-flow_card iframe,.st-key-vote_card iframe{border-radius:12px;display:block}
+.st-key-chart_card,.st-key-chart_card_s,.st-key-chart_card_fx{background:#000;border-radius:18px;padding:.8rem 1rem .6rem;box-shadow:0 10px 30px rgba(70,30,120,.3)}
+.st-key-flow_card,.st-key-fx_flow_card,.st-key-strat_card,.st-key-trade_card,.st-key-vote_card{background:#15111c;border-radius:18px;padding:1rem 1.3rem;color:#ffffff;box-shadow:0 10px 30px rgba(70,30,120,.25)}
+.st-key-chart_card iframe,.st-key-chart_card_s iframe,.st-key-chart_card_fx iframe,.st-key-flow_card iframe,.st-key-fx_flow_card iframe,.st-key-vote_card iframe{border-radius:12px;display:block}
 
 /* 標題與副標題高對比顯示 */
 .ttl{color:#fff;font-size:1.1rem;font-weight:800}.ttl span{color:#d0cde0;font-size:.88rem;margin-left:.45rem;font-weight:600}
@@ -144,6 +145,14 @@ div[data-testid=stMetric]{background:#1e1927;border:1px solid #352c47;border-rad
 div[data-testid=stMetric] label p{color:#e2dff0!important;font-weight:700!important;font-size:.92rem!important}
 div[data-testid=stMetricValue]{color:#fff!important;font-weight:800!important}
 
+/* 晨會快照高對比字卡（紅漲綠跌） */
+.snap-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:8px}
+@media(max-width:900px){.snap-grid{grid-template-columns:repeat(2,1fr)}}
+.snap-card{background:#1e1927;border:1px solid #352c47;border-radius:12px;padding:10px 14px;display:flex;flex-direction:column;gap:4px}
+.snap-lbl{color:#e2dff0;font-weight:700;font-size:.92rem}
+.snap-val{color:#ffffff;font-weight:800;font-size:1.55rem;line-height:1.2}
+.snap-chg{font-weight:800;font-size:.92rem;display:flex;align-items:center;gap:4px}
+
 /* 晨會卡片與新聞列表專用樣式 */
 .fact-box{background:#1e1927;border:1px solid #3d3354;border-radius:12px;padding:12px 16px;margin-bottom:10px;line-height:1.65;font-size:.95rem;color:#f1f5f9}
 .fact-box b{color:#FFC83D}
@@ -186,6 +195,20 @@ def load_intraday():
     return d[d.index.date == d.index[-1].date()]
 
 @st.cache_data(ttl=60, show_spinner=False)
+def load_fx_intraday():
+    d = _clean(yf.download(FX_TICKER, period="5d", interval="5m", progress=False))
+    if d.empty:
+        return d
+    d.index = d.index.tz_convert(TZ)
+    last_d = d.index[-1].date()
+    sub = d[d.index.date == last_d]
+    if len(sub) < 3:
+        dates = sorted(list(set(d.index.date)))
+        if len(dates) >= 2:
+            sub = d[d.index.date == dates[-2]]
+    return sub
+
+@st.cache_data(ttl=60, show_spinner=False)
 def load_5m_all(sym):
     d = _clean(yf.download(sym, period="60d", interval="5m", progress=False))
     if d.empty:
@@ -205,7 +228,7 @@ def twse_day(ymd):
         r = requests.get("https://www.twse.com.tw/rwd/zh/fund/BFI82U", timeout=8,
                          params={"dayDate": ymd, "type": "day", "response": "json"},
                          headers={"User-Agent": "Mozilla/5.0"}).json()
-        time.sleep(0.15)
+        time.sleep(0.12)
         if r.get("stat") != "OK":
             return None
         t = {row[0]: int(row[3].replace(",", "")) for row in r["data"]}
@@ -214,76 +237,85 @@ def twse_day(ymd):
     except Exception:
         return None
 
-@st.cache_data(ttl=900, show_spinner=False)
-def twse_margin_day(ymd):
+def _fetch_margin_and_maint_raw(ymd):
+    """單日抓取上市融資融券餘額、增減與大盤融資維持率（供多執行緒批次呼叫）"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    margin_bal = margin_chg = None
+    short_bal = short_chg = None
+    total_loan_k = None
+    maint_ratio = None
+    stock_rows = []
+
     try:
-        r = requests.get("https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN", timeout=8,
-                         params={"date": ymd, "selectType": "MS", "response": "json"},
-                         headers={"User-Agent": "Mozilla/5.0"}).json()
-        if r.get("stat") != "OK":
-            return {"ok": False, "label": "未取得"}
-        tables = r.get("tables", [])
-        if not tables:
-            return {"ok": False, "label": "未取得"}
-        rows = tables[0].get("data", [])
-        margin_bal = margin_chg = None
-        short_bal = short_chg = None
-        for row in rows:
-            item_name = str(row[0])
-            if "融資金額" in item_name:
-                prev_v = _parse_num(row[4])
-                curr_v = _parse_num(row[5])
-                if curr_v is not None:
-                    margin_bal = curr_v / 1e5
-                    margin_chg = (curr_v - prev_v) / 1e5 if prev_v is not None else 0.0
-            elif "融券" in item_name and "交易單位" in item_name:
-                prev_s = _parse_num(row[4])
-                curr_s = _parse_num(row[5])
-                if curr_s is not None:
-                    short_bal = int(curr_s)
-                    short_chg = int(curr_s - prev_s) if prev_s is not None else 0
-        if margin_bal is not None:
-            return {
-                "ok": True,
-                "margin_yi": round(margin_bal, 2),
-                "margin_chg_yi": round(margin_chg, 2),
-                "short_lots": short_bal or 0,
-                "short_chg_lots": short_chg or 0,
-                "label": f"融資餘額 {margin_bal:,.1f} 億（日增減 {margin_chg:+.2f} 億）｜融券 {short_bal or 0:,d} 張（{short_chg or 0:+,d} 張）"
-            }
+        r_m = requests.get(
+            "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN",
+            timeout=10,
+            params={"date": ymd, "selectType": "ALL", "response": "json"},
+            headers=headers,
+        ).json()
+        if r_m.get("stat") == "OK":
+            for tbl in r_m.get("tables", []):
+                flds = tbl.get("fields", [])
+                data_rows = tbl.get("data", [])
+                if any("項目" in str(f) for f in flds) or (data_rows and "融資" in str(data_rows[0][0])):
+                    for row in data_rows:
+                        item_name = str(row[0])
+                        if "融資金額" in item_name:
+                            prev_v = _parse_num(row[4])
+                            curr_v = _parse_num(row[5])
+                            if curr_v is not None:
+                                total_loan_k = curr_v
+                                margin_bal = curr_v / 1e5
+                                margin_chg = (curr_v - prev_v) / 1e5 if prev_v is not None else 0.0
+                        elif "融券" in item_name and "交易單位" in item_name:
+                            prev_s = _parse_num(row[4])
+                            curr_s = _parse_num(row[5])
+                            if curr_s is not None:
+                                short_bal = int(curr_s)
+                                short_chg = int(curr_s - prev_s) if prev_s is not None else 0
+                elif any("代號" in str(f) for f in flds):
+                    stock_rows = data_rows
     except Exception:
         pass
-    return {"ok": False, "label": "未取得"}
 
-@st.cache_data(ttl=900, show_spinner=False)
-def twse_market_maintenance_ratio(ymd):
-    """計算上市大盤融資維持率 (%) = 全部融資股票總市值(仟元) / 大盤融資總餘額(仟元) * 100"""
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        r_m = requests.get("https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN", timeout=10,
-                           params={"date": ymd, "selectType": "ALL", "response": "json"},
-                           headers=headers).json()
-        if r_m.get("stat") != "OK":
-            return None
-        tables = r_m.get("tables", [])
-        if len(tables) < 2:
-            return None
+    # 若 ALL 模式的統計表未取到，退回 MS 模式取融資融券總額
+    if margin_bal is None:
+        try:
+            r_ms = requests.get(
+                "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN",
+                timeout=8,
+                params={"date": ymd, "selectType": "MS", "response": "json"},
+                headers=headers,
+            ).json()
+            if r_ms.get("stat") == "OK" and r_ms.get("tables"):
+                for row in r_ms["tables"][0].get("data", []):
+                    item_name = str(row[0])
+                    if "融資金額" in item_name:
+                        prev_v = _parse_num(row[4])
+                        curr_v = _parse_num(row[5])
+                        if curr_v is not None:
+                            total_loan_k = curr_v
+                            margin_bal = curr_v / 1e5
+                            margin_chg = (curr_v - prev_v) / 1e5 if prev_v is not None else 0.0
+                    elif "融券" in item_name and "交易單位" in item_name:
+                        prev_s = _parse_num(row[4])
+                        curr_s = _parse_num(row[5])
+                        if curr_s is not None:
+                            short_bal = int(curr_s)
+                            short_chg = int(curr_s - prev_s) if prev_s is not None else 0
+        except Exception:
+            pass
 
-        # 1. 從 tables[0] 取得大盤融資金額今日餘額 (仟元)
-        total_loan_k = None
-        for row in tables[0].get("data", []):
-            if "融資金額" in str(row[0]):
-                total_loan_k = _parse_num(row[5])
-                break
-        if not total_loan_k or total_loan_k <= 0:
-            return None
-
-        # 2. 取得當日全部上市個股收盤價
+    # 計算該日大盤融資維持率 (%)
+    if total_loan_k and total_loan_k > 0 and stock_rows:
         price_map = {}
         try:
-            r_idx = requests.get("https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX", timeout=10,
-                                 params={"date": ymd, "type": "ALLBUT0999", "response": "json"},
-                                 headers=headers).json()
+            r_idx = requests.get(
+                "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX",
+                timeout=10,
+                params={"date": ymd, "type": "ALLBUT0999", "response": "json"},
+                headers=headers,
+            ).json()
             for tbl in r_idx.get("tables", []):
                 flds = tbl.get("fields", [])
                 if "證券代號" in flds and "收盤價" in flds:
@@ -300,31 +332,32 @@ def twse_market_maintenance_ratio(ymd):
         except Exception:
             pass
 
-        if not price_map:
-            r_all = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
-                                 timeout=10, headers=headers).json()
-            for item in r_all:
-                code = str(item.get("Code", "")).strip()
-                pr = _parse_num(item.get("ClosingPrice"))
-                if code and pr is not None:
-                    price_map[code] = pr
+        if price_map:
+            total_mkt_val_k = 0.0
+            for row in stock_rows:
+                code = str(row[0]).strip()
+                lots = _parse_num(row[6])
+                if lots and lots > 0 and code in price_map:
+                    total_mkt_val_k += lots * price_map[code]
+            if total_mkt_val_k > 0:
+                maint_ratio = round((total_mkt_val_k / total_loan_k) * 100.0, 1)
 
-        if not price_map:
-            return None
+    if margin_bal is not None:
+        maint_txt = f"｜大盤維持率 {maint_ratio:.1f}%" if maint_ratio is not None else ""
+        return {
+            "ok": True,
+            "margin_yi": round(margin_bal, 2),
+            "margin_chg_yi": round(margin_chg, 2),
+            "short_lots": short_bal or 0,
+            "short_chg_lots": short_chg or 0,
+            "maint_ratio": maint_ratio,
+            "label": f"融資餘額 {margin_bal:,.1f} 億（日增減 {margin_chg:+.2f} 億）{maint_txt}｜融券 {short_bal or 0:,d} 張（{short_chg or 0:+,d} 張）",
+        }
+    return {"ok": False, "label": "未取得", "maint_ratio": None}
 
-        # 3. 從 tables[1] 加總個股融資市值 (張數 * 收盤價 = 仟元)
-        total_mkt_val_k = 0.0
-        for row in tables[1].get("data", []):
-            code = str(row[0]).strip()
-            lots = _parse_num(row[6])  # 融資今日餘額(張)
-            if lots and lots > 0 and code in price_map:
-                total_mkt_val_k += lots * price_map[code]
-
-        if total_mkt_val_k > 0:
-            return round((total_mkt_val_k / total_loan_k) * 100.0, 2)
-    except Exception:
-        pass
-    return None
+@st.cache_data(ttl=900, show_spinner=False)
+def twse_margin_day(ymd):
+    return _fetch_margin_and_maint_raw(ymd)
 
 @st.cache_data(ttl=900, show_spinner=False)
 def last_15_flows():
@@ -341,20 +374,22 @@ def last_15_flows():
         d = d - pd.Timedelta(days=1)
     out = out[::-1]
 
-    # 為近 10 個交易日並行補齊融資融券數據
+    # 為近 10 個交易日平行補齊：融資增減、融資總額、融券增減、融券總額、大盤融資維持率
     target_days = out[-10:]
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        margin_results = list(ex.map(lambda item: twse_margin_day(item["ymd"]), target_days))
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        margin_results = list(ex.map(lambda item: _fetch_margin_and_maint_raw(item["ymd"]), target_days))
 
     for item, mg in zip(target_days, margin_results):
         if mg and mg.get("ok"):
             item["融資"] = mg["margin_chg_yi"]
             item["融資餘額"] = mg["margin_yi"]
+            item["維持率"] = mg.get("maint_ratio")
             item["融券"] = mg["short_chg_lots"]
             item["融券餘額"] = mg["short_lots"]
         else:
             item["融資"] = 0.0
             item["融資餘額"] = None
+            item["維持率"] = None
             item["融券"] = 0
             item["融券餘額"] = None
 
@@ -362,6 +397,133 @@ def last_15_flows():
 
 def last_10_flows():
     return last_15_flows()[-10:]
+
+def _fetch_taifex_tx_single_day(ymd):
+    """單日備援：從期交所 futContractsDate 網頁擷取外資臺股期貨未平倉數據"""
+    q_date = f"{ymd[:4]}/{ymd[4:6]}/{ymd[6:8]}"
+    try:
+        r = requests.post(
+            "https://www.taifex.com.tw/cht/3/futContractsDate",
+            data={"queryType": "1", "doQuery": "1", "queryDate": q_date, "commodityId": "TXF"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=8,
+        )
+        if r.status_code != 200:
+            return None
+        html = r.text
+        idx = html.find("外資及陸資")
+        if idx == -1:
+            return None
+        sub = html[idx:idx + 3500]
+        tr_end = sub.find("</tr>")
+        if tr_end != -1:
+            sub = sub[:tr_end]
+        cells = re.findall(r"<td[^>]*>(.*?)</td>", sub, flags=re.S)
+        nums = []
+        for c in cells:
+            clean_c = re.sub(r"<[^>]+>", "", c).strip()
+            v = _parse_num(clean_c)
+            if v is not None:
+                nums.append(int(round(v)))
+        if len(nums) >= 11:
+            long_oi = nums[6]
+            short_oi = nums[8]
+            net_oi = nums[10]
+            return {
+                "ymd": ymd,
+                "long_oi": long_oi,
+                "short_oi": short_oi,
+                "net_oi": net_oi,
+                "net_short": -net_oi,
+            }
+    except Exception:
+        pass
+    return None
+
+@st.cache_data(ttl=900, show_spinner=False)
+def last_10_taifex_fx_oi():
+    """取得近 10 個交易日外資台指期未平倉空單與每日增減（含前 1 日基準以計算第 1 日增減）"""
+    flows = last_15_flows()
+    if not flows:
+        return []
+    need_days = flows[-11:] if len(flows) >= 11 else flows
+    start_d = need_days[0]["dt"] - timedelta(days=3)
+    end_d = need_days[-1]["dt"]
+
+    by_ymd = {}
+    # 1. 優先使用期交所 CSV 批次下載端點
+    try:
+        r = requests.post(
+            "https://www.taifex.com.tw/cht/3/futContractsDateDown",
+            data={
+                "queryStartDate": start_d.strftime("%Y/%m/%d"),
+                "queryEndDate": end_d.strftime("%Y/%m/%d"),
+                "commodityId": "TXF",
+            },
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        if r.status_code == 200 and len(r.content) > 100:
+            txt = r.content.decode("cp950", errors="ignore")
+            for row in csv.reader(io.StringIO(txt)):
+                if len(row) >= 14 and "外資" in row[2] and ("臺股" in row[1] or "台股" in row[1] or "TX" in row[1]):
+                    raw_d = row[0].strip().replace("/", "").replace("-", "")
+                    if len(raw_d) == 8 and raw_d.isdigit():
+                        long_oi = int(_parse_num(row[9]) or 0)
+                        short_oi = int(_parse_num(row[11]) or 0)
+                        net_oi = int(_parse_num(row[13]) or 0)
+                        by_ymd[raw_d] = {
+                            "ymd": raw_d,
+                            "long_oi": long_oi,
+                            "short_oi": short_oi,
+                            "net_oi": net_oi,
+                            "net_short": -net_oi,
+                        }
+    except Exception:
+        pass
+
+    # 2. 若有缺漏日期，平行以單日網頁查詢補齊
+    missing_ymds = [x["ymd"] for x in need_days if x["ymd"] not in by_ymd]
+    if missing_ymds:
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            fetched = list(ex.map(_fetch_taifex_tx_single_day, missing_ymds))
+        for ymd, res in zip(missing_ymds, fetched):
+            if res:
+                by_ymd[ymd] = res
+
+    ordered = []
+    for x in need_days:
+        ymd = x["ymd"]
+        info = by_ymd.get(ymd)
+        if info:
+            ordered.append({
+                "ymd": ymd,
+                "d": x["d"],
+                "dt": x["dt"],
+                "net_short": info["net_short"],
+                "short_oi": info["short_oi"],
+                "net_oi": info["net_oi"],
+            })
+        else:
+            ordered.append({
+                "ymd": ymd,
+                "d": x["d"],
+                "dt": x["dt"],
+                "net_short": None,
+                "short_oi": None,
+                "net_oi": None,
+            })
+
+    # 計算每日未平倉空單增減
+    for i in range(len(ordered)):
+        cur_ns = ordered[i]["net_short"]
+        prev_ns = ordered[i - 1]["net_short"] if i > 0 else None
+        if cur_ns is not None and prev_ns is not None:
+            ordered[i]["chg"] = cur_ns - prev_ns
+        else:
+            ordered[i]["chg"] = 0
+
+    return ordered[-10:]
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def tw_holidays():
@@ -491,12 +653,12 @@ def daily_html(df, h=390, n=130):
     data = dict(k=k, v=[int(x) if pd.notna(x) else 0 for x in d.Volume], m=m)
     return (BASE + DAILY_JS).replace("__H__", str(h)).replace("__DATA__", json.dumps(data))
 
-def intraday_html(d, prev, h=390, step=60, floor=20, dec=0, mm=1):
+def intraday_html(d, prev, h=390, step=60, floor=20, dec=0, mm=1, start_hr=9, dur_min=270, grid_sec=1800):
     off = 8 * 3600
     base = int(d.index[-1].normalize().timestamp()) + off
     pts = [[int(t.timestamp()) + off, round(float(c) - prev, 4), round(float(c), 2)] for t, c in d.Close.items()]
-    allt = [base + 9 * 3600 + k * step for k in range(270 * 60 // step + 1)]
-    data = dict(pts=pts, prev=float(prev), all=allt, grid=[t for t in allt if (t - base) % 1800 == 0])
+    allt = [base + start_hr * 3600 + k * step for k in range(dur_min * 60 // step + 1)]
+    data = dict(pts=pts, prev=float(prev), all=allt, grid=[t for t in allt if (t - base) % grid_sec == 0])
     js = INTRA_JS.replace("__FLOOR__", str(floor)).replace("__DEC__", str(dec)).replace("__MM__", str(mm))
     return (BASE + js).replace("__H__", str(h)).replace("__DATA__", json.dumps(data))
 
@@ -506,7 +668,13 @@ def pick(label, opts, key):
 def prev_close(daily, d):
     dts = pd.DatetimeIndex(daily.index).tz_localize(None).date
     sub = daily.Close[dts < d.index[-1].date()]
-    return float(sub.iloc[-1]) if not sub.empty else float(daily.Close.iloc[-1])
+    if not sub.empty:
+        c_last = float(d.Close.iloc[-1])
+        for val in reversed(sub.values):
+            if abs(float(val) - c_last) > 1e-5:
+                return float(val)
+        return float(sub.iloc[-1])
+    return float(daily.Close.iloc[-1])
 
 # ───────────────────────── 頁面一：大盤 ─────────────────────────
 def _bar(a, mx, up):
@@ -516,12 +684,19 @@ def _bar(a, mx, up):
 def _col(a):
     return UP if a >= 0 else DN
 
+def _tag_pos_cls(i, total=10):
+    if i <= 2:
+        return "pos-l"
+    if i >= total - 3:
+        return "pos-r"
+    return "pos-c"
+
 FL_HEAD = """<!DOCTYPE html><html><head><meta charset="utf-8"><style>
 body{margin:0;background:transparent;color:#e8e6ee;font-family:-apple-system,"Noto Sans TC","Microsoft JhengHei",sans-serif;overflow:hidden}
 .fl-h{color:#fff;font-size:.98rem;font-weight:800;margin-bottom:.3rem}
 .fl-h small{color:#d8d4e8;font-weight:500;margin-left:.5rem}
-.fl{display:grid;grid-template-columns:50px 140px 1fr 250px;gap:18px;align-items:center;padding:6px 0;border-top:1px solid #2a2433}
-.fl.has-bal{padding-top:25px}
+.fl{display:grid;grid-template-columns:64px 140px 1fr 250px;gap:18px;align-items:center;padding:6px 0;border-top:1px solid #2a2433}
+.fl.has-bal{padding-top:26px}
 .fl .nm{font-weight:700;color:#fff}
 .fl .lt{font-size:1.12rem;font-weight:800}
 .fl .sm{font-size:.98rem;color:#d0cde0}
@@ -534,45 +709,43 @@ body{margin:0;background:transparent;color:#e8e6ee;font-family:-apple-system,"No
 .bars .u{align-items:flex-end}.bars .d{align-items:flex-start}
 .bars i{display:block;width:100%;border-radius:2px}
 .bal-tag{
+  display:none;
   position:absolute;
   bottom:100%;
-  right:0;
   margin-bottom:4px;
   white-space:nowrap;
   background:#261f35;
-  border:1px solid rgba(255,200,61,.65);
+  border:1px solid rgba(255,200,61,.75);
   color:#FFC83D;
   font-size:.73rem;
   font-weight:800;
   padding:1px 8px;
   border-radius:5px;
   pointer-events:none;
-  z-index:4;
-  box-shadow:0 2px 6px rgba(0,0,0,.45);
+  z-index:6;
+  box-shadow:0 2px 8px rgba(0,0,0,.55);
 }
+.bal-tag.show{display:block}
+.bal-tag.pos-l{left:0}
+.bal-tag.pos-c{left:50%;transform:translateX(-50%)}
+.bal-tag.pos-r{right:0}
 .dates{display:grid;grid-template-columns:repeat(10,1fr);gap:5px;color:#b8b4c9;font-size:.72rem;text-align:center}
 .dates div{cursor:pointer;border-radius:3px}.dates div.hi{color:#fff;background:rgba(255,255,255,.10)}
 </style></head><body>
-<div class="fl-h">近10日三大法人買賣超及融資融券<small>上市 · 紅＝買超/增加 綠＝賣超/減少（游標移到長條或日期上，左側數值會顯示該日資料）</small></div>
-<div class="fl" style="border:0;padding-bottom:2px">
-  <div></div>
-  <div class="lt" id="dlab" style="font-size:.82rem;color:#d0cde0">最新 當日買賣超/增減</div>
-  <div></div>
-  <div class="sm"><div class="row" style="font-size:.78rem;color:#d0cde0"><div style="width:105px">近 5 日累積</div><div style="width:105px">近 10 日累積</div></div></div>
-</div>
 """
 
 FL_JS = """
 <script>
-const flowData=__DATA__, lastIdx=flowData.length-1;
+const flowData=__DATA__, keys=__KEYS__, lastIdx=flowData.length-1;
 function updateFlow(i,hl){
   const d=flowData[i]; if(!d) return;
-  ['外資','投信','自營','融資','融券'].forEach(k=>{
+  keys.forEach(k=>{
     const e=document.getElementById('val_'+k);
     if(e){e.innerText=d[k];e.style.color=d[k+'c'];}
   });
-  document.getElementById('dlab').innerText=(hl?d.d:'最新 '+d.d)+' 當日買賣超/增減';
+  document.getElementById('dlab').innerText=(hl?d.d:'最新 '+d.d)+' __DLAB_SUFFIX__';
   document.querySelectorAll('[data-i]').forEach(e=>e.classList.toggle('hi',hl&&Number(e.dataset.i)===i));
+  document.querySelectorAll('[data-bal-i]').forEach(e=>e.classList.toggle('show',Number(e.dataset.balI)===i));
 }
 function resetFlow(){updateFlow(lastIdx,false);}
 document.querySelectorAll('[data-i]').forEach(e=>{
@@ -583,12 +756,23 @@ resetFlow();
 </script></body></html>
 """
 
-def flows_html(days, maint_ratio=None):
+def flows_html(days):
     raw = []
+    m_tags, s_tags = [], []
     for x in days:
         f, t, z = x["外資"] / 1e8, x["投信"] / 1e8, x["自營"] / 1e8
         m_chg = float(x.get("融資", 0.0) or 0.0)
         s_chg = int(x.get("融券", 0) or 0)
+        m_bal = x.get("融資餘額")
+        maint = x.get("維持率")
+        s_bal = x.get("融券餘額")
+
+        maint_str = f"{maint:.1f}%" if maint is not None else "未取得"
+        m_bal_str = f"{x['d']} 融資總額 {m_bal:,.1f}億｜大盤維持率 {maint_str}" if m_bal is not None else f"{x['d']} 融資總額 未取得｜大盤維持率 {maint_str}"
+        s_bal_str = f"{x['d']} 融券總額 {s_bal:,d}張" if s_bal is not None else f"{x['d']} 融券總額 未取得"
+
+        m_tags.append(m_bal_str)
+        s_tags.append(s_bal_str)
         raw.append({
             "d": x["d"],
             "外資": f"{f:+,.1f}億", "外資c": _col(f),
@@ -598,35 +782,37 @@ def flows_html(days, maint_ratio=None):
             "融券": f"{s_chg:+,d}張", "融券c": _col(s_chg),
         })
 
-    last_idx = len(days) - 1
-    last_day = days[-1] if days else {}
-    m_bal = last_day.get("融資餘額")
-    s_bal = last_day.get("融券餘額")
-
-    maint_str = f"{maint_ratio:.1f}%" if maint_ratio is not None else "未取得"
-    m_bal_str = f"餘額 {m_bal:,.1f}億｜大盤融資維持率 {maint_str}" if m_bal is not None else f"餘額 未取得｜大盤融資維持率 {maint_str}"
-    s_bal_str = f"餘額 {s_bal:,d}張" if s_bal is not None else "餘額 未取得"
-
+    total_n = len(days)
     row_configs = [
         ("外資", [x["外資"] / 1e8 for x in days], lambda v: f"{v:+,.1f}億", None),
         ("投信", [x["投信"] / 1e8 for x in days], lambda v: f"{v:+,.1f}億", None),
         ("自營", [x["自營"] / 1e8 for x in days], lambda v: f"{v:+,.1f}億", None),
-        ("融資", [float(x.get("融資", 0.0) or 0.0) for x in days], lambda v: f"{v:+,.2f}億", m_bal_str),
-        ("融券", [int(x.get("融券", 0) or 0) for x in days], lambda v: f"{int(round(v)):+,d}張", s_bal_str),
+        ("融資", [float(x.get("融資", 0.0) or 0.0) for x in days], lambda v: f"{v:+,.2f}億", m_tags),
+        ("融券", [int(x.get("融券", 0) or 0) for x in days], lambda v: f"{int(round(v)):+,d}張", s_tags),
     ]
 
+    header_block = (
+        '<div class="fl-h">近10日三大法人買賣超及融資融券'
+        '<small>上市 · 紅＝買超/增加 綠＝賣超/減少（游標移到長條或日期上，左側數值與柱狀上方總額/維持率會同步切換為該日資料）</small></div>'
+        '<div class="fl" style="border:0;padding-bottom:2px">'
+        '<div></div><div class="lt" id="dlab" style="font-size:.82rem;color:#d0cde0">最新 當日買賣超/增減</div>'
+        '<div></div><div class="sm"><div class="row" style="font-size:.78rem;color:#d0cde0">'
+        '<div style="width:105px">近 5 日累積</div><div style="width:105px">近 10 日累積</div></div></div></div>'
+    )
+
     rows = ""
-    for k, v, fmt_fn, bal_badge in row_configs:
+    for k, v, fmt_fn, tag_list in row_configs:
         mx = max(abs(a) for a in v) or 1
         bar_cells = []
         for i, a in enumerate(v):
-            tag_html = f"<span class='bal-tag'>{bal_badge}</span>" if (bal_badge and i == last_idx) else ""
+            pos_cls = _tag_pos_cls(i, total_n)
+            tag_html = f"<span class='bal-tag {pos_cls}' data-bal-i='{i}'>{tag_list[i]}</span>" if tag_list else ""
             bar_cells.append(
                 f"<div data-i='{i}'>{tag_html}<div class='u'>{_bar(a, mx, True)}</div><div class='d'>{_bar(a, mx, False)}</div></div>"
             )
         bars = "".join(bar_cells)
         s5, s10 = sum(v[-5:]), sum(v)
-        row_cls = "fl has-bal" if bal_badge else "fl"
+        row_cls = "fl has-bal" if tag_list else "fl"
         rows += (
             f"<div class='{row_cls}'><div class='nm'>{k}</div>"
             f"<div class='lt' id='val_{k}' style='color:{_col(v[-1])}'>{fmt_fn(v[-1])}</div>"
@@ -639,7 +825,72 @@ def flows_html(days, maint_ratio=None):
 
     dates = "".join(f"<div data-i='{i}'>{x['d']}</div>" for i, x in enumerate(days))
     rows += f"<div class='fl' style='border:0;padding-top:0'><div></div><div></div><div class='dates'>{dates}</div><div></div></div>"
-    return FL_HEAD + rows + FL_JS.replace("__DATA__", json.dumps(raw))
+    js_str = (
+        FL_JS.replace("__DATA__", json.dumps(raw))
+        .replace("__KEYS__", json.dumps(["外資", "投信", "自營", "融資", "融券"]))
+        .replace("__DLAB_SUFFIX__", "當日買賣超/增減")
+    )
+    return FL_HEAD + header_block + rows + js_str
+
+def fx_oi_html(fx_days):
+    """近 10 日外資期貨未平倉空單互動式圖表（與三大法人區塊相同設計）"""
+    raw = []
+    oi_tags = []
+    vals = []
+    for x in fx_days:
+        chg = int(x.get("chg", 0) or 0)
+        ns = x.get("net_short")
+        vals.append(chg)
+        if ns is not None:
+            oi_tags.append(f"{x['d']} 未平倉空單 {ns:,d}口")
+        else:
+            oi_tags.append(f"{x['d']} 未平倉空單 未取得")
+        raw.append({
+            "d": x["d"],
+            "外資空單": f"{chg:+,d}口",
+            "外資空單c": _col(chg),
+        })
+
+    total_n = len(fx_days)
+    mx = max((abs(a) for a in vals), default=1) or 1
+    bar_cells = []
+    for i, a in enumerate(vals):
+        pos_cls = _tag_pos_cls(i, total_n)
+        tag_html = f"<span class='bal-tag {pos_cls}' data-bal-i='{i}'>{oi_tags[i]}</span>"
+        bar_cells.append(
+            f"<div data-i='{i}'>{tag_html}<div class='u'>{_bar(a, mx, True)}</div><div class='d'>{_bar(a, mx, False)}</div></div>"
+        )
+    bars = "".join(bar_cells)
+    s5, s10 = sum(vals[-5:]), sum(vals)
+
+    header_block = (
+        '<div class="fl-h">近10日外資期貨未平倉空單'
+        '<small>臺股期貨(TX) · 口 · 紅＝空單增加 綠＝空單減少（游標移到長條或日期上，左側當日增減與柱狀上方未平倉總額會同步切換）</small></div>'
+        '<div class="fl" style="border:0;padding-bottom:2px">'
+        '<div></div><div class="lt" id="dlab" style="font-size:.82rem;color:#d0cde0">最新 當日空單增減</div>'
+        '<div></div><div class="sm"><div class="row" style="font-size:.78rem;color:#d0cde0">'
+        '<div style="width:105px">近 5 日累積</div><div style="width:105px">近 10 日累積</div></div></div></div>'
+    )
+
+    last_v = vals[-1] if vals else 0
+    rows = (
+        f"<div class='fl has-bal'><div class='nm'>外資空單</div>"
+        f"<div class='lt' id='val_外資空單' style='color:{_col(last_v)}'>{last_v:+,d}口</div>"
+        f"<div class='bars'>{bars}</div>"
+        f"<div class='sm'><div class='row'>"
+        f"<div style='width:105px'><b style='color:{_col(s5)}'>{s5:+,d}口</b></div>"
+        f"<div style='width:105px'><b style='color:{_col(s10)}'>{s10:+,d}口</b></div>"
+        f"</div></div></div>"
+    )
+    dates = "".join(f"<div data-i='{i}'>{x['d']}</div>" for i, x in enumerate(fx_days))
+    rows += f"<div class='fl' style='border:0;padding-top:0'><div></div><div></div><div class='dates'>{dates}</div><div></div></div>"
+
+    js_str = (
+        FL_JS.replace("__DATA__", json.dumps(raw))
+        .replace("__KEYS__", json.dumps(["外資空單"]))
+        .replace("__DLAB_SUFFIX__", "當日空單增減")
+    )
+    return FL_HEAD + header_block + rows + js_str
 
 def market_page():
     daily = load_daily(INDEX_TICKER)
@@ -661,11 +912,10 @@ def market_page():
 
     st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
     with st.container(key="flow_card"):
-        with st.spinner("讀取證交所三大法人、融資融券與大盤維持率…"):
+        with st.spinner("讀取證交所三大法人、融資融券與近 10 日大盤維持率…"):
             days = last_10_flows()
-            maint_ratio = twse_market_maintenance_ratio(days[-1]["ymd"]) if days else None
         if days:
-            components.html(flows_html(days, maint_ratio=maint_ratio), height=395, scrolling=False)
+            components.html(flows_html(days), height=395, scrolling=False)
         else:
             st.warning("目前無法取得證交所三大法人與融資融券資料。")
 
@@ -833,9 +1083,61 @@ def strategy_page():
             st.markdown("<div class='fl-h'>最近 5 筆模擬交易</div>", unsafe_allow_html=True)
             st.dataframe(pd.DataFrame(s["trades"][-5:][::-1]), hide_index=True, use_container_width=True)
 
-# ───────────────────────── 頁面三：晨會與一鍵問問 AI ─────────────────────────
+# ───────────────────────── 頁面三：匯率 (USD/TWD & 外資期貨空單) ─────────────────────────
+def fx_page():
+    daily = load_daily(FX_TICKER)
+    with st.container(key="chart_card_fx"):
+        l, r = st.columns([5, 2], vertical_alignment="center")
+        l.markdown(f"<div class='ttl'>美元兌新台幣<span>USD/TWD ({FX_TICKER})</span></div>", unsafe_allow_html=True)
+        with r:
+            tf = pick("週期", ["分時圖", "日線圖"], "tf_fx")
+        if tf == "分時圖":
+            d = load_fx_intraday()
+            if d.empty or daily.empty:
+                st.warning("目前抓不到匯率分時資料，請切換至日線圖或稍後再試。")
+            else:
+                components.html(
+                    intraday_html(
+                        d,
+                        prev_close(daily, d),
+                        h=390,
+                        step=300,
+                        floor=0.05,
+                        dec=2,
+                        mm=0.01,
+                        start_hr=0,
+                        dur_min=1435,
+                        grid_sec=7200,
+                    ),
+                    height=400,
+                )
+        elif daily.empty:
+            st.warning("匯率日線資料載入失敗。")
+        else:
+            components.html(daily_html(daily, h=390), height=400)
+
+    st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
+    with st.container(key="fx_flow_card"):
+        with st.spinner("讀取期交所近 10 日外資台指期未平倉空單…"):
+            fx_days = last_10_taifex_fx_oi()
+        if fx_days:
+            components.html(fx_oi_html(fx_days), height=165, scrolling=False)
+        else:
+            st.warning("目前無法取得期交所外資台指期未平倉資料。")
+
+# ───────────────────────── 頁面四：晨會與一鍵問問 AI ─────────────────────────
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_taifex_oi_and_pcr_for_date(ymd):
+    fx_days = last_10_taifex_fx_oi()
+    for x in reversed(fx_days):
+        if x["ymd"] <= ymd and x.get("net_short") is not None:
+            chg = int(x.get("chg", 0) or 0)
+            return {
+                "fx_oi_ok": True,
+                "fx_label": f"未平倉淨空單 {x['net_short']:,d} 口（當日增減 {chg:+,d} 口）",
+                "pcr_ok": False,
+                "pcr_label": "未取得",
+            }
     return {"fx_oi_ok": False, "fx_label": "未取得", "pcr_ok": False, "pcr_label": "未取得"}
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -850,9 +1152,13 @@ def fetch_overnight_us_market(upto_date):
         "fx": "TWD=X",
     }
     res = {
-        "sox_pct": 0.0, "tsm_pct": 0.0, "nvda_pct": 0.0, "sp_pct": 0.0,
-        "vix_close": 0.0, "vix_pct": 0.0, "tnx_close": 0.0, "tnx_pct": 0.0,
-        "fx_close": 32.0, "fx_pct": 0.0,
+        "sox_close": 0.0, "sox_pct": 0.0,
+        "tsm_close": 0.0, "tsm_pct": 0.0,
+        "nvda_close": 0.0, "nvda_pct": 0.0,
+        "sp_close": 0.0, "sp_pct": 0.0,
+        "vix_close": 0.0, "vix_pct": 0.0,
+        "tnx_close": 0.0, "tnx_pct": 0.0,
+        "fx_close": 32.0, "fx_chg": 0.0, "fx_pct": 0.0,
     }
     for k, sym in tickers.items():
         try:
@@ -865,18 +1171,17 @@ def fetch_overnight_us_market(upto_date):
                 sub = d
             c = float(sub["Close"].iloc[-1])
             p = float(sub["Close"].iloc[-2]) if len(sub) >= 2 else c
+            # 針對匯率跨日重複報價防呆：往前找最後一個有變動的收盤價
+            if k == "fx" and abs(c - p) < 1e-4 and len(sub) >= 3:
+                for prev_candidate in reversed(sub["Close"].iloc[:-1].values):
+                    if abs(c - float(prev_candidate)) >= 1e-4:
+                        p = float(prev_candidate)
+                        break
             pct = (c / p - 1.0) * 100.0 if p else 0.0
-            if k in ("sox", "tsm", "nvda", "sp"):
-                res[f"{k}_pct"] = round(pct, 2)
-            elif k == "vix":
-                res["vix_close"] = round(c, 2)
-                res["vix_pct"] = round(pct, 2)
-            elif k == "tnx":
-                res["tnx_close"] = round(c, 2)
-                res["tnx_pct"] = round(pct, 2)
-            elif k == "fx":
-                res["fx_close"] = round(c, 2)
-                res["fx_pct"] = round(pct, 2)
+            res[f"{k}_close"] = round(c, 2)
+            res[f"{k}_pct"] = round(pct, 2)
+            if k == "fx":
+                res["fx_chg"] = round(c - p, 3)
         except Exception:
             continue
     return res
@@ -1172,7 +1477,8 @@ def build_external_ai_prompt(briefing):
 
     # C. 籌碼面欄位格式化
     if mg.get("ok"):
-        margin_line = f"- 融資餘額：{mg['margin_yi']:,.2f} 億（日增減 {mg['margin_chg_yi']:+.2f} 億）｜融券：{mg['short_lots']:,d} 張（日增減 {mg['short_chg_lots']:+,d} 張）"
+        maint_part = f"（大盤維持率 {mg['maint_ratio']:.1f}%）" if mg.get("maint_ratio") is not None else ""
+        margin_line = f"- 融資餘額：{mg['margin_yi']:,.2f} 億（日增減 {mg['margin_chg_yi']:+.2f} 億）{maint_part}｜融券：{mg['short_lots']:,d} 張（日增減 {mg['short_chg_lots']:+,d} 張）"
     else:
         margin_line = "- 融資餘額：未取得（日增減：未取得）｜融券：未取得（日增減：未取得）"
 
@@ -1337,6 +1643,46 @@ function openAI(mode) {{
 }}
 </script></body></html>"""
 
+def _render_snapshot_cards(us_info):
+    """渲染晨會 5 張國際市場與匯率快照卡（下方以紅漲綠跌顯示變化數值與 %）"""
+    def _chg_html(pct_val, extra_chg=None):
+        c = UP if pct_val >= 0 else DN
+        arr = "▲" if pct_val > 0 else ("▼" if pct_val < 0 else "—")
+        if extra_chg is not None:
+            return f"<div class='snap-chg' style='color:{c}'>{arr} {extra_chg:+.2f}（{pct_val:+.2f}%）</div>"
+        return f"<div class='snap-chg' style='color:{c}'>{arr} {pct_val:+.2f}%</div>"
+
+    cards_html = f"""
+    <div class="snap-grid">
+      <div class="snap-card">
+        <div class="snap-lbl">費半</div>
+        <div class="snap-val">{us_info['sox_close']:,.2f}</div>
+        {_chg_html(us_info['sox_pct'])}
+      </div>
+      <div class="snap-card">
+        <div class="snap-lbl">台積電 ADR</div>
+        <div class="snap-val">{us_info['tsm_close']:,.2f}</div>
+        {_chg_html(us_info['tsm_pct'])}
+      </div>
+      <div class="snap-card">
+        <div class="snap-lbl">VIX</div>
+        <div class="snap-val">{us_info['vix_close']:,.2f}</div>
+        {_chg_html(us_info['vix_pct'])}
+      </div>
+      <div class="snap-card">
+        <div class="snap-lbl">美債 10Y 殖利率</div>
+        <div class="snap-val">{us_info['tnx_close']:.2f}%</div>
+        {_chg_html(us_info['tnx_pct'])}
+      </div>
+      <div class="snap-card">
+        <div class="snap-lbl">匯率 (USD/TWD)</div>
+        <div class="snap-val">{us_info['fx_close']:.2f}</div>
+        {_chg_html(us_info['fx_pct'], extra_chg=us_info['fx_chg'])}
+      </div>
+    </div>
+    """
+    st.markdown(cards_html, unsafe_allow_html=True)
+
 def _render_tech_card_box(title_label, card):
     if not card:
         st.warning(f"{title_label} 資料不足，無法產生技術面事實卡。")
@@ -1434,17 +1780,13 @@ def briefing_page():
 
         st.markdown("<div style='height:0.4rem'></div>", unsafe_allow_html=True)
         st.markdown("<div class='fl-h'>一、隔夜國際市場與台股籌碼快照</div>", unsafe_allow_html=True)
-        m = st.columns(5)
-        m[0].metric("費半", f"{us_info['sox_pct']:+.2f}%")
-        m[1].metric("台積電 ADR", f"{us_info['tsm_pct']:+.2f}%")
-        m[2].metric("VIX", f"{us_info['vix_close']:.2f}", f"{us_info['vix_pct']:+.2f}%", delta_color="inverse")
-        m[3].metric("美債 10Y 殖利率", f"{us_info['tnx_close']:.2f}%", f"{us_info['tnx_pct']:+.2f}%", delta_color="inverse")
-        m[4].metric("台美匯率", f"{us_info['fx_close']:.2f}", f"{us_info['fx_pct']:+.2f}%", delta_color="inverse")
+        _render_snapshot_cards(us_info)
 
         st.caption(
             f"📌 籌碼補充：外資當日 {flow_dict['f1']:+.2f} 億（近5日 {flow_dict['f5']:+.2f} 億）｜"
             f"投信當日 {flow_dict['t1']:+.2f} 億（近5日 {flow_dict['t5']:+.2f} 億）｜"
-            f"自營商當日 {flow_dict['z1']:+.2f} 億｜{margin_info.get('label', '融資融券：未取得')}"
+            f"自營商當日 {flow_dict['z1']:+.2f} 億｜{margin_info.get('label', '融資融券：未取得')}｜"
+            f"外資期貨：{oi_pcr_info.get('fx_label', '未取得')}"
         )
 
         st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
@@ -1475,12 +1817,14 @@ with st.container(key="nav"):
     nl, nr = st.columns([5, 4], vertical_alignment="center")
     nl.markdown("<h1>📈 破產後重生之我要靠量化交易發財</h1>", unsafe_allow_html=True)
     with nr:
-        page = pick("導覽", ["大盤", "策略", "晨會"], "nav_page")
+        page = pick("導覽", ["大盤", "策略", "匯率", "晨會"], "nav_page")
 
 with st.container(key="body"):
     if page == "大盤":
         market_page()
     elif page == "策略":
         strategy_page()
+    elif page == "匯率":
+        fx_page()
     elif page == "晨會":
         briefing_page()
