@@ -1,6 +1,7 @@
 import os, io, csv, json, time, re, math
 import urllib.parse
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date, time as dtime, timedelta
 import numpy as np, pandas as pd, pytz, requests, yfinance as yf
 import streamlit as st
@@ -20,14 +21,14 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 TZ = pytz.timezone("Asia/Taipei")
-UP, DN = "#ff4d5a", "#22c55e"                   # 台股慣例：紅漲綠跌
+UP, DN = "#ff4d5a", "#22c55e"                    # 台股慣例：紅漲(增)綠跌(減)
 
 # ───────────────────────── 系統設定與白名單設定 ─────────────────────────
 INDEX_TICKER = "^TWII"
 ETF_TICKER = "00631L.TW"
 SYM = ETF_TICKER
 MAX_ARCHIVE_DAYS = 5
-MAX_NEWS_COUNT = 10                             # 網站新聞擷取數量提升為 10 則
+MAX_NEWS_COUNT = 10                              # 網站新聞擷取數量提升為 10 則
 
 NEWS_WHITELIST = [
     {"name": "中央社",   "domain": "cna.com.tw",       "lang": "zh", "paywall": False},
@@ -165,7 +166,7 @@ def _parse_num(val):
     if val is None:
         return None
     s = str(val).strip().replace(",", "").replace("%", "").replace("+", "")
-    if not s or s in ("-", "--", "N/A", "None"):
+    if not s or s in ("-", "--", "N/A", "None", "X"):
         return None
     try:
         return float(s)
@@ -204,7 +205,7 @@ def twse_day(ymd):
         r = requests.get("https://www.twse.com.tw/rwd/zh/fund/BFI82U", timeout=8,
                          params={"dayDate": ymd, "type": "day", "response": "json"},
                          headers={"User-Agent": "Mozilla/5.0"}).json()
-        time.sleep(0.2)
+        time.sleep(0.15)
         if r.get("stat") != "OK":
             return None
         t = {row[0]: int(row[3].replace(",", "")) for row in r["data"]}
@@ -255,6 +256,77 @@ def twse_margin_day(ymd):
     return {"ok": False, "label": "未取得"}
 
 @st.cache_data(ttl=900, show_spinner=False)
+def twse_market_maintenance_ratio(ymd):
+    """計算上市大盤融資維持率 (%) = 全部融資股票總市值(仟元) / 大盤融資總餘額(仟元) * 100"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        r_m = requests.get("https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN", timeout=10,
+                           params={"date": ymd, "selectType": "ALL", "response": "json"},
+                           headers=headers).json()
+        if r_m.get("stat") != "OK":
+            return None
+        tables = r_m.get("tables", [])
+        if len(tables) < 2:
+            return None
+
+        # 1. 從 tables[0] 取得大盤融資金額今日餘額 (仟元)
+        total_loan_k = None
+        for row in tables[0].get("data", []):
+            if "融資金額" in str(row[0]):
+                total_loan_k = _parse_num(row[5])
+                break
+        if not total_loan_k or total_loan_k <= 0:
+            return None
+
+        # 2. 取得當日全部上市個股收盤價
+        price_map = {}
+        try:
+            r_idx = requests.get("https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX", timeout=10,
+                                 params={"date": ymd, "type": "ALLBUT0999", "response": "json"},
+                                 headers=headers).json()
+            for tbl in r_idx.get("tables", []):
+                flds = tbl.get("fields", [])
+                if "證券代號" in flds and "收盤價" in flds:
+                    c_i = flds.index("證券代號")
+                    p_i = flds.index("收盤價")
+                    b_i = flds.index("最後揭示買價") if "最後揭示買價" in flds else None
+                    for row in tbl.get("data", []):
+                        code = str(row[c_i]).strip()
+                        pr = _parse_num(row[p_i])
+                        if pr is None and b_i is not None:
+                            pr = _parse_num(row[b_i])
+                        if pr is not None:
+                            price_map[code] = pr
+        except Exception:
+            pass
+
+        if not price_map:
+            r_all = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
+                                 timeout=10, headers=headers).json()
+            for item in r_all:
+                code = str(item.get("Code", "")).strip()
+                pr = _parse_num(item.get("ClosingPrice"))
+                if code and pr is not None:
+                    price_map[code] = pr
+
+        if not price_map:
+            return None
+
+        # 3. 從 tables[1] 加總個股融資市值 (張數 * 收盤價 = 仟元)
+        total_mkt_val_k = 0.0
+        for row in tables[1].get("data", []):
+            code = str(row[0]).strip()
+            lots = _parse_num(row[6])  # 融資今日餘額(張)
+            if lots and lots > 0 and code in price_map:
+                total_mkt_val_k += lots * price_map[code]
+
+        if total_mkt_val_k > 0:
+            return round((total_mkt_val_k / total_loan_k) * 100.0, 2)
+    except Exception:
+        pass
+    return None
+
+@st.cache_data(ttl=900, show_spinner=False)
 def last_15_flows():
     out, d = [], datetime.now(TZ)
     for _ in range(38):
@@ -267,7 +339,26 @@ def last_15_flows():
                 x["dt"] = d.date()
                 out.append(x)
         d = d - pd.Timedelta(days=1)
-    return out[::-1]
+    out = out[::-1]
+
+    # 為近 10 個交易日並行補齊融資融券數據
+    target_days = out[-10:]
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        margin_results = list(ex.map(lambda item: twse_margin_day(item["ymd"]), target_days))
+
+    for item, mg in zip(target_days, margin_results):
+        if mg and mg.get("ok"):
+            item["融資"] = mg["margin_chg_yi"]
+            item["融資餘額"] = mg["margin_yi"]
+            item["融券"] = mg["short_chg_lots"]
+            item["融券餘額"] = mg["short_lots"]
+        else:
+            item["融資"] = 0.0
+            item["融資餘額"] = None
+            item["融券"] = 0
+            item["融券餘額"] = None
+
+    return out
 
 def last_10_flows():
     return last_15_flows()[-10:]
@@ -429,27 +520,45 @@ FL_HEAD = """<!DOCTYPE html><html><head><meta charset="utf-8"><style>
 body{margin:0;background:transparent;color:#e8e6ee;font-family:-apple-system,"Noto Sans TC","Microsoft JhengHei",sans-serif;overflow:hidden}
 .fl-h{color:#fff;font-size:.98rem;font-weight:800;margin-bottom:.3rem}
 .fl-h small{color:#d8d4e8;font-weight:500;margin-left:.5rem}
-.fl{display:grid;grid-template-columns:50px 130px 1fr 240px;gap:20px;align-items:center;padding:6px 0;border-top:1px solid #2a2433}
+.fl{display:grid;grid-template-columns:50px 140px 1fr 250px;gap:18px;align-items:center;padding:6px 0;border-top:1px solid #2a2433}
+.fl.has-bal{padding-top:25px}
 .fl .nm{font-weight:700;color:#fff}
-.fl .lt{font-size:1.15rem;font-weight:800}
-.fl .sm{font-size:1rem;color:#d0cde0}
-.fl .sm .row{display:flex;gap:25px;white-space:nowrap}
-.fl .sm b{font-weight:700;font-size:1.05rem}
+.fl .lt{font-size:1.12rem;font-weight:800}
+.fl .sm{font-size:.98rem;color:#d0cde0}
+.fl .sm .row{display:flex;gap:20px;white-space:nowrap}
+.fl .sm b{font-weight:700;font-size:1.02rem}
 .bars{display:grid;grid-template-columns:repeat(10,1fr);gap:5px;height:42px}
-.bars>div{display:flex;flex-direction:column;cursor:pointer;border-radius:3px}
+.bars>div{position:relative;display:flex;flex-direction:column;cursor:pointer;border-radius:3px}
 .bars>div.hi{background:rgba(255,255,255,.10)}
 .bars .u,.bars .d{flex:1;display:flex}
 .bars .u{align-items:flex-end}.bars .d{align-items:flex-start}
 .bars i{display:block;width:100%;border-radius:2px}
+.bal-tag{
+  position:absolute;
+  bottom:100%;
+  right:0;
+  margin-bottom:4px;
+  white-space:nowrap;
+  background:#261f35;
+  border:1px solid rgba(255,200,61,.65);
+  color:#FFC83D;
+  font-size:.73rem;
+  font-weight:800;
+  padding:1px 8px;
+  border-radius:5px;
+  pointer-events:none;
+  z-index:4;
+  box-shadow:0 2px 6px rgba(0,0,0,.45);
+}
 .dates{display:grid;grid-template-columns:repeat(10,1fr);gap:5px;color:#b8b4c9;font-size:.72rem;text-align:center}
 .dates div{cursor:pointer;border-radius:3px}.dates div.hi{color:#fff;background:rgba(255,255,255,.10)}
 </style></head><body>
-<div class="fl-h">近 10 日三大法人買賣超<small>上市 · 億元 · 紅＝買超 綠＝賣超（游標移到長條或日期上，左側數值會顯示該日資料）</small></div>
+<div class="fl-h">近10日三大法人買賣超及融資融券<small>上市 · 紅＝買超/增加 綠＝賣超/減少（游標移到長條或日期上，左側數值會顯示該日資料）</small></div>
 <div class="fl" style="border:0;padding-bottom:2px">
   <div></div>
-  <div class="lt" id="dlab" style="font-size:.82rem;color:#d0cde0">最新 當日買賣超</div>
+  <div class="lt" id="dlab" style="font-size:.82rem;color:#d0cde0">最新 當日買賣超/增減</div>
   <div></div>
-  <div class="sm"><div class="row" style="font-size:.78rem;color:#d0cde0"><div style="width:95px">近 5 日累積</div><div style="width:95px">近 10 日累積</div></div></div>
+  <div class="sm"><div class="row" style="font-size:.78rem;color:#d0cde0"><div style="width:105px">近 5 日累積</div><div style="width:105px">近 10 日累積</div></div></div>
 </div>
 """
 
@@ -458,11 +567,11 @@ FL_JS = """
 const flowData=__DATA__, lastIdx=flowData.length-1;
 function updateFlow(i,hl){
   const d=flowData[i]; if(!d) return;
-  ['外資','投信','自營'].forEach(k=>{
+  ['外資','投信','自營','融資','融券'].forEach(k=>{
     const e=document.getElementById('val_'+k);
     if(e){e.innerText=d[k];e.style.color=d[k+'c'];}
   });
-  document.getElementById('dlab').innerText=(hl?d.d:'最新 '+d.d)+' 當日買賣超';
+  document.getElementById('dlab').innerText=(hl?d.d:'最新 '+d.d)+' 當日買賣超/增減';
   document.querySelectorAll('[data-i]').forEach(e=>e.classList.toggle('hi',hl&&Number(e.dataset.i)===i));
 }
 function resetFlow(){updateFlow(lastIdx,false);}
@@ -474,26 +583,60 @@ resetFlow();
 </script></body></html>
 """
 
-def flows_html(days):
+def flows_html(days, maint_ratio=None):
     raw = []
     for x in days:
         f, t, z = x["外資"] / 1e8, x["投信"] / 1e8, x["自營"] / 1e8
-        raw.append({"d": x["d"],
-                    "外資": f"{f:+,.1f}億", "外資c": _col(f),
-                    "投信": f"{t:+,.1f}億", "投信c": _col(t),
-                    "自營": f"{z:+,.1f}億", "自營c": _col(z)})
+        m_chg = float(x.get("融資", 0.0) or 0.0)
+        s_chg = int(x.get("融券", 0) or 0)
+        raw.append({
+            "d": x["d"],
+            "外資": f"{f:+,.1f}億", "外資c": _col(f),
+            "投信": f"{t:+,.1f}億", "投信c": _col(t),
+            "自營": f"{z:+,.1f}億", "自營c": _col(z),
+            "融資": f"{m_chg:+,.2f}億", "融資c": _col(m_chg),
+            "融券": f"{s_chg:+,d}張", "融券c": _col(s_chg),
+        })
+
+    last_idx = len(days) - 1
+    last_day = days[-1] if days else {}
+    m_bal = last_day.get("融資餘額")
+    s_bal = last_day.get("融券餘額")
+
+    maint_str = f"{maint_ratio:.1f}%" if maint_ratio is not None else "未取得"
+    m_bal_str = f"餘額 {m_bal:,.1f}億｜大盤融資維持率 {maint_str}" if m_bal is not None else f"餘額 未取得｜大盤融資維持率 {maint_str}"
+    s_bal_str = f"餘額 {s_bal:,d}張" if s_bal is not None else "餘額 未取得"
+
+    row_configs = [
+        ("外資", [x["外資"] / 1e8 for x in days], lambda v: f"{v:+,.1f}億", None),
+        ("投信", [x["投信"] / 1e8 for x in days], lambda v: f"{v:+,.1f}億", None),
+        ("自營", [x["自營"] / 1e8 for x in days], lambda v: f"{v:+,.1f}億", None),
+        ("融資", [float(x.get("融資", 0.0) or 0.0) for x in days], lambda v: f"{v:+,.2f}億", m_bal_str),
+        ("融券", [int(x.get("融券", 0) or 0) for x in days], lambda v: f"{int(round(v)):+,d}張", s_bal_str),
+    ]
+
     rows = ""
-    for k in ("外資", "投信", "自營"):
-        v = [x[k] / 1e8 for x in days]
+    for k, v, fmt_fn, bal_badge in row_configs:
         mx = max(abs(a) for a in v) or 1
-        bars = "".join(f"<div data-i='{i}'><div class='u'>{_bar(a, mx, True)}</div><div class='d'>{_bar(a, mx, False)}</div></div>"
-                       for i, a in enumerate(v))
+        bar_cells = []
+        for i, a in enumerate(v):
+            tag_html = f"<span class='bal-tag'>{bal_badge}</span>" if (bal_badge and i == last_idx) else ""
+            bar_cells.append(
+                f"<div data-i='{i}'>{tag_html}<div class='u'>{_bar(a, mx, True)}</div><div class='d'>{_bar(a, mx, False)}</div></div>"
+            )
+        bars = "".join(bar_cells)
         s5, s10 = sum(v[-5:]), sum(v)
-        rows += (f"<div class='fl'><div class='nm'>{k}</div>"
-                 f"<div class='lt' id='val_{k}' style='color:{_col(v[-1])}'>{v[-1]:+,.1f}億</div>"
-                 f"<div class='bars'>{bars}</div>"
-                 f"<div class='sm'><div class='row'><div style='width:95px'><b style='color:{_col(s5)}'>{s5:+,.1f}億</b></div>"
-                 f"<div style='width:95px'><b style='color:{_col(s10)}'>{s10:+,.1f}億</b></div></div></div></div>")
+        row_cls = "fl has-bal" if bal_badge else "fl"
+        rows += (
+            f"<div class='{row_cls}'><div class='nm'>{k}</div>"
+            f"<div class='lt' id='val_{k}' style='color:{_col(v[-1])}'>{fmt_fn(v[-1])}</div>"
+            f"<div class='bars'>{bars}</div>"
+            f"<div class='sm'><div class='row'>"
+            f"<div style='width:105px'><b style='color:{_col(s5)}'>{fmt_fn(s5)}</b></div>"
+            f"<div style='width:105px'><b style='color:{_col(s10)}'>{fmt_fn(s10)}</b></div>"
+            f"</div></div></div>"
+        )
+
     dates = "".join(f"<div data-i='{i}'>{x['d']}</div>" for i, x in enumerate(days))
     rows += f"<div class='fl' style='border:0;padding-top:0'><div></div><div></div><div class='dates'>{dates}</div><div></div></div>"
     return FL_HEAD + rows + FL_JS.replace("__DATA__", json.dumps(raw))
@@ -518,12 +661,13 @@ def market_page():
 
     st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
     with st.container(key="flow_card"):
-        with st.spinner("讀取證交所三大法人…"):
+        with st.spinner("讀取證交所三大法人、融資融券與大盤維持率…"):
             days = last_10_flows()
+            maint_ratio = twse_market_maintenance_ratio(days[-1]["ymd"]) if days else None
         if days:
-            components.html(flows_html(days), height=215, scrolling=False)
+            components.html(flows_html(days, maint_ratio=maint_ratio), height=395, scrolling=False)
         else:
-            st.warning("目前無法取得證交所三大法人資料。")
+            st.warning("目前無法取得證交所三大法人與融資融券資料。")
 
 # ───────────────────────── 頁面二：策略 (00631L.TW) ─────────────────────────
 @st.cache_data(ttl=300, show_spinner=False)
@@ -694,10 +838,6 @@ def strategy_page():
 def fetch_taifex_oi_and_pcr_for_date(ymd):
     return {"fx_oi_ok": False, "fx_label": "未取得", "pcr_ok": False, "pcr_label": "未取得"}
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_00631l_nav_info():
-    return {"ok": False, "label": "未取得"}
-
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_overnight_us_market(upto_date):
     tickers = {
@@ -711,7 +851,7 @@ def fetch_overnight_us_market(upto_date):
     }
     res = {
         "sox_pct": 0.0, "tsm_pct": 0.0, "nvda_pct": 0.0, "sp_pct": 0.0,
-        "vix_close": 0.0, "vix_pct": 0.0, "tnx_close": 0.0,
+        "vix_close": 0.0, "vix_pct": 0.0, "tnx_close": 0.0, "tnx_pct": 0.0,
         "fx_close": 32.0, "fx_pct": 0.0,
     }
     for k, sym in tickers.items():
@@ -733,6 +873,7 @@ def fetch_overnight_us_market(upto_date):
                 res["vix_pct"] = round(pct, 2)
             elif k == "tnx":
                 res["tnx_close"] = round(c, 2)
+                res["tnx_pct"] = round(pct, 2)
             elif k == "fx":
                 res["fx_close"] = round(c, 2)
                 res["fx_pct"] = round(pct, 2)
@@ -773,7 +914,7 @@ def get_schedule_state(tw_df):
         "banner_msg": banner_msg,
     }
 
-def compute_tech_fact_card(df_full, upto_date, label_name, is_etf=False):
+def compute_tech_fact_card(df_full, upto_date, label_name):
     dts = pd.DatetimeIndex(df_full.index).tz_localize(None).date
     d = df_full[dts <= upto_date].copy()
     if len(d) < 30:
@@ -853,7 +994,7 @@ def compute_tech_fact_card(df_full, upto_date, label_name, is_etf=False):
                 unfilled_dn_gaps.append(f"{dates_60[i]} 下跳缺口 [{subsequent_max_high:,.1f} ~ {lows_60[i-1]:,.1f}]")
 
     gap_str = "、".join((unfilled_up_gaps[-1:] + unfilled_dn_gaps[-1:])) or "近60日無明顯未回補日K缺口"
-    step_round = 10.0 if is_etf else 500.0
+    step_round = 500.0
     upper_round = math.ceil(c / step_round) * step_round
     lower_round = math.floor(c / step_round) * step_round
     if upper_round == c:
@@ -879,28 +1020,17 @@ def compute_tech_fact_card(df_full, upto_date, label_name, is_etf=False):
         f"若開盤落於 {pivot_dn:,.2f}（前日低點/5MA 下沿）以下，下方第一支撐位在 {sup_1:,.2f}，次一支撐位在 {sup_2:,.2f}。"
     )
 
-    rets_5 = d["Ret"].tail(5).dropna().values
-    std_5d = float(np.std(rets_5, ddof=1)) if len(rets_5) >= 2 else 0.0
-    abs_mean_5d = float(np.mean(np.abs(rets_5))) if len(rets_5) >= 1 else 0.0
-
-    etf_extra = ""
-    if is_etf:
-        etf_extra = (
-            f"近 5 日單日報酬標準差為 {std_5d:.2f}%（平均單日絕對波動 {abs_mean_5d:.2f}%），"
-            f"2 倍槓桿每日再平衡於雙向震盪盤會產生波動率累積耗損。"
-        )
-
     return {
         "name": label_name, "date_str": r_last.name.strftime("%Y/%m/%d"),
         "close": c, "open": o, "high": h, "low": l, "prev_close": prev_c,
         "chg": chg, "pct": pct, "ma5": ma5, "ma20": ma20, "ma60": ma60, "ma240": ma240,
         "vol_cur": vol_cur, "vol_ma5": vol_ma5, "vol_ratio": round(vol_ratio, 2),
-        "h20": h20, "l20": l20, "gap_str": gap_str, "std_5d": round(std_5d, 2),
+        "h20": h20, "l20": l20, "gap_str": gap_str,
         "upper_round": upper_round, "lower_round": lower_round,
         "pivot_up": round(pivot_up, 2), "res_1": round(res_1, 2), "res_2": round(res_2, 2),
         "pivot_dn": round(pivot_dn, 2), "sup_1": round(sup_1, 2), "sup_2": round(sup_2, 2),
         "trend_fact": trend_fact, "vol_fact": vol_fact, "kbar_fact": kbar_fact,
-        "levels_fact": levels_fact, "cond_fact": cond_fact, "etf_extra": etf_extra,
+        "levels_fact": levels_fact, "cond_fact": cond_fact,
     }
 
 TOPIC_CLUSTERS = [
@@ -908,7 +1038,7 @@ TOPIC_CLUSTERS = [
     {"id": "nvda_ai",   "name": "輝達 NVIDIA / AI 伺服器供應鏈", "kw": ["輝達", "NVIDIA", "NVDA", "Blackwell", "GB200", "GB300", "AI伺服器", "鴻海", "廣達", "緯穎", "CSP"]},
     {"id": "fed_macro", "name": "聯準會利率 / 通膨數據 / 美債匯率", "kw": ["聯準會", "Fed", "降息", "利率", "CPI", "PPI", "非農", "鮑爾", "Powell", "美債", "殖利率", "通膨", "inflation", "匯率", "台幣"]},
     {"id": "tariff_geo","name": "關稅貿易政策 / 出口管制 / 地緣", "kw": ["關稅", "川普", "Trump", "tariff", "出口管制", "禁令", "晶片法", "制裁", "貿易"]},
-    {"id": "tw_flow",   "name": "台股外資期現貨 / 投信 ETF 籌碼", "kw": ["外資", "投信", "三大法人", "台指期", "融資", "ETF", "0050", "00631L", "權值股", "加權指數"]},
+    {"id": "tw_flow",   "name": "台股外資期現貨 / 投信 ETF 籌碼", "kw": ["外資", "投信", "三大法人", "台指期", "融資", "ETF", "0050", "權值股", "加權指數"]},
 ]
 
 def _assign_topic_cluster(title_txt):
@@ -1018,15 +1148,13 @@ def fetch_and_select_top10_news(window_hours, max_count=MAX_NEWS_COUNT):
 
     return selected[:max_count]
 
-# ───────────────────────── 動態生成使用者指定之 AI 提示詞 ─────────────────────────
-def build_external_ai_prompt(briefing, user_position_str="空手"):
+# ───────────────────────── 動態生成 AI 提示詞（不含 00631L） ─────────────────────────
+def build_external_ai_prompt(briefing):
     target_d = briefing["target_d"]
     tw_c = briefing["tw_card"]
-    etf_c = briefing["etf_card"]
     fl = briefing["flow"]
     mg = briefing["margin"]
     op = briefing["oi_pcr"]
-    nv = briefing["nav"]
     us = briefing["us"]
     news_list = briefing["news_list"]
 
@@ -1050,11 +1178,9 @@ def build_external_ai_prompt(briefing, user_position_str="空手"):
 
     fx_oi_str = op.get("fx_label", "未取得")
     pcr_str = op.get("pcr_label", "未取得")
-    nav_str = nv.get("label", "未取得")
 
     prompt_text = f"""# 角色
 你是台股短線研究員，專長是把「新聞事件、籌碼面、技術面」整合成條件式的交易判斷。
-最終操作標的是 00631L（元大台灣50正2，追蹤臺灣50指數單日正向 2 倍報酬，每日再平衡）。
 
 # 硬性規則
 1. 新聞：請直接讀取下方網址內文；讀不到的網址請用「標題＋媒體名稱」搜尋同一則報導，並從中挑出你覺得對於台股市場最有影響力的8篇去分析。
@@ -1062,7 +1188,7 @@ def build_external_ai_prompt(briefing, user_position_str="空手"):
 2. 所有論點必須引用下方提供的具體數字（例如「外資 -35.4 億」「收盤低於 5MA 1.2%」），禁止空泛形容，若提供資料過少，不足於提供分析使用，可自行上網搜尋，但需標示哪些是你去另外找的。
 3. 區分「事實」與「推論」。
 4. 判斷新聞是否「已被市場反映」：對照隔夜美股與當日實際漲跌，若價格已先行大幅波動，視為已反映，不宜追價。
-5. 不給單一「買／不買」標籤，要給「條件式」結論：在什麼價位或條件下可以買、什麼條件下不要買、何處停損。
+5. 不給單一「買／不買」標籤，要給「條件式」結論：在什麼點位或條件下偏多操作、什麼條件下觀望或避開、何處停損。
 
 # 輸入資料
 
@@ -1078,7 +1204,6 @@ def build_external_ai_prompt(briefing, user_position_str="空手"):
 {margin_line}
 - 外資台指期淨未平倉：{fx_oi_str}
 - 選擇權 Put/Call 比：{pcr_str}
-- 00631L 折溢價：{nav_str}，成交量：{etf_c['vol_cur']:,.0f} 股（為 5 日均量的 {etf_c['vol_ratio']:.2f} 倍）
 
 ## D. 技術面
 加權指數（^TWII）：
@@ -1086,22 +1211,17 @@ def build_external_ai_prompt(briefing, user_position_str="空手"):
 - 5MA {tw_c['ma5']:,.2f}｜20MA {tw_c['ma20']:,.2f}｜60MA {tw_c['ma60']:,.2f}｜240MA {tw_c['ma240']:,.2f}
 - 成交量為 5 日均量的 {tw_c['vol_ratio']:.2f} 倍
 - 近 20 日高 {tw_c['h20']:,.2f}、低 {tw_c['l20']:,.2f}；未回補缺口：{tw_c['gap_str']}
-00631L：
-- 開 {etf_c['open']:,.2f} 高 {etf_c['high']:,.2f} 低 {etf_c['low']:,.2f} 收 {etf_c['close']:,.2f}（漲跌 {etf_c['pct']:+.2f}%）
-- 5MA {etf_c['ma5']:,.2f}｜20MA {etf_c['ma20']:,.2f}｜240MA {etf_c['ma240']:,.2f}
-- 近 5 日單日報酬標準差：{etf_c['std_5d']:.2f}%
-- 我目前的狀態：{user_position_str}
 
 ## E. 隔夜國際市場
 費半 {us['sox_pct']:+.2f}%｜台積電 ADR {us['tsm_pct']:+.2f}%｜NVDA {us['nvda_pct']:+.2f}%｜S&P 500 {us['sp_pct']:+.2f}%｜VIX {us['vix_close']:.2f}（{us['vix_pct']:+.2f}%）｜美債 10Y {us['tnx_close']:.2f}%｜美元兌台幣 {us['fx_close']:.2f}（{us['fx_pct']:+.2f}%）
 
 # 分析流程（請依序完成）
 步驟 1：逐則整理新聞，輸出「事情發展」（發生什麼、關鍵數字、時間點）。
-步驟 2：逐則分析「對台股大盤與臺灣50權值股的影響」，標註利多／利空／中性、影響產業或個股、是否已反映。
+步驟 2：逐則分析「對台股大盤與權值股的影響」，標註利多／利空／中性、影響產業或個股、是否已反映。
 步驟 3：解讀籌碼面，指出哪些指標與新聞方向一致、哪些互相矛盾。
 步驟 4：解讀技術面，指出趨勢位階、量價、關鍵支撐與壓力。
 步驟 5：整合三者，找出「最可能的短線情境」與「最大的反向風險」。
-步驟 6：針對 00631L 給出條件式操作建議。
+步驟 6：針對台股大盤給出條件式操作建議。
 
 # 輸出格式（嚴格依此）
 ## 一、新聞重點
@@ -1119,13 +1239,13 @@ def build_external_ai_prompt(briefing, user_position_str="空手"):
 - 偏空情境（機率估計）：…
 - 三者最關鍵的分歧訊號：…
 
-## 五、00631L 操作建議
+## 五、台股操作建議
 - 整體傾向：偏多／中性／偏空（說明理由）
-- 若我空手：
-  - 可考慮買進的條件：（價位＋觸發條件，如「開盤站穩 X 元 15 分鐘」）
-  - 不應買進的條件：…
-  - 建議部位上限與停損價：…
-- 若我已持有：續抱／減碼／停損的條件與價位
+- 若空手：
+  - 可考慮進場的條件：（點位＋觸發條件，如「大盤開盤站穩 X 點 15 分鐘」）
+  - 不應進場的條件：…
+  - 建議部位上限與停損點位：…
+- 若已持有部位：續抱／減碼／停損的條件與點位
 - 近 2 日最需盯的 3 個觀察點
 
 ## 六、風險與資料限制
@@ -1231,7 +1351,6 @@ def _render_tech_card_box(title_label, card):
       <div><b>• K 棒結構：</b>{card['kbar_fact']}</div>
       <div><b>• 關鍵價位與缺口：</b>{card['levels_fact']}</div>
       <div><b>• 條件式支撐壓力：</b>{card['cond_fact']}</div>
-      {f"<div><b>• 波動與槓桿特性：</b>{card['etf_extra']}</div>" if card.get('etf_extra') else ""}
     </div>
     """
     st.markdown(html, unsafe_allow_html=True)
@@ -1240,16 +1359,15 @@ def briefing_page():
     with st.container(key="vote_card"):
         st.markdown(
             "<div class='fl-h'>晨會"
-            "<small>08:30 盤前簡報 & 一鍵問問 AI（自動彙整 10 則白名單新聞網址、上市籌碼、隔夜美股與技術面數據）</small></div>",
+            "<small>08:30 盤前簡報 & 一鍵問問 AI（自動彙整 10 則白名單新聞網址、上市籌碼、隔夜美股與大盤技術面數據）</small></div>",
             unsafe_allow_html=True,
         )
         with st.spinner("正在載入晨會簡報、籌碼與最新新聞…"):
             tw_df = load_daily(INDEX_TICKER)
-            etf_df = load_daily(ETF_TICKER)
             flows_all = last_15_flows()
 
-        if tw_df.empty or etf_df.empty:
-            st.error("無法取得台股或 00631L 歷史日線資料，請稍後再試。")
+        if tw_df.empty:
+            st.error("無法取得台股歷史日線資料，請稍後再試。")
             return
 
         sched = get_schedule_state(tw_df)
@@ -1260,7 +1378,7 @@ def briefing_page():
         else:
             st.warning(sched["banner_msg"])
 
-        c1, c2, c3 = st.columns([2, 2, 3])
+        c1, c2 = st.columns(2)
         archive_dates = sched["archive_dates"]
         sel_d = c1.selectbox(
             "📅 選擇晨會交易日",
@@ -1268,11 +1386,9 @@ def briefing_page():
             format_func=lambda d: f"{d:%Y/%m/%d}（週{WD[d.weekday()]}）",
         )
         win_hr = c2.selectbox("📰 新聞擷取時間窗（小時）", [24, 36, 48, 72], index=1)
-        user_pos = c3.text_input("💼 我目前的 00631L 部位狀態（會自動帶入提示詞）", value="空手")
 
-        tw_card = compute_tech_fact_card(tw_df, sel_d, "加權指數 (^TWII)", is_etf=False)
-        etf_card = compute_tech_fact_card(etf_df, sel_d, "00631L (元大台灣50正2)", is_etf=True)
-        if not tw_card or not etf_card:
+        tw_card = compute_tech_fact_card(tw_df, sel_d, "加權指數 (^TWII)")
+        if not tw_card:
             st.warning("所選日期的歷史資料不足以計算技術指標。")
             return
 
@@ -1297,23 +1413,20 @@ def briefing_page():
         }
         margin_info = twse_margin_day(ref_ymd)
         oi_pcr_info = fetch_taifex_oi_and_pcr_for_date(ref_ymd)
-        nav_info = fetch_00631l_nav_info()
         us_info = fetch_overnight_us_market(sel_d)
         news_list = fetch_and_select_top10_news(win_hr, max_count=MAX_NEWS_COUNT)
 
         briefing = {
             "target_d": sel_d,
             "tw_card": tw_card,
-            "etf_card": etf_card,
             "flow": flow_dict,
             "margin": margin_info,
             "oi_pcr": oi_pcr_info,
-            "nav": nav_info,
             "us": us_info,
             "news_list": news_list,
         }
 
-        prompt_text = build_external_ai_prompt(briefing, user_position_str=user_pos.strip() or "空手")
+        prompt_text = build_external_ai_prompt(briefing)
         components.html(render_ask_ai_buttons_html(prompt_text), height=120, scrolling=False)
 
         with st.expander("📋 檢視／手動複製完整 AI 提示詞內容"):
@@ -1322,22 +1435,21 @@ def briefing_page():
         st.markdown("<div style='height:0.4rem'></div>", unsafe_allow_html=True)
         st.markdown("<div class='fl-h'>一、隔夜國際市場與台股籌碼快照</div>", unsafe_allow_html=True)
         m = st.columns(5)
-        m[0].metric("費城半導體 (SOX)", f"{us_info['sox_pct']:+.2f}%")
-        m[1].metric("台積電 ADR (TSM)", f"{us_info['tsm_pct']:+.2f}%")
-        m[2].metric("輝達 (NVDA)", f"{us_info['nvda_pct']:+.2f}%")
-        m[3].metric("VIX 恐慌指數", f"{us_info['vix_close']:.2f}", f"{us_info['vix_pct']:+.2f}%", delta_color="inverse")
-        m[4].metric("外資現貨 (當日/5日)", f"{flow_dict['f1']:+.1f} 億", f"近5日 {flow_dict['f5']:+.1f} 億")
+        m[0].metric("費半", f"{us_info['sox_pct']:+.2f}%")
+        m[1].metric("台積電 ADR", f"{us_info['tsm_pct']:+.2f}%")
+        m[2].metric("VIX", f"{us_info['vix_close']:.2f}", f"{us_info['vix_pct']:+.2f}%", delta_color="inverse")
+        m[3].metric("美債 10Y 殖利率", f"{us_info['tnx_close']:.2f}%", f"{us_info['tnx_pct']:+.2f}%", delta_color="inverse")
+        m[4].metric("台美匯率", f"{us_info['fx_close']:.2f}", f"{us_info['fx_pct']:+.2f}%", delta_color="inverse")
 
         st.caption(
-            f"📌 籌碼補充：投信當日 {flow_dict['t1']:+.2f} 億（近5日 {flow_dict['t5']:+.2f} 億）｜"
-            f"自營商當日 {flow_dict['z1']:+.2f} 億｜{margin_info.get('label', '融資融券：未取得')}｜"
-            f"美債10Y {us_info['tnx_close']:.2f}%｜USD/TWD {us_info['fx_close']:.2f}（{us_info['fx_pct']:+.2f}%）"
+            f"📌 籌碼補充：外資當日 {flow_dict['f1']:+.2f} 億（近5日 {flow_dict['f5']:+.2f} 億）｜"
+            f"投信當日 {flow_dict['t1']:+.2f} 億（近5日 {flow_dict['t5']:+.2f} 億）｜"
+            f"自營商當日 {flow_dict['z1']:+.2f} 億｜{margin_info.get('label', '融資融券：未取得')}"
         )
 
         st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
         st.markdown("<div class='fl-h'>二、技術面數據摘要</div>", unsafe_allow_html=True)
         _render_tech_card_box("加權指數 (^TWII)", tw_card)
-        _render_tech_card_box("00631L (元大台灣50正2)", etf_card)
 
         st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
         st.markdown(f"<div class='fl-h'>三、最新精選白名單財經新聞（共 {len(news_list)} 則）</div>", unsafe_allow_html=True)
