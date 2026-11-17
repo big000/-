@@ -1157,3 +1157,38 @@ function openAI(mode) {{
     t.style.display = 'block';
     return;
   }}
+function openAI(mode) {{
+  syncCopyText(PROMPT_TEXT);
+
+  const t = document.getElementById('toast');
+  if (mode === 'copy') {{
+    t.innerText = '✅ 已成功複製最新提示詞到剪貼簿！';
+    t.style.display = 'block';
+    return;
+  }}
+  if (mode === 'gemini') {{
+    t.innerText = '✅ 已自動複製提示詞！正在開啟 Gemini，進入後請直接按 Ctrl+V 貼上送出。';
+  }} else {{
+    t.innerText = '✅ 已同步複製提示詞並正在開啟對話視窗（若網址過長被截斷，直接按 Ctrl+V 貼上即可）！';
+  }}
+  t.style.display = 'block';
+  window.open(URL_MAP[mode], '_blank', 'noopener,noreferrer');
+}}
+</script></body></html>"""function openAI(mode) {{
+  syncCopyText(PROMPT_TEXT);
+
+  const t = document.getElementById('toast');
+  if (mode === 'copy') {{
+    t.innerText = '✅ 已成功複製最新提示詞到剪貼簿！';
+    t.style.display = 'block';
+    return;
+  }}
+  if (mode === 'gemini') {{
+    t.innerText = '✅ 已自動複製提示詞！正在開啟 Gemini，進入後請直接按 Ctrl+V 貼上送出。';
+  }} else {{
+    t.innerText = '✅ 已同步複製提示詞並正在開啟對話視窗（若網址過長被截斷，直接按 Ctrl+V 貼上即可）！';
+  }}
+  t.style.display = 'block';
+  window.open(URL_MAP[mode], '_blank', 'noopener,noreferrer');
+}}
+</script></body></html>"""
