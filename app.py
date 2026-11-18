@@ -1093,57 +1093,135 @@ def strategy_data():
                 df.loc[last_idx, "Volume"] = max(df.loc[last_idx, "Volume"], g["Volume"].sum())
     return df, intra
 
-def simulate(df, intra, em=1.04, xm=0.98, sl=0.03, tp1=0.20, sl1=0.03, cool=5):
+def simulate(df, intra, em=1.04, xm=0.98, sl=0.08, tp1=0.20, sl1=0.03, cool=5):
+    """
+    完全對齊 XQ 新版邏輯：
+    - 模式 1 (弱勢區間 entry_regime = 1)：前日 5MA < 240MA 且 5MA 金叉 10MA 進場；+20% 弱勢觸價停利 / -3% 弱勢觸價停損。
+    - 模式 2 (強勢區間 entry_regime = 2)：前日 5MA >= 240MA 且 盤中價 >= 前日5MA * em 進場；
+      出場依成本價 (ep) 分流：
+        條件 A (Close < ep 且 Close <= ep*(1-sl)) -> 強勢觸價停損
+        條件 B (Close > ep 且 Close <= 前日5MA*xm) -> 強勢均線停利
+    """
     d = df.copy()
     for p in (5, 10, 240):
         d[f"m{p}"] = d.Close.rolling(p).mean()
     O, Hh, L, C = d["Open"].values, d["High"].values, d["Low"].values, d["Close"].values
     M5, M10, M240 = d["m5"].values, d["m10"].values, d["m240"].values
     dates = [x.date() for x in d.index]
-    pos, ep, reg, ei, last, tr = 0, 0., 0, 0, -9999, []
-
-    def lines(ep, reg, m5):
-        return (ep * (1 - sl1), ep * (1 + tp1)) if reg == 1 else (max(ep * (1 - sl), m5 * xm), None)
+    pos, ep, reg, ei, last, tr = 0, 0.0, 0, 0, -9999, []
+    ent_label = ""
 
     def close(i, xp, why):
-        nonlocal pos, last
-        tr.append(dict(進場日=d.index[ei].date(), 進場價=round(ep, 2), 出場日=d.index[i].date(), 出場價=round(xp, 2),
-                       報酬率=f"{(xp / ep - 1) * 100 - 0.4:+.2f}%", 原因=why, K棒="5分K" if dates[i] in intra else "日K"))
-        pos, last = 0, i
+        nonlocal pos, reg, last
+        tr.append(dict(
+            進場日=d.index[ei].date(),
+            進場標籤=ent_label,
+            進場價=round(ep, 2),
+            出場日=d.index[i].date(),
+            出場價=round(xp, 2),
+            報酬率=f"{(xp / ep - 1) * 100 - 0.4:+.2f}%",
+            原因=why,
+            K棒="5分K" if dates[i] in intra else "日K",
+        ))
+        pos, reg, last = 0, 0, i
 
     for i in range(241, len(d)):
-        m5, m10, m240 = M5[i-1], M10[i-1], M240[i-1]
-        m5b, m10b = M5[i-2], M10[i-2]
+        m5, m10, m240 = M5[i - 1], M10[i - 1], M240[i - 1]  # m5 即 XQ 中的 ma_prev (前日 5MA)
+        m5b, m10b = M5[i - 2], M10[i - 2]
         bars = intra.get(dates[i]) or [(O[i], Hh[i], L[i], C[i])]
+
         for j, (bo, bh, bl, bc) in enumerate(bars):
-            if pos:
-                ln, tp = lines(ep, reg, m5)
-                if bo <= ln or (tp and bo >= tp):
-                    close(i, bo, "跳空出場")
-                elif bl <= ln:
-                    close(i, ln, "弱勢停損" if reg == 1 else "停損" if ep * (1 - sl) >= m5 * xm else "跌破均線")
-                elif tp and bh >= tp:
-                    close(i, tp, "弱勢停利")
-            elif i - last > cool:
-                ent, r = None, 0
+            # 3. 出場邏輯 (盤中實時監控報價)
+            if pos > 0:
+                # 模式 1：弱勢區間出場
+                if reg == 1:
+                    tp_p = ep * (1.0 + tp1)
+                    sl_p = ep * (1.0 - sl1)
+                    if bo >= tp_p:
+                        close(i, bo, "弱勢觸價停利")
+                    elif bo <= sl_p:
+                        close(i, bo, "弱勢觸價停損")
+                    elif bl <= sl_p:
+                        close(i, sl_p, "弱勢觸價停損")
+                    elif bh >= tp_p:
+                        close(i, tp_p, "弱勢觸價停利")
+
+                # 模式 2：強勢區間出場（依成本價 ep 分流停損與均線停利）
+                elif reg == 2:
+                    sl_p = ep * (1.0 - sl)
+                    exit_ma = m5 * xm
+
+                    # 先檢查該根 K 棒開盤價 bo 是否直接觸發條件 A 或條件 B
+                    if bo < ep and bo <= sl_p:
+                        close(i, bo, "強勢觸價停損")
+                    elif bo > ep and bo <= exit_ma:
+                        close(i, bo, "強勢均線停利")
+                    else:
+                        # 再檢查該根 K 棒盤中高低點觸價
+                        if exit_ma > ep:
+                            if bo > exit_ma and bl <= exit_ma:
+                                # 從 exit_ma 上方回落觸及 exit_ma（此時價格 > ep 且 <= exit_ma，觸發條件 B）
+                                close(i, exit_ma, "強勢均線停利")
+                            elif bo <= ep:
+                                # 開盤在成本價以下但尚未跌破停損 (sl_p < bo <= ep)
+                                if bl <= sl_p:
+                                    close(i, sl_p, "強勢觸價停損")
+                                elif bh > ep:
+                                    close(i, min(bh, exit_ma), "強勢均線停利")
+                        else:
+                            # 當 exit_ma <= ep 時，條件 B (Close > ep and Close <= exit_ma) 不可能成立，只看條件 A 停損
+                            if bl <= sl_p:
+                                close(i, sl_p, "強勢觸價停損")
+
+            # 4. 進場邏輯 (無部位且超過冷卻期)
+            elif (i - last) > cool:
+                ent, r, lbl = None, 0, ""
+                # 模式 1：弱勢區間進場 (昨日 5MA < 240MA 且昨日 5MA 金叉 10MA)
                 if m5 < m240:
                     if j == 0 and m5 > m10 and m5b <= m10b:
-                        ent, r = bo, 1
+                        ent, r, lbl = bo, 1, "弱勢進場"
+                # 模式 2：強勢區間進場 (昨日 5MA >= 240MA 且盤中價 >= 前日5MA * Entry_Mult)
                 else:
                     lv = m5 * em
                     if bo >= lv:
-                        ent, r = bo, 2
+                        ent, r, lbl = bo, 2, "強勢觸價進場"
                     elif bh >= lv:
-                        ent, r = lv, 2
-                if ent:
-                    pos, ep, reg, ei = 1, ent, r, i
-                    ln, tp = lines(ep, reg, m5)
-                    if (bl <= ln) if ent == bo else (bc <= ln):
-                        close(i, ln, "當日停損")
+                        ent, r, lbl = lv, 2, "強勢觸價進場"
+
+                if ent is not None:
+                    pos, ep, reg, ei, ent_label = 1, ent, r, i, lbl
+                    # 檢查進場當根 K 棒進場後是否立即觸發停損或停利
+                    if r == 1:
+                        tp_p = ep * (1.0 + tp1)
+                        sl_p = ep * (1.0 - sl1)
+                        if bl <= sl_p:
+                            close(i, sl_p, "弱勢觸價停損")
+                        elif bh >= tp_p:
+                            close(i, tp_p, "弱勢觸價停利")
+                    elif r == 2:
+                        sl_p = ep * (1.0 - sl)
+                        exit_ma = m5 * xm
+                        chk_low = bl if ent == bo else bc
+                        if chk_low < ep and chk_low <= sl_p:
+                            close(i, sl_p, "強勢觸價停損")
+                        elif exit_ma > ep and chk_low > ep and chk_low <= exit_ma:
+                            close(i, min(chk_low, exit_ma), "強勢均線停利")
+
     N = len(d)
-    return dict(pos=pos, ep=ep, reg=reg, since=d.index[ei].date() if pos else None,
-                cd=max(0, cool + 1 - (N - last)) if last > 0 else 0,
-                m5=M5[-1], m10=M10[-1], m240=M240[-1], m5b=M5[-2], m10b=M10[-2], trades=tr)
+    return dict(
+        pos=pos,
+        ep=ep,
+        reg=reg,
+        ent_label=ent_label if pos else "",
+        since=d.index[ei].date() if pos else None,
+        cd=max(0, cool + 1 - (N - last)) if last > 0 else 0,
+        m5=M5[-1],
+        m10=M10[-1],
+        m240=M240[-1],
+        m5b=M5[-2],
+        m10b=M10[-2],
+        trades=tr,
+    )
 
 def entry_plan(df, s, em, xm, sl, tp1, sl1):
     c = df.Close.values
@@ -1151,20 +1229,26 @@ def entry_plan(df, s, em, xm, sl, tp1, sl1):
     if s["m5"] < s["m240"]:
         hit = s["m5"] > s["m10"] and s["m5b"] <= s["m10b"]
         if hit:
-            ent, how = last, f"5MA 已上穿 10MA，明日開盤進場（以最新價 {last:,.2f} 估算）"
+            ent, how = last, f"【弱勢進場】5MA 已上穿 10MA，明日開盤進場（以最新價 {last:,.2f} 估算）"
         elif s["m5b"] > s["m10b"]:
-            return None, None, None, "5MA 已在 10MA 之上，需先回落到 10MA 下方、再重新上穿才會有進場訊號"
+            return None, None, None, "【弱勢區間】5MA 已在 10MA 之上，需先回落到 10MA 下方、再重新上穿才會有弱勢進場訊號"
         else:
             trig = float(c[-10:-1].sum() - 2 * c[-5:-1].sum())
-            ent, how = trig, f"收盤價需站上 {trig:,.2f}，5MA 才會上穿 10MA，隔日開盤進場（此價為估算進場價）"
-        return ent, ent * (1 - sl1), ent * (1 + tp1), how
+            ent, how = trig, f"【弱勢區間】收盤價需站上 {trig:,.2f}，5MA 才會上穿 10MA，隔日開盤進場（此價為估算進場價）"
+        return ent, ent * (1.0 - sl1), ent * (1.0 + tp1), how
+
+    # 強勢區間：進場價為 5MA * em，初始停損固定為進場價 * (1 - sl)，均線停利需待 5MA * xm > 成本後才啟動
     ent = s["m5"] * em
-    return ent, max(ent * (1 - sl), s["m5"] * xm), None, f"盤中價 ≥ {ent:,.2f}（5MA {s['m5']:,.2f} × {em}）即進場"
+    stop_loss_only = ent * (1.0 - sl)
+    return ent, stop_loss_only, None, f"【強勢觸價進場】盤中價 ≥ {ent:,.2f}（前日 5MA {s['m5']:,.2f} × {em}）即觸價買進"
 
 def strategy_page():
     with st.container(key="strat_card"):
-        st.markdown("<div class='fl-h'>策略：狀態與訊號<small>00631L · 進出場以 5 分 K 時序精準判定（避免開高走低／開低走高的假訊號）</small></div>",
-                    unsafe_allow_html=True)
+        st.markdown(
+            "<div class='fl-h'>策略：狀態與訊號"
+            "<small>00631L · 已同步 XQ 新版「強勢區間成本分流出場 + Label 標記版」邏輯（以 5 分 K 時序精準判定）</small></div>",
+            unsafe_allow_html=True,
+        )
         with st.spinner("同步歷史資料…"):
             df, intra = strategy_data()
         if len(df) < 245:
@@ -1176,32 +1260,55 @@ def strategy_page():
             c = st.columns(6)
             em = c[0].number_input("強勢進場乘數", value=1.04, step=0.01)
             xm = c[1].number_input("強勢出場乘數", value=0.98, step=0.01)
-            sl = c[2].number_input("強勢停損 %", value=3.0, step=0.5) / 100
-            tp1 = c[3].number_input("弱勢停利 %", value=20.0, step=1.0) / 100
-            sl1 = c[4].number_input("弱勢停損 %", value=3.0, step=0.5) / 100
+            sl = c[2].number_input("強勢停損 %", value=8.0, step=0.5) / 100.0
+            tp1 = c[3].number_input("弱勢停利 %", value=20.0, step=1.0) / 100.0
+            sl1 = c[4].number_input("弱勢停損 %", value=3.0, step=0.5) / 100.0
             cool = int(c[5].number_input("冷卻交易日", value=5, step=1))
+
         s = simulate(df, intra, em, xm, sl, tp1, sl1, cool)
         weak = s["m5"] < s["m240"]
         last = float(df.Close.iloc[-1])
         m = st.columns(4)
         m[0].metric("最新價", f"{last:,.2f}", f"{(last / df.Close.iloc[-2] - 1) * 100:+.2f}%")
         m[1].metric("區間", "弱勢 (5MA<240MA)" if weak else "強勢 (5MA≥240MA)")
-        m[2].metric("5MA / 10MA", f"{s['m5']:,.1f} / {s['m10']:,.1f}")
-        m[3].metric("240MA", f"{s['m240']:,.1f}")
+        m[2].metric("5MA / 10MA", f"{s['m5']:,.2f} / {s['m10']:,.2f}")
+        m[3].metric("240MA", f"{s['m240']:,.2f}")
 
         if s["pos"]:
-            ln, tp = (s["ep"] * (1 - sl1), s["ep"] * (1 + tp1)) if s["reg"] == 1 else (max(s["ep"] * (1 - sl), s["m5"] * xm), None)
-            st.info(f"🟢 模擬持有中（{'弱勢' if s['reg'] == 1 else '強勢'}單，{s['since']} 進場）")
+            st.info(f"🟢 模擬持有中（{s['ent_label']}，{s['since']} 進場）")
             k = st.columns(3)
             k[0].metric("持有成本", f"{s['ep']:,.2f}", f"{(last / s['ep'] - 1) * 100:+.2f}%")
-            k[1].metric("出場線（停損）", f"{ln:,.2f}", f"{(ln / s['ep'] - 1) * 100:+.2f}%")
-            k[2].metric("停利價", f"{tp:,.2f}" if tp else "—", f"{(tp / s['ep'] - 1) * 100:+.2f}%" if tp else None)
+
+            if s["reg"] == 1:
+                sl_p = s["ep"] * (1.0 - sl1)
+                tp_p = s["ep"] * (1.0 + tp1)
+                k[1].metric("弱勢觸價停損", f"{sl_p:,.2f}", f"{(sl_p / s['ep'] - 1) * 100:+.2f}%")
+                k[2].metric("弱勢觸價停利", f"{tp_p:,.2f}", f"{(tp_p / s['ep'] - 1) * 100:+.2f}%")
+            else:
+                sl_p = s["ep"] * (1.0 - sl)
+                ma_tp = s["m5"] * xm
+                k[1].metric("強勢觸價停損 (<成本)", f"{sl_p:,.2f}", f"{(sl_p / s['ep'] - 1) * 100:+.2f}%")
+                if ma_tp > s["ep"]:
+                    k[2].metric(
+                        f"強勢均線停利 (5MA×{xm:g})",
+                        f"{ma_tp:,.2f}",
+                        f"{(ma_tp / s['ep'] - 1) * 100:+.2f}%（已高於成本，跌破即停利）",
+                    )
+                else:
+                    k[2].metric(
+                        f"強勢均線停利 (5MA×{xm:g})",
+                        f"{ma_tp:,.2f}（未啟動）",
+                        f"需 > 成本 {s['ep']:,.2f} 才會啟動均線停利",
+                        delta_color="off",
+                    )
         else:
             ent, stop, tp, how = entry_plan(df, s, em, xm, sl, tp1, sl1)
             if s["cd"]:
                 days, skipped, ok = future_trading_days(df.index[-1].date(), s["cd"] + 1)
-                msg = (f"⏳ 冷卻中，還需 {s['cd']} 個交易日｜冷卻結束：{fmt_d(days[s['cd'] - 1])} "
-                       f"最早可再進場：{fmt_d(days[s['cd']])}（冷卻結束後參考下列價位）")
+                msg = (
+                    f"⏳ 冷卻中，還需 {s['cd']} 個交易日｜冷卻結束：{fmt_d(days[s['cd'] - 1])} "
+                    f"最早可再進場：{fmt_d(days[s['cd']])}（冷卻結束後參考下列價位）"
+                )
                 if skipped:
                     msg += "\n\n已排除休市日：" + "、".join(f"{fmt_d(k)} {v}" for k, v in skipped.items())
                 if not ok:
@@ -1214,9 +1321,13 @@ def strategy_page():
                     st.caption(how)
                 k = st.columns(3)
                 k[0].metric("合理進場價", f"{ent:,.2f}", f"{(ent / last - 1) * 100:+.2f}% vs 現價", delta_color="off")
-                k[1].metric("停損／出場價", f"{stop:,.2f}", f"{(stop / ent - 1) * 100:+.2f}%", delta_color="off")
-                k[2].metric("停利價", f"{tp:,.2f}" if tp else "—（強勢單無固定停利，跌破出場線即出）",
-                            f"{(tp / ent - 1) * 100:+.2f}%" if tp else None, delta_color="off")
+                k[1].metric("觸價停損價 (<成本)", f"{stop:,.2f}", f"{(stop / ent - 1) * 100:+.2f}%", delta_color="off")
+                k[2].metric(
+                    "停利機制",
+                    f"{tp:,.2f}" if tp else f"均線停利（5MA×{xm:g} > 成本後啟動）",
+                    f"{(tp / ent - 1) * 100:+.2f}%" if tp else "價格 > 成本 且 ≤ 前日5MA×0.98 觸發",
+                    delta_color="off",
+                )
 
     st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
     with st.container(key="chart_card_s"):
